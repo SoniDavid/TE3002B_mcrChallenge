@@ -79,7 +79,9 @@ source install/setup.bash
 
 ## Run
 
-Default settings (1280x720 @ 30 fps, JPEG quality 80):
+> **Note:** The GStreamer pipeline captures at 1920x1080 internally (the sensor's native confirmed mode) and scales down to the configured `width`/`height` via `nvvidconv`. Do not change the capture resolution in the pipeline directly.
+
+Default settings (1280x720 output @ 24 fps, JPEG quality 80):
 
 ```bash
 ros2 launch pzb_camera camera.launch.py
@@ -121,10 +123,45 @@ ros2 topic echo --once /camera/image_compressed
 
 ## View the Stream
 
-On a remote machine in the same ROS 2 network:
+### rqt_image_view (remote machine)
+
+Run this on your PC while the camera node runs on the Jetson. Both must be on the same network with the same `ROS_DOMAIN_ID`.
 
 ```bash
-ros2 run rqt_image_view rqt_image_view /camera/image_compressed
+ros2 run rqt_image_view rqt_image_view
+```
+
+Select `/camera/image_compressed` from the dropdown. **Do not use `/camera/image_raw` over the network** — it is ~2.7 MB/frame and will cause severe lag. If you still see delay, reduce quality or framerate:
+
+```bash
+ros2 launch pzb_camera camera.launch.py jpeg_quality:=60 framerate:=15
+```
+
+### rosshow (on the Jetson over SSH — no display needed)
+
+rosshow renders the stream in the terminal, so there is no network overhead and no VNC required.
+
+```bash
+# From the workspace root on the Jetson
+source install/setup.bash
+ros2 run rosshow rosshow /camera/image_compressed
+```
+
+If rosshow is not built yet:
+
+```bash
+colcon build --packages-select rosshow
+source install/setup.bash
+ros2 run rosshow rosshow /camera/image_compressed
+```
+
+### rqt_image_view (on the Jetson via VNC)
+
+If you have a VNC session running on display `:1`:
+
+```bash
+export DISPLAY=:1
+ros2 run rqt_image_view rqt_image_view
 ```
 
 Or with rviz2: add an `Image` display and set topic to `/camera/image_compressed`.
@@ -141,15 +178,4 @@ Or with rviz2: add an `Image` display and set topic to `/camera/image_compressed
 
 - This is expected when running over SSH with no display attached. The ROS node does not need a display.
 
-**Low framerate or frame drops**
 
-- Reduce `jpeg_quality` (try 60) or lower resolution in `camera_params.yaml`
-- Check CPU load: `jtop` or `htop`
-
-**`ImportError: cv2`**
-
-- Install OpenCV: `sudo apt install python3-opencv`
-
-**`ModuleNotFoundError: cv_bridge`**
-
-- Install cv_bridge: `sudo apt install ros-humble-cv-bridge`

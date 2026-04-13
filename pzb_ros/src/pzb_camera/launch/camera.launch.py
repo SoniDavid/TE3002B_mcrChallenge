@@ -33,7 +33,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'framerate',
-            default_value='30',
+            default_value='24',
             description='Target framerate',
         ),
         DeclareLaunchArgument(
