@@ -94,10 +94,10 @@ class CameraPublisher(Node):
         return (
             f'nvarguscamerasrc sensor-id={sensor_id} ! '
             f'video/x-raw(memory:NVMM), '
-            f'width={self._width}, height={self._height}, '
+            f'width=1920, height=1080, '
             f'framerate={self._fps}/1 ! '
-            f'nvvidconv ! '
-            f'video/x-raw, format=BGRx ! '
+            f'nvvidconv flip-method=0 ! '
+            f'video/x-raw, width={self._width}, height={self._height}, format=BGRx ! '
             f'videoconvert ! '
             f'video/x-raw, format=BGR ! '
             f'appsink drop=1'
