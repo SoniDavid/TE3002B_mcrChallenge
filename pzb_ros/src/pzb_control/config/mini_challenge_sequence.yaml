@@ -1,0 +1,27 @@
+mini_challenge_ctrl:
+  ros__parameters:
+    use_sim_time: false
+
+    # define full behavior as a sequence in YAML.
+    # segment_types: move (meters), turn (radians)
+    segment_types: [move, turn, move, turn, move, turn, move]
+    segment_values: [0.35, 1.57079632679, 0.35, 1.57079632679, 0.35, 1.57079632679, 0.35]
+
+    # Planning mode: speed or time
+    plan_mode: speed
+    target_linear_speed: 0.10
+    target_angular_speed: 0.60
+    total_time_s: 120.0
+
+    # Reachability and robustness limits
+    max_linear_speed: 0.50
+    max_angular_speed: 1.50
+    min_linear_speed_cmd: 0.08
+    min_angular_speed_cmd: 0.20
+    max_linear_accel: 0.25
+    max_angular_accel: 1.0
+
+    # Execution safety
+    loop_hz: 20.0
+    max_run_time_s: 240.0
+    stop_burst_cycles: 30
