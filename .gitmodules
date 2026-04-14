@@ -1,0 +1,3 @@
+[submodule "pzb_ros/src/deps/rosshow"]
+	path = pzb_ros/src/deps/rosshow
+	url = https://github.com/dheera/rosshow.git
