@@ -229,9 +229,26 @@ class MiniChallengeCtrl(Node):
     def _apply_segment_durations(self):
         for seg in self.segments:
             if seg['type'] == 'move':
-                seg['duration'] = seg['value'] / self.linear_speed
+                seg['duration'] = self._duration_with_accel(seg['value'], self.linear_speed, self.max_linear_accel)
             else:
-                seg['duration'] = abs(seg['value']) / self.angular_speed
+                seg['duration'] = self._duration_with_accel(abs(seg['value']), self.angular_speed, self.max_angular_accel)
+
+    def _duration_with_accel(self, amount: float, cruise_speed: float, accel_limit: float) -> float:
+        if amount <= 0.0:
+            return 0.0
+        if cruise_speed <= 0.0:
+            raise ValueError('cruise_speed must be > 0')
+        if accel_limit <= 1e-9:
+            return amount / cruise_speed
+
+        ramp_time = cruise_speed / accel_limit
+        ramp_amount = 0.5 * accel_limit * ramp_time * ramp_time
+
+        if amount <= ramp_amount:
+            return math.sqrt(2.0 * amount / accel_limit)
+
+        cruise_amount = amount - ramp_amount
+        return ramp_time + (cruise_amount / cruise_speed)
 
     def _ramp(self, current: float, target: float, accel_limit: float, dt: float) -> float:
         max_step = accel_limit * dt
@@ -281,12 +298,18 @@ class MiniChallengeCtrl(Node):
             desired_w = math.copysign(self.angular_speed, seg['value'])
 
         dt = 1.0 / self.loop_hz
-        self.current_v = self._ramp(self.current_v, desired_v, self.max_linear_accel, dt)
-        self.current_w = self._ramp(self.current_w, desired_w, self.max_angular_accel, dt)
+        # Open-loop axis isolation: moves are pure translation, turns are pure rotation.
+        if seg['type'] == 'move':
+            self.current_w = 0.0
+            self.current_v = self._ramp(self.current_v, desired_v, self.max_linear_accel, dt)
+        else:
+            self.current_v = 0.0
+            self.current_w = self._ramp(self.current_w, desired_w, self.max_angular_accel, dt)
 
-        if abs(self.current_v) > 0.0 and abs(self.current_v) < self.min_linear_speed_cmd:
+        # Enforce minimum command only when that axis is actively commanded.
+        if abs(desired_v) > 0.0 and abs(self.current_v) > 0.0 and abs(self.current_v) < self.min_linear_speed_cmd:
             self.current_v = math.copysign(self.min_linear_speed_cmd, self.current_v)
-        if abs(self.current_w) > 0.0 and abs(self.current_w) < self.min_angular_speed_cmd:
+        if abs(desired_w) > 0.0 and abs(self.current_w) > 0.0 and abs(self.current_w) < self.min_angular_speed_cmd:
             self.current_w = math.copysign(self.min_angular_speed_cmd, self.current_w)
 
         self.publish_cmd(self.current_v, self.current_w)
