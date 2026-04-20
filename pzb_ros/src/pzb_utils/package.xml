@@ -3,8 +3,8 @@
 <package format="3">
   <name>pzb_utils</name>
   <version>0.1.0</version>
-  <description>Puzzlebot utility nodes (emergency stop).</description>
-  <maintainer email="student@example.com">Student</maintainer>
+  <description>Puzzlebot utility nodes.</description>
+  <maintainer email="sonidavid46@gmail.com">Student</maintainer>
   <license>Apache-2.0</license>
 
   <depend>rclpy</depend>

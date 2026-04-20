@@ -18,7 +18,7 @@ def wrap_to_pi(angle: float) -> float:
 
 class MiniChallengeCtrl(Node):
     def __init__(self):
-        super().__init__('mini_challenge_ctrl')
+        super().__init__('open_loop_controller')
 
         self.declare_parameter('path_mode', 'square')
         self.declare_parameter('square_side_m', 0.35)

@@ -11,7 +11,7 @@ def generate_launch_description():
     default_params = PathJoinSubstitution([
         FindPackageShare('pzb_control'),
         'config',
-        'mini_challenge_sequence.yaml',
+        'open_loop_sequence.yaml',
     ])
 
     return LaunchDescription([
@@ -30,8 +30,8 @@ def generate_launch_description():
         DeclareLaunchArgument('stop_burst_cycles', default_value='30'),
         Node(
             package='pzb_control',
-            executable='mini_challenge_ctrl',
-            name='mini_challenge_ctrl',
+            executable='open_loop_controller',
+            name='open_loop_controller',
             output='screen',
             parameters=[
                 LaunchConfiguration('params_file'),

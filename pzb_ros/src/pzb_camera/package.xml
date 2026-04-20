@@ -4,7 +4,7 @@
   <name>pzb_camera</name>
   <version>0.1.0</version>
   <description>Puzzlebot IMX219 CSI camera publisher for Jetson Nano.</description>
-  <maintainer email="student@example.com">Student</maintainer>
+  <maintainer email="sonidavid46@gmail.com">Student</maintainer>
   <license>Apache-2.0</license>
 
   <depend>rclpy</depend>

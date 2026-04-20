@@ -1,4 +1,4 @@
-mini_challenge_ctrl:
+open_loop_ctrl:
   ros__parameters:
     use_sim_time: false
 

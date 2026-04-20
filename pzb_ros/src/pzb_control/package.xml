@@ -3,12 +3,15 @@
 <package format="3">
   <name>pzb_control</name>
   <version>0.1.0</version>
-  <description>Puzzlebot Week 2 open-loop mini challenge controller.</description>
-  <maintainer email="student@example.com">Student</maintainer>
+  <description>Puzzlebot control scripts</description>
+  <maintainer email="sonidavid46@gmail.com">Student</maintainer>
   <license>Apache-2.0</license>
 
   <depend>rclpy</depend>
   <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>tf2_ros</depend>
   <depend>ros2launch</depend>
 
   <test_depend>ament_copyright</test_depend>
