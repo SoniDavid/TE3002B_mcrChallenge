@@ -26,7 +26,10 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'mini_challenge_ctrl = pzb_control_scripts.mini_challenge_ctrl:main',
+            'open_loop_controller = pzb_control_scripts.open_loop_controller:main',
+            'odometry_node = pzb_control_scripts.odometry_node:main',
+            'velocity_controller = pzb_control_scripts.velocity_controller:main',
+            'waypoint_follower = pzb_control_scripts.waypoint_follower:main',
         ],
     },
 )

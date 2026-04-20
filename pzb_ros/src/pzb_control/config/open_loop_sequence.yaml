@@ -1,15 +1,28 @@
-mini_challenge_ctrl:
+open_loop_ctrl:
   ros__parameters:
     use_sim_time: false
 
     # define full behavior as a sequence in YAML.
     # segment_types: move (meters), turn (radians)
+
+    #   segment_types: [move, turn]
+    # segment_values: [0.5, -1.57079632679]
+
+#  MOVE FORWARD
+    # segment_types: [move]
+    # segment_values: [0.5]
+
+# THREE BASIC WAYPOINT SEGMENT
+    # segment_types: [move, turn, move, turn, move]
+    # segment_values: [0.2, -0.523599, 0.4, 3.14159, 0.3]
+
+# SQUARE
     segment_types: [move, turn, move, turn, move, turn, move]
-    segment_values: [0.35, 1.57079632679, 0.35, 1.57079632679, 0.35, 1.57079632679, 0.35]
+    segment_values: [0.5, -1.57079632679, 0.5, -1.57079632679, 0.5, -1.57079632679, 0.5]
 
     # Planning mode: speed or time
     plan_mode: speed
-    target_linear_speed: 0.10
+    target_linear_speed: 0.15
     target_angular_speed: 0.60
     total_time_s: 120.0
 
