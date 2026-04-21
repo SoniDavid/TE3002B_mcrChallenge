@@ -45,22 +45,32 @@ class CameraPublisher(Node):
         self._fps    = self.get_parameter('framerate').value
         self._quality = self.get_parameter('jpeg_quality').value
         self._frame_id = self.get_parameter('frame_id').value
+        self._flip_method = str(self.get_parameter('flip_method').value)
+        self._publish_compressed_enabled = bool(self.get_parameter('publish_compressed').value)
         self._publish_raw_enabled = bool(self.get_parameter('publish_raw').value)
         topic_compressed = self.get_parameter('topic_compressed').value
         topic_raw        = self.get_parameter('topic_raw').value
 
         # ── Publishers ───────────────────────────────────────────────────────
-        sensor_qos = QoSProfile(
+        compressed_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.VOLATILE,
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
         )
 
+        # RViz Image display defaults to RELIABLE; keep raw compatible.
+        raw_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+
         self._pub_compressed = self.create_publisher(
-            CompressedImage, topic_compressed, sensor_qos)
+            CompressedImage, topic_compressed, compressed_qos)
         self._pub_raw = self.create_publisher(
-            Image, topic_raw, sensor_qos)
+            Image, topic_raw, raw_qos)
 
         # ── GStreamer pipeline ────────────────────────────────────────────────
         pipeline = self._gstreamer_pipeline(sensor_id)
@@ -78,7 +88,9 @@ class CameraPublisher(Node):
 
         self.get_logger().info(
             f'Camera ready  {self._width}x{self._height}@{self._fps}fps  '
-            f'JPEG quality={self._quality}  publish_raw={self._publish_raw_enabled}'
+            f'JPEG quality={self._quality}  '
+            f'publish_compressed={self._publish_compressed_enabled}  '
+            f'publish_raw={self._publish_raw_enabled}'
         )
 
         # ── Timer ─────────────────────────────────────────────────────────────
@@ -99,8 +111,10 @@ class CameraPublisher(Node):
         self.declare_parameter('framerate',        30)
         self.declare_parameter('jpeg_quality',     80)
         self.declare_parameter('frame_id',         'camera_optical_frame')
+        self.declare_parameter('flip_method',      '0')
         self.declare_parameter('topic_compressed', '/camera/image_compressed')
         self.declare_parameter('topic_raw',        '/camera/image_raw')
+        self.declare_parameter('publish_compressed', True)
         self.declare_parameter('publish_raw',      False)
 
     # ── GStreamer pipeline builder ────────────────────────────────────────────
@@ -109,13 +123,13 @@ class CameraPublisher(Node):
         return (
             f'nvarguscamerasrc sensor-id={sensor_id} ! '
             f'video/x-raw(memory:NVMM), '
-            f'width=1920, height=1080, '
+            f'width={self._width}, height={self._height}, '
             f'framerate={self._fps}/1 ! '
-            f'nvvidconv flip-method=0 ! '
+            f'nvvidconv flip-method={self._flip_method} ! '
             f'video/x-raw, width={self._width}, height={self._height}, format=BGRx ! '
             f'videoconvert ! '
             f'video/x-raw, format=BGR ! '
-            f'appsink drop=1'
+            f'appsink drop=1 max-buffers=1 sync=false'
         )
 
     # ── Capture + publish callback ────────────────────────────────────────────
@@ -129,8 +143,9 @@ class CameraPublisher(Node):
         now = self.get_clock().now().to_msg()
         self._frame_count += 1
 
-        # Always publish compressed (primary network topic)
-        self._publish_compressed(frame, now)
+        # Publish compressed only when enabled and needed to avoid unnecessary JPEG load.
+        if self._publish_compressed_enabled and self._pub_compressed.get_subscription_count() > 0:
+            self._publish_compressed(frame, now)
 
         # Only publish raw if someone is subscribed (saves CPU when unused)
         if self._publish_raw_enabled and self._pub_raw.get_subscription_count() > 0:
