@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'camera_publisher = pzb_camera_scripts.camera_publisher:main',
+            'image_decompressor = pzb_camera_scripts.image_decompressor:main',
         ],
     },
 )

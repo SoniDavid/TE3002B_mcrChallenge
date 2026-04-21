@@ -2,6 +2,7 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -33,13 +34,43 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'framerate',
-            default_value='24',
+            default_value='30',
             description='Target framerate',
         ),
         DeclareLaunchArgument(
             'jpeg_quality',
-            default_value='80',
+            default_value='75',
             description='JPEG compression quality (1-100)',
+        ),
+        DeclareLaunchArgument(
+            'flip_method',
+            default_value='0',
+            description='nvvidconv flip-method (0:none, 2:rotate-180, 4:horizontal, 6:vertical)',
+        ),
+        DeclareLaunchArgument(
+            'publish_compressed',
+            default_value='true',
+            description='Publish /camera/image_compressed.',
+        ),
+        DeclareLaunchArgument(
+            'publish_raw',
+            default_value='false',
+            description='Publish /camera/image_raw (heavy bandwidth).',
+        ),
+        DeclareLaunchArgument(
+            'publish_camera_info',
+            default_value='false',
+            description='Launch camera_info_publisher node.',
+        ),
+        DeclareLaunchArgument(
+            'camera_info_url',
+            default_value='file:///home/puzzlebot/.ros/jetson_cam.yaml',
+            description='Calibration file URL used by camera_info_publisher.',
+        ),
+        DeclareLaunchArgument(
+            'camera_info_frame_id',
+            default_value='camera_optical_frame',
+            description='frame_id for camera_info_publisher.',
         ),
 
         Node(
@@ -55,7 +86,21 @@ def generate_launch_description():
                     'height':       LaunchConfiguration('height'),
                     'framerate':    LaunchConfiguration('framerate'),
                     'jpeg_quality': LaunchConfiguration('jpeg_quality'),
+                    'flip_method':  LaunchConfiguration('flip_method'),
+                    'publish_compressed': LaunchConfiguration('publish_compressed'),
+                    'publish_raw':  LaunchConfiguration('publish_raw'),
                 },
             ],
+        ),
+        Node(
+            package='camera_info_publisher',
+            executable='camera_info_publisher',
+            name='camera_info_publisher',
+            output='screen',
+            condition=IfCondition(LaunchConfiguration('publish_camera_info')),
+            parameters=[{
+                'camera_calibration_file': LaunchConfiguration('camera_info_url'),
+                'frame_id': LaunchConfiguration('camera_info_frame_id'),
+            }],
         ),
     ])

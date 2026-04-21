@@ -11,6 +11,7 @@ The MCU owns all kinematic parameters.
 """
 import math
 import signal
+import time
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
@@ -107,6 +108,7 @@ class VelocityController(Node):
         self._w_actual = 0.0
         self._last_desired_time = None
         self._last_time = None
+        self._last_diag_warn_time = 0.0
 
         self.create_subscription(Twist, '/cmd_vel_desired', self._cb_desired, 10)
         # /robot_vel is the MCU's body velocity — read-only feedback
@@ -133,6 +135,8 @@ class VelocityController(Node):
         self._w_actual = msg.twist.angular.z
 
     def _control_loop(self):
+        self._warn_if_robot_interface_missing()
+
         now = self.get_clock().now()
         if self._last_time is None:
             self._last_time = now
@@ -177,6 +181,24 @@ class VelocityController(Node):
         msg.linear.x = v_cmd
         msg.angular.z = w_cmd
         self._cmd_pub.publish(msg)
+
+    def _warn_if_robot_interface_missing(self):
+        # Emit this warning periodically so missing bring-up is obvious at runtime.
+        now_s = time.monotonic()
+        if now_s - self._last_diag_warn_time < 2.0:
+            return
+
+        cmd_vel_subs = self.count_subscribers('/cmd_vel')
+        robot_vel_pubs = self.count_publishers('/robot_vel')
+
+        if cmd_vel_subs == 0 or robot_vel_pubs == 0:
+            self.get_logger().warn(
+                'Robot interface missing: '
+                f'/cmd_vel subscribers={cmd_vel_subs}, '
+                f'/robot_vel publishers={robot_vel_pubs}. '
+                'Start the base/MCU bridge node so the robot can move.'
+            )
+            self._last_diag_warn_time = now_s
 
 
 def main(args=None):

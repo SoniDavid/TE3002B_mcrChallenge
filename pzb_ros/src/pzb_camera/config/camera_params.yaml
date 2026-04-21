@@ -10,7 +10,17 @@ camera_publisher:
     framerate: 30
 
     # JPEG quality for CompressedImage (1-100). 80 is a good balance.
-    jpeg_quality: 80
+    jpeg_quality: 75
+
+    # nvvidconv flip-method for CSI cameras:
+    # 0:none, 2:rotate-180, 4:horizontal, 6:vertical
+    flip_method: "0"
+
+    # Publish /camera/image_compressed stream.
+    publish_compressed: true
+
+    # Publish heavy /camera/image_raw stream. Keep false for teleop/RViz over network.
+    publish_raw: false
 
     # Topic names
     topic_compressed: /camera/image_compressed

@@ -26,6 +26,7 @@ setup(
     entry_points={
         'console_scripts': [
             'emergency_stop = pzb_utils_scripts.emergency_stop:main',
+            'twist_slew_limiter = pzb_utils_scripts.twist_slew_limiter:main',
         ],
     },
 )
