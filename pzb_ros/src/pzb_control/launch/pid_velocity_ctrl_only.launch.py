@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-Full closed-loop stack: odometry_node + velocity_controller + waypoint_follower.
+Minimal launch for PID tuning sessions: odometry_node + velocity_controller only.
 
-Configure waypoints in closed_loop_params.yaml (waypoints_xyyaw) or pass a
-custom params_file argument:
+Publish step commands to /cmd_vel_desired to characterize the PID
+velocity response:
 
-  ros2 launch pzb_control waypoint_mission.launch.py \
-    params_file:=/path/to/my_mission.yaml
+  ros2 topic pub /cmd_vel_desired geometry_msgs/msg/Twist \
+    "{linear: {x: 0.15}, angular: {z: 0.0}}" --rate 20
+
+Monitor with:
+  rqt_plot /VelocityEncR/data /VelocityEncL/data /VelocitySetR/data /VelocitySetL/data
 """
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
@@ -19,7 +22,7 @@ def generate_launch_description():
     default_params = PathJoinSubstitution([
         FindPackageShare('pzb_control'),
         'config',
-        'closed_loop_params.yaml',
+        'pid_vel_params.yaml',
     ])
 
     params_arg = DeclareLaunchArgument('params_file', default_value=default_params)
@@ -44,12 +47,4 @@ def generate_launch_description():
         parameters=[params, {'use_sim_time': sim}],
     )
 
-    wp_node = Node(
-        package='pzb_control',
-        executable='waypoint_follower',
-        name='waypoint_follower',
-        output='screen',
-        parameters=[params, {'use_sim_time': sim}],
-    )
-
-    return LaunchDescription([params_arg, sim_arg, odom_node, vel_ctrl_node, wp_node])
+    return LaunchDescription([params_arg, sim_arg, odom_node, vel_ctrl_node])

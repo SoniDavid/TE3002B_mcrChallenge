@@ -12,6 +12,9 @@ camera_publisher:
     # JPEG quality for CompressedImage (1-100). 80 is a good balance.
     jpeg_quality: 80
 
+    # Publish heavy /camera/image_raw stream. Keep false for teleop/RViz over network.
+    publish_raw: false
+
     # Topic names
     topic_compressed: /camera/image_compressed
     topic_raw: /camera/image_raw

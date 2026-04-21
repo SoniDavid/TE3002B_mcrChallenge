@@ -33,13 +33,18 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'framerate',
-            default_value='24',
+            default_value='30',
             description='Target framerate',
         ),
         DeclareLaunchArgument(
             'jpeg_quality',
             default_value='80',
             description='JPEG compression quality (1-100)',
+        ),
+        DeclareLaunchArgument(
+            'publish_raw',
+            default_value='false',
+            description='Publish /camera/image_raw (heavy bandwidth).',
         ),
 
         Node(
@@ -55,6 +60,7 @@ def generate_launch_description():
                     'height':       LaunchConfiguration('height'),
                     'framerate':    LaunchConfiguration('framerate'),
                     'jpeg_quality': LaunchConfiguration('jpeg_quality'),
+                    'publish_raw':  LaunchConfiguration('publish_raw'),
                 },
             ],
         ),

@@ -18,7 +18,7 @@ velocity_controller:
     kd_w: 0.0
     integral_clamp: 0.2
     loop_hz: 50.0
-    max_linear_speed: 0.30
+    max_linear_speed: 0.40
     max_angular_speed: 1.50
     cmd_timeout_s: 0.50
     deadzone_comp_v: 0.0   # snap small linear commands up to this threshold (m/s); 0 = disabled
@@ -35,25 +35,25 @@ waypoint_follower:
     max_angular_speed: 1.20
     min_linear_speed: 0.05  # dead zone — below this speed command 0 to prevent creep
     align_yaw: false      # rotate to target yaw only at the final waypoint
-    lookahead_dist: 0.15  # advance to next waypoint this far early — keeps motion continuous
+    lookahead_dist: 0.2  # advance to next waypoint this far early — keeps motion continuous
     loop_hz: 20.0
     # Waypoints: flat list [x0, y0, yaw0, x1, y1, yaw1, ...]
-    # waypoints_xyyaw: [
-    #   0.5,  0.0,  0.0,
-    #   0.5,  0.5,  1.5708,
-    #   0.0,  0.5,  3.1416,
-    #   0.0,  0.0, -1.5708
-    # ]
-
     waypoints_xyyaw: [
-      0.354,  0.146,  0.7854,
-      0.500,  0.500,  1.5708,
-      0.354,  0.854,  2.3562,
-      0.000,  1.000,  3.1416,
-      -0.354,  0.854, -2.3562,
-      -0.500,  0.500, -1.5708,
-      -0.354,  0.146, -0.7854,
-      0.000,  0.000,  0.0000
-      ]
+      0.5,  0.0,  0.0,
+      0.5,  0.5,  1.5708,
+      0.0,  0.5,  3.1416,
+      0.0,  0.0, -1.5708
+    ]
+
+    # waypoints_xyyaw: [
+    #   0.354,  0.146,  0.7854,
+    #   0.500,  0.500,  1.5708,
+    #   0.354,  0.854,  2.3562,
+    #   0.000,  1.000,  3.1416,
+    #   -0.354,  0.854, -2.3562,
+    #   -0.500,  0.500, -1.5708,
+    #   -0.354,  0.146, -0.7854,
+    #   0.000,  0.000,  0.0000
+    #   ]
 
 

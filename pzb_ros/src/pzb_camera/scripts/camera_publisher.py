@@ -19,6 +19,12 @@ import numpy as np
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import (
+    QoSProfile,
+    ReliabilityPolicy,
+    DurabilityPolicy,
+    HistoryPolicy,
+)
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 
 from sensor_msgs.msg import Image, CompressedImage
@@ -39,14 +45,22 @@ class CameraPublisher(Node):
         self._fps    = self.get_parameter('framerate').value
         self._quality = self.get_parameter('jpeg_quality').value
         self._frame_id = self.get_parameter('frame_id').value
+        self._publish_raw_enabled = bool(self.get_parameter('publish_raw').value)
         topic_compressed = self.get_parameter('topic_compressed').value
         topic_raw        = self.get_parameter('topic_raw').value
 
         # ── Publishers ───────────────────────────────────────────────────────
+        sensor_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+
         self._pub_compressed = self.create_publisher(
-            CompressedImage, topic_compressed, 10)
+            CompressedImage, topic_compressed, sensor_qos)
         self._pub_raw = self.create_publisher(
-            Image, topic_raw, 10)
+            Image, topic_raw, sensor_qos)
 
         # ── GStreamer pipeline ────────────────────────────────────────────────
         pipeline = self._gstreamer_pipeline(sensor_id)
@@ -64,7 +78,7 @@ class CameraPublisher(Node):
 
         self.get_logger().info(
             f'Camera ready  {self._width}x{self._height}@{self._fps}fps  '
-            f'JPEG quality={self._quality}'
+            f'JPEG quality={self._quality}  publish_raw={self._publish_raw_enabled}'
         )
 
         # ── Timer ─────────────────────────────────────────────────────────────
@@ -87,6 +101,7 @@ class CameraPublisher(Node):
         self.declare_parameter('frame_id',         'camera_optical_frame')
         self.declare_parameter('topic_compressed', '/camera/image_compressed')
         self.declare_parameter('topic_raw',        '/camera/image_raw')
+        self.declare_parameter('publish_raw',      False)
 
     # ── GStreamer pipeline builder ────────────────────────────────────────────
 
@@ -118,7 +133,7 @@ class CameraPublisher(Node):
         self._publish_compressed(frame, now)
 
         # Only publish raw if someone is subscribed (saves CPU when unused)
-        if self._pub_raw.get_subscription_count() > 0:
+        if self._publish_raw_enabled and self._pub_raw.get_subscription_count() > 0:
             self._publish_raw(frame, now)
 
     def _publish_compressed(self, frame: np.ndarray, stamp) -> None:
