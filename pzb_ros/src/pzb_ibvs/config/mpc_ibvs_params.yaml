@@ -1,0 +1,68 @@
+# ─── Visual Detector ─────────────────────────────────────────────────────────
+visual_detector_node:
+  ros__parameters:
+    # 'color_blob' or 'aruco'
+    detector_type: color_blob
+
+    image_width: 1280
+    image_height: 720
+    # cx/cy: image principal point (negative → use image_width/2, image_height/2)
+    cx: -1.0
+    cy: -1.0
+
+    # Apparent area (pixels²) of the target when at the desired servoing distance.
+    # Tune this by placing the robot at the goal distance and reading the area from
+    # the debug image.
+    desired_area: 8000.0
+
+    # ── Color blob (ball) ──────────────────────────────────────────────────
+    # HSV range for the ball. Use the HSV tuner to find these values.
+    # Example: orange ball  lower=[5,120,80] upper=[20,255,255]
+    #          red ball      requires two ranges (hue wraps at 180)
+    hsv_lower: [5, 120, 80]
+    hsv_upper: [20, 255, 255]
+    ball_diameter_m: 0.065      # physical diameter of the ball in metres
+    min_contour_area: 500.0     # discard detections smaller than this (px²)
+
+    # ── ArUco marker ───────────────────────────────────────────────────────
+    marker_id: 0                # integer ID to track
+    marker_size_m: 0.10         # physical side length in metres
+    aruco_dict: DICT_4X4_50
+
+    confidence_threshold: 0.5
+
+
+# ─── MPC IBVS Controller ─────────────────────────────────────────────────────
+mpc_ibvs_node:
+  ros__parameters:
+    Ts: 0.08           # control period [s]  (12.5 Hz)
+    N: 15              # prediction horizon [steps]  → 1.2 s lookahead
+
+    # Feature error weights [eu, ev, ea] — increase to servo more aggressively
+    Q_diag: [1.0, 1.0, 0.5]
+    # Control effort weights [v, omega] — increase to slow down commands
+    R_diag: [0.1, 0.2]
+
+    # Velocity constraints
+    v_max: 0.30        # max forward speed [m/s]  (hardware limit is 0.60)
+    v_min: -0.05       # allow slight backward motion to correct overshoot
+    omega_max: 1.20    # max angular speed [rad/s]
+
+    # Safety: stop if no detection received within this window
+    lost_timeout_s: 0.5
+
+    # ── Camera intrinsics ─────────────────────────────────────────────────
+    # Approximate values for IMX219 at 1280x720.
+    # For best results run camera calibration and replace these.
+    fx: 640.0
+    fy: 640.0
+    cx: 640.0
+    cy: 360.0
+
+    # Estimated depth Z [m] at the desired goal pose (robot distance from target).
+    # This is used to build the linearised interaction matrix. Tune to match your
+    # physical setup.
+    nominal_depth_Z: 0.50
+
+    # Must match visual_detector_node/desired_area
+    desired_area: 8000.0
