@@ -22,28 +22,39 @@ velocity_controller:
     max_angular_speed: 1.50
     cmd_timeout_s: 0.50
     deadzone_comp_v: 0.0   # snap small linear commands up to this threshold (m/s); 0 = disabled
-    deadzone_comp_w: 0.0   # snap small angular commands up to this threshold (rad/s); 0 = disabled
+    deadzone_comp_w: 0.10  # snap small angular commands up to this threshold (rad/s); 0 = disabled
+    robot_vel_stale_timeout_s: 0.10  # if /robot_vel is older than this, publish zero /cmd_vel
+    min_dt_s: 0.005                 # reject too-small control dt to avoid transient spikes
+    hold_zero_until_feedback: true  # keep /cmd_vel=0 until first /robot_vel sample arrives
+    diag_period_s: 5.0              # emit periodic safety counters for debugging
 
 waypoint_follower:
   ros__parameters:
     use_sim_time: false
     Kp_dist: 1.0
     Kp_yaw: 2.0
+    Ki_yaw: 0.3              # integral gain for yaw alignment; 0.0 = P-only
+    yaw_integral_clamp: 0.5  # anti-windup clamp on yaw integral (rad)
     dist_tol_m: 0.05
-    yaw_tol_rad: 0.05
-    max_linear_speed: 0.20
+    yaw_tol_rad: 0.03
+    max_linear_speed: 0.40
     max_angular_speed: 1.20
     min_linear_speed: 0.05  # dead zone — below this speed command 0 to prevent creep
-    align_yaw: false      # rotate to target yaw only at the final waypoint
-    lookahead_dist: 0.2  # advance to next waypoint this far early — keeps motion continuous
+    align_yaw: true                # rotate to target yaw at waypoints
+    align_at_all_waypoints: true   # stop and align at every corner, not just the last
+    lookahead_dist: 0.10           # no early advance — wait for dist_tol before aligning
     loop_hz: 20.0
     # Waypoints: flat list [x0, y0, yaw0, x1, y1, yaw1, ...]
     waypoints_xyyaw: [
-      0.5,  0.0,  0.0,
-      0.5,  0.5,  1.5708,
-      0.0,  0.5,  3.1416,
-      0.0,  0.0, -1.5708
+      0.0000, 0.0000,  0.0000,
+      0.3000, 0.0000,  2.0944,
+      0.1500, 0.2598, -2.0944,
+      0.0000, 0.0000,  0.0000
     ]
+    # waypoints_xyyaw: [
+    #   0.8,  0.0,  0.0,
+    #   0.8,  0.8,  0.8,
+    # ]
 
     # waypoints_xyyaw: [
     #   0.354,  0.146,  0.7854,

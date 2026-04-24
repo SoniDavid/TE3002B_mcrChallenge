@@ -26,6 +26,7 @@ setup(
         'console_scripts': [
             'camera_publisher = pzb_camera_scripts.camera_publisher:main',
             'image_decompressor = pzb_camera_scripts.image_decompressor:main',
+            'calibrate_from_rosbag = pzb_camera_scripts.calibrate_from_rosbag:main',
         ],
     },
 )

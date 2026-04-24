@@ -81,12 +81,20 @@ class VelocityController(Node):
         self.declare_parameter('cmd_timeout_s', 0.50)
         self.declare_parameter('deadzone_comp_v', 0.0)
         self.declare_parameter('deadzone_comp_w', 0.0)
+        self.declare_parameter('robot_vel_stale_timeout_s', 0.10)
+        self.declare_parameter('min_dt_s', 0.005)
+        self.declare_parameter('hold_zero_until_feedback', True)
+        self.declare_parameter('diag_period_s', 5.0)
 
         self._max_v = self.get_parameter('max_linear_speed').value
         self._max_w = self.get_parameter('max_angular_speed').value
         self._cmd_timeout = self.get_parameter('cmd_timeout_s').value
         self._dz_v = self.get_parameter('deadzone_comp_v').value
         self._dz_w = self.get_parameter('deadzone_comp_w').value
+        self._robot_vel_stale_timeout = self.get_parameter('robot_vel_stale_timeout_s').value
+        self._min_dt = self.get_parameter('min_dt_s').value
+        self._hold_zero_until_feedback = self.get_parameter('hold_zero_until_feedback').value
+        self._diag_period = self.get_parameter('diag_period_s').value
 
         ic = self.get_parameter('integral_clamp').value
         self._pi_v = PIDController(
@@ -107,8 +115,16 @@ class VelocityController(Node):
         self._v_actual = 0.0
         self._w_actual = 0.0
         self._last_desired_time = None
+        self._last_robot_vel_time = None
         self._last_time = None
         self._last_diag_warn_time = 0.0
+        self._last_stale_feedback_warn_time = 0.0
+        self._last_startup_hold_warn_time = 0.0
+        self._last_dt_warn_time = 0.0
+        self._count_startup_hold = 0
+        self._count_stale_feedback = 0
+        self._count_dt_rejected = 0
+        self._count_cmd_timeout = 0
 
         self.create_subscription(Twist, '/cmd_vel_desired', self._cb_desired, 10)
         # /robot_vel is the MCU's body velocity — read-only feedback
@@ -118,11 +134,14 @@ class VelocityController(Node):
 
         hz = self.get_parameter('loop_hz').value
         self.create_timer(1.0 / hz, self._control_loop)
+        self.create_timer(self._diag_period, self._publish_diag_summary)
 
         self.get_logger().info(
             f'VelocityController ready — '
             f'kp_v={self._pi_v.kp}, ki_v={self._pi_v.ki}, kd_v={self._pi_v.kd}, '
-            f'kp_w={self._pi_w.kp}, ki_w={self._pi_w.ki}, kd_w={self._pi_w.kd}'
+            f'kp_w={self._pi_w.kp}, ki_w={self._pi_w.ki}, kd_w={self._pi_w.kd}, '
+            f'min_dt={self._min_dt:.3f}s, robot_vel_stale={self._robot_vel_stale_timeout:.3f}s, '
+            f'diag_period={self._diag_period:.1f}s'
         )
 
     def _cb_desired(self, msg: Twist):
@@ -133,6 +152,7 @@ class VelocityController(Node):
     def _cb_robot_vel(self, msg: TwistStamped):
         self._v_actual = msg.twist.linear.x
         self._w_actual = msg.twist.angular.z
+        self._last_robot_vel_time = self.get_clock().now()
 
     def _control_loop(self):
         self._warn_if_robot_interface_missing()
@@ -145,13 +165,35 @@ class VelocityController(Node):
         dt = (now - self._last_time).nanoseconds * 1e-9
         self._last_time = now
 
-        if dt <= 0.0 or dt > 0.5:
+        if dt <= 0.0 or dt > 0.5 or dt < self._min_dt:
+            if dt < self._min_dt:
+                self._count_dt_rejected += 1
+                self._warn_dt_rejected(dt)
             return
+
+        if self._hold_zero_until_feedback and self._last_robot_vel_time is None:
+            self._count_startup_hold += 1
+            self._warn_startup_hold()
+            self._pi_v.reset()
+            self._pi_w.reset()
+            self._cmd_pub.publish(Twist())
+            return
+
+        if self._last_robot_vel_time is not None:
+            robot_vel_age = (now - self._last_robot_vel_time).nanoseconds * 1e-9
+            if robot_vel_age > self._robot_vel_stale_timeout:
+                self._count_stale_feedback += 1
+                self._warn_stale_feedback(robot_vel_age)
+                self._pi_v.reset()
+                self._pi_w.reset()
+                self._cmd_pub.publish(Twist())
+                return
 
         # Safety: stale /cmd_vel_desired → stop and reset integrators
         if self._last_desired_time is not None:
             age = (now - self._last_desired_time).nanoseconds * 1e-9
             if age > self._cmd_timeout:
+                self._count_cmd_timeout += 1
                 self._v_des = 0.0
                 self._w_des = 0.0
                 self._pi_v.reset()
@@ -182,6 +224,36 @@ class VelocityController(Node):
         msg.angular.z = w_cmd
         self._cmd_pub.publish(msg)
 
+    def _warn_startup_hold(self):
+        now_s = time.monotonic()
+        if now_s - self._last_startup_hold_warn_time < 2.0:
+            return
+        self.get_logger().warn(
+            'Holding /cmd_vel at zero: waiting for first /robot_vel feedback sample.'
+        )
+        self._last_startup_hold_warn_time = now_s
+
+    def _warn_stale_feedback(self, age_s: float):
+        now_s = time.monotonic()
+        if now_s - self._last_stale_feedback_warn_time < 2.0:
+            return
+        self.get_logger().warn(
+            'Stale /robot_vel feedback '
+            f'(age={age_s:.3f}s > {self._robot_vel_stale_timeout:.3f}s). '
+            'Publishing zero /cmd_vel for safety.'
+        )
+        self._last_stale_feedback_warn_time = now_s
+
+    def _warn_dt_rejected(self, dt_s: float):
+        now_s = time.monotonic()
+        if now_s - self._last_dt_warn_time < 2.0:
+            return
+        self.get_logger().warn(
+            f'Control step rejected due to small dt={dt_s:.6f}s '
+            f'(min_dt_s={self._min_dt:.6f}s).'
+        )
+        self._last_dt_warn_time = now_s
+
     def _warn_if_robot_interface_missing(self):
         # Emit this warning periodically so missing bring-up is obvious at runtime.
         now_s = time.monotonic()
@@ -199,6 +271,16 @@ class VelocityController(Node):
                 'Start the base/MCU bridge node so the robot can move.'
             )
             self._last_diag_warn_time = now_s
+
+    def _publish_diag_summary(self):
+        # Periodic health snapshot helps correlate safety gates with runtime behavior.
+        self.get_logger().info(
+            'Safety summary: '
+            f'startup_hold={self._count_startup_hold}, '
+            f'stale_feedback={self._count_stale_feedback}, '
+            f'dt_rejected={self._count_dt_rejected}, '
+            f'cmd_timeout={self._count_cmd_timeout}'
+        )
 
 
 def main(args=None):

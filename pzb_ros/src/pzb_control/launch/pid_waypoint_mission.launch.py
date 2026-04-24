@@ -82,7 +82,7 @@ def generate_launch_description():
             'loop_hz': 50.0,
             'max_linear_accel': accel_v,
             'max_angular_accel': accel_w,
-            'max_linear_speed': 0.30,
+            'max_linear_speed': 0.40,
             'max_angular_speed': 1.50,
             'cmd_timeout_s': 0.50,
             'initial_linear_speed': 0.0,

@@ -45,7 +45,7 @@ class CameraPublisher(Node):
         self._fps    = self.get_parameter('framerate').value
         self._quality = self.get_parameter('jpeg_quality').value
         self._frame_id = self.get_parameter('frame_id').value
-        self._flip_method = str(self.get_parameter('flip_method').value)
+        self._flip_method = int(self.get_parameter('flip_method').value)
         self._publish_compressed_enabled = bool(self.get_parameter('publish_compressed').value)
         self._publish_raw_enabled = bool(self.get_parameter('publish_raw').value)
         topic_compressed = self.get_parameter('topic_compressed').value
@@ -111,7 +111,7 @@ class CameraPublisher(Node):
         self.declare_parameter('framerate',        30)
         self.declare_parameter('jpeg_quality',     80)
         self.declare_parameter('frame_id',         'camera_optical_frame')
-        self.declare_parameter('flip_method',      '0')
+        self.declare_parameter('flip_method',      0)
         self.declare_parameter('topic_compressed', '/camera/image_compressed')
         self.declare_parameter('topic_raw',        '/camera/image_raw')
         self.declare_parameter('publish_compressed', True)

@@ -37,8 +37,10 @@ def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
-def _yaw_from_quaternion(qz: float, qw: float) -> float:
-    return 2.0 * math.atan2(qz, qw)
+def _yaw_from_quaternion(qx: float, qy: float, qz: float, qw: float) -> float:
+    siny_cosp = 2.0 * (qw * qz + qx * qy)
+    cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
+    return math.atan2(siny_cosp, cosy_cosp)
 
 
 class State(enum.Enum):
@@ -54,31 +56,41 @@ class WaypointFollower(Node):
 
         self.declare_parameter('Kp_dist', 1.0)
         self.declare_parameter('Kp_yaw', 2.0)
+        self.declare_parameter('Ki_yaw', 0.3)
+        self.declare_parameter('yaw_integral_clamp', 0.5)
         self.declare_parameter('dist_tol_m', 0.05)
         self.declare_parameter('yaw_tol_rad', 0.05)
         self.declare_parameter('max_linear_speed', 0.20)
         self.declare_parameter('max_angular_speed', 1.20)
         self.declare_parameter('min_linear_speed', 0.05)  # dead zone: below this → 0
         self.declare_parameter('align_yaw', True)
+        # When true, stop and align yaw at every waypoint, not just the last.
+        # Use this for precise paths (e.g. square) where corner drift matters.
+        self.declare_parameter('align_at_all_waypoints', False)
         # Intermediate waypoints are advanced this far before reaching them,
         # so the robot never slows to zero between waypoints.
+        # Set to 0.0 to disable early advance (requires align_at_all_waypoints for clean corners).
         self.declare_parameter('lookahead_dist', 0.15)
         self.declare_parameter('loop_hz', 20.0)
         self.declare_parameter('waypoints_xyyaw', [0.5, 0.0, 0.0])
 
         self._kp_dist = self.get_parameter('Kp_dist').value
         self._kp_yaw = self.get_parameter('Kp_yaw').value
+        self._ki_yaw = self.get_parameter('Ki_yaw').value
+        self._yaw_integral_clamp = self.get_parameter('yaw_integral_clamp').value
         self._dist_tol = self.get_parameter('dist_tol_m').value
         self._yaw_tol = self.get_parameter('yaw_tol_rad').value
         self._max_v = self.get_parameter('max_linear_speed').value
         self._max_w = self.get_parameter('max_angular_speed').value
         self._min_v = self.get_parameter('min_linear_speed').value
         self._align_yaw = self.get_parameter('align_yaw').value
+        self._align_all = self.get_parameter('align_at_all_waypoints').value
         self._lookahead = self.get_parameter('lookahead_dist').value
 
         self._x = 0.0
         self._y = 0.0
         self._theta = 0.0
+        self._yaw_integral = 0.0
 
         self._state = State.IDLE
         self._waypoints: list[tuple[float, float, float]] = []
@@ -92,11 +104,12 @@ class WaypointFollower(Node):
         self._cmd_pub = self.create_publisher(Twist, '/cmd_vel_desired', 10)
 
         hz = self.get_parameter('loop_hz').value
-        self.create_timer(1.0 / hz, self._control_loop)
+        self._dt = 1.0 / hz
+        self.create_timer(self._dt, self._control_loop)
 
         self.get_logger().info(
             f'WaypointFollower ready — {len(self._waypoints)} waypoint(s), '
-            f'align_yaw={self._align_yaw}'
+            f'align_yaw={self._align_yaw}, Kp_yaw={self._kp_yaw}, Ki_yaw={self._ki_yaw}'
         )
         if self._waypoints:
             self._state = State.MOVING
@@ -108,6 +121,8 @@ class WaypointFollower(Node):
         self._x = msg.pose.pose.position.x
         self._y = msg.pose.pose.position.y
         self._theta = _yaw_from_quaternion(
+            msg.pose.pose.orientation.x,
+            msg.pose.pose.orientation.y,
             msg.pose.pose.orientation.z,
             msg.pose.pose.orientation.w,
         )
@@ -115,7 +130,7 @@ class WaypointFollower(Node):
     def _cb_waypoints(self, msg: PoseArray):
         wps = [
             (p.position.x, p.position.y,
-             _yaw_from_quaternion(p.orientation.z, p.orientation.w))
+             _yaw_from_quaternion(p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w))
             for p in msg.poses
         ]
         if wps:
@@ -150,12 +165,15 @@ class WaypointFollower(Node):
             self._publish(v, omega)
 
             is_last = (self._wp_idx == len(self._waypoints) - 1)
-            # Intermediate waypoints: advance early (lookahead) to stay continuous.
-            # Last waypoint: wait for precise arrival.
-            threshold = self._dist_tol if is_last else self._lookahead
+            # Last waypoint: use dist_tol for precise arrival.
+            # Intermediate: use lookahead for early advance, but never below dist_tol
+            # so that lookahead=0 still triggers (d < 0 is never true otherwise).
+            threshold = self._dist_tol if is_last else max(self._lookahead, self._dist_tol)
             if d < threshold:
-                if is_last and self._align_yaw:
+                should_align = self._align_yaw and (is_last or self._align_all)
+                if should_align:
                     self._state = State.ALIGNING
+                    self._yaw_integral = 0.0
                     self.get_logger().info(
                         f'[WP {self._wp_idx}] Position reached — aligning yaw'
                     )
@@ -164,7 +182,16 @@ class WaypointFollower(Node):
 
         elif self._state == State.ALIGNING:
             e_yaw = _wrap_to_pi(yaw_goal - self._theta)
-            self._publish(0.0, _clamp(self._kp_yaw * e_yaw, -self._max_w, self._max_w))
+            self._yaw_integral = _clamp(
+                self._yaw_integral + e_yaw * self._dt,
+                -self._yaw_integral_clamp,
+                self._yaw_integral_clamp,
+            )
+            omega = _clamp(
+                self._kp_yaw * e_yaw + self._ki_yaw * self._yaw_integral,
+                -self._max_w, self._max_w,
+            )
+            self._publish(0.0, omega)
             if abs(e_yaw) < self._yaw_tol:
                 self.get_logger().info(
                     f'[WP {self._wp_idx}] Done '
@@ -173,6 +200,7 @@ class WaypointFollower(Node):
                 self._advance()
 
     def _advance(self):
+        self._yaw_integral = 0.0
         self._wp_idx += 1
         if self._wp_idx >= len(self._waypoints):
             self._state = State.DONE

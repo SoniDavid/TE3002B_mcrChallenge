@@ -14,7 +14,7 @@ camera_publisher:
 
     # nvvidconv flip-method for CSI cameras:
     # 0:none, 2:rotate-180, 4:horizontal, 6:vertical
-    flip_method: "0"
+    flip_method: 0
 
     # Publish /camera/image_compressed stream.
     publish_compressed: true
