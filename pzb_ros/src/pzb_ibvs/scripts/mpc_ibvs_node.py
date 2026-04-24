@@ -59,6 +59,23 @@ class LinearMPC:
         self._N = N
         self._A = A
         self._B = B
+        self._Q = Q
+        self._R = R
+
+        # Box constraints: lb <= U <= ub
+        self._lb = np.tile(u_min, N)
+        self._ub = np.tile(u_max, N)
+
+        self._solver = None
+        self._build_problem()
+
+    def _build_problem(self):
+        """Build condensed prediction and QP matrices for current A, B."""
+        A = self._A
+        B = self._B
+        N = self._N
+        nx = self._nx
+        nu = self._nu
 
         # Build prediction matrices: S_x (N*nx x nx), S_u (N*nx x N*nu)
         S_x = np.zeros((N * nx, nx))
@@ -73,8 +90,8 @@ class LinearMPC:
                 )
 
         # Block-diagonal cost matrices over horizon
-        Q_bar = np.kron(np.eye(N), Q)
-        R_bar = np.kron(np.eye(N), R)
+        Q_bar = np.kron(np.eye(N), self._Q)
+        R_bar = np.kron(np.eye(N), self._R)
 
         # QP Hessian: H = S_u' Q_bar S_u + R_bar
         self._H = S_u.T @ Q_bar @ S_u + R_bar
@@ -83,13 +100,14 @@ class LinearMPC:
         self._S_x = S_x
         self._Q_bar = Q_bar
 
-        # Box constraints: lb <= U <= ub
-        self._lb = np.tile(u_min, N)
-        self._ub = np.tile(u_max, N)
-
-        self._solver = None
         if _OSQP_AVAILABLE:
             self._setup_osqp()
+
+    def update_model(self, A, B):
+        """Update model matrices and rebuild the condensed QP data."""
+        self._A = A
+        self._B = B
+        self._build_problem()
 
     def _setup_osqp(self):
         N_u = self._N * self._nu
@@ -119,16 +137,20 @@ class LinearMPC:
                 return result.x[:self._nu]
             # Fall through to numpy fallback on solver failure
 
-        # Unconstrained fallback: U* = -H^{-1} f, clipped to bounds
-        U = np.linalg.solve(self._H, -f)
+        # Unconstrained fallback: U* = -H^{-1} f, clipped to bounds.
+        # Use least squares if H is singular/ill-conditioned.
+        try:
+            U = np.linalg.solve(self._H, -f)
+        except np.linalg.LinAlgError:
+            U = np.linalg.lstsq(self._H, -f, rcond=None)[0]
         U = np.clip(U, self._lb, self._ub)
         return U[:self._nu]
 
 
-def _build_interaction_matrix(fx, fy, Z_star, desired_area):
+def _build_interaction_matrix(fx, fy, Z_star, desired_area, eu=0.0, ev=0.0):
     """
-    Build the 3x2 linearised interaction matrix L_s* evaluated at s* = 0
-    (target centroid at image centre, at depth Z_star).
+    Build a local 3x2 interaction matrix L evaluated at current feature error
+    (eu, ev) and depth Z_star.
 
     Camera frame convention: z_cam = forward, x_cam = right, y_cam = down.
     Robot control inputs: [v (forward), omega (yaw, CCW positive)].
@@ -141,33 +163,27 @@ def _build_interaction_matrix(fx, fy, Z_star, desired_area):
         d/dt [xn] = [xn*vz/Z - (1+xn^2)*wy + yn*wz - vx/Z]
         d/dt [yn] = [yn*vz/Z - xn*yn*wy - xn*wz - vy/Z]
 
-    At s* = 0: xn = yn = 0. Pixel errors: eu = fx*xn, ev = fy*yn.
+        With pixel errors eu = fx*xn, ev = fy*yn, and wy = -omega:
+            d_eu/dt = (eu/Z)*v + fx*(1 + xn^2)*omega
+            d_ev/dt = (ev/Z)*v + fy*(xn*yn)*omega
+
+        At s* = 0 this simplifies to:
+            d_eu/dt = fx*omega, d_ev/dt = 0.
     Area of a projected circle: A = pi*(fx*r/Z)^2, so sqrt(A) = sqrt(pi)*fx*r/Z.
     d/dt sqrt(A) = -sqrt(pi)*fx*r/Z^2 * vz = -sqrt(A_des)/Z * v
 
     Returns L (3x2) mapping [v, omega] to [d_eu/dt, d_ev/dt, d_ea/dt].
     """
     sqrt_A_des = np.sqrt(desired_area)
+    xn = eu / fx if fx != 0.0 else 0.0
+    yn = ev / fy if fy != 0.0 else 0.0
 
-    # At xn=yn=0, vx=vy=0, vz=v, wz=0, wy=-omega:
-    #   d_xn/dt = -(-omega)*(1+0) = omega  →  d_eu/dt = fx * omega * (-1) ... let's be careful
-
-    # ẋn = xn*v/Z - (1+xn^2)*(-omega) = xn*v/Z + omega  (at xn=0: omega)
-    # ẏn = yn*v/Z - xn*yn*(-omega)                        (at yn=0, xn=0: 0)
-    # But we want d_eu/dt = fx * ẋn, d_ev/dt = fy * ẏn
-
-    # So at s*=0:
-    # d_eu/dt = fx * (0 * v/Z + omega)   = fx * omega
-    # d_ev/dt = fy * 0                   = 0
-    # d_ea/dt = -sqrt_A_des / Z * v
-
-    # Note: omega here is in rad/s. A positive omega (CCW) moves the target
-    # to the right in the image (positive eu), so the controller will apply
-    # negative omega to bring eu back to zero — which is correct.
+    # Positive omega (robot CCW) pushes the target right in the image.
+    # The optimizer applies opposite-signed omega to reduce eu.
 
     L = np.array([
-        [0.0,           fx],        # d_eu/dt = fx * omega
-        [0.0,           0.0],       # d_ev/dt ≈ 0 (zero at linearisation point)
+        [eu / Z_star,   fx * (1.0 + xn * xn)],
+        [ev / Z_star,   fy * (xn * yn)],
         [-sqrt_A_des / Z_star, 0.0],  # d_ea/dt = -sqrt_A_des/Z * v
     ])
     return L
@@ -192,6 +208,8 @@ class MPCIBVSNode(Node):
         self.declare_parameter('cy', 360.0)
         self.declare_parameter('nominal_depth_Z', 0.5)
         self.declare_parameter('desired_area', 8000.0)
+        self.declare_parameter('online_linearization', True)
+        self.declare_parameter('confidence_threshold', 0.5)
 
         Ts = self.get_parameter('Ts').value
         N = self.get_parameter('N').value
@@ -205,11 +223,18 @@ class MPCIBVSNode(Node):
         fy = self.get_parameter('fy').value
         Z_star = self.get_parameter('nominal_depth_Z').value
         desired_area = float(self.get_parameter('desired_area').value)
+        self._online_linearization = bool(self.get_parameter('online_linearization').value)
+        self._conf_threshold = float(self.get_parameter('confidence_threshold').value)
 
         self._lost_timeout = self.get_parameter('lost_timeout_s').value
         self._v_max = v_max
         self._v_min = v_min
         self._omega_max = omega_max
+        self._Ts = Ts
+        self._fx = fx
+        self._fy = fy
+        self._Z_star = Z_star
+        self._desired_area = desired_area
 
         L_star = _build_interaction_matrix(fx, fy, Z_star, desired_area)
 
@@ -250,6 +275,9 @@ class MPCIBVSNode(Node):
         self.get_logger().info(f'Interaction matrix L_s*:\n{np.array2string(L_star, precision=4)}')
 
     def _feat_callback(self, msg: Float64MultiArray):
+        if len(msg.data) < 4:
+            self.get_logger().warn('Received malformed /visual_features (expected 4 values).')
+            return
         self._feat = msg.data
         self._last_feat_time = self.get_clock().now()
 
@@ -272,9 +300,20 @@ class MPCIBVSNode(Node):
 
         eu, ev, ea, conf = self._feat
 
-        if conf < 0.5:
+        if conf < self._conf_threshold:
             self._publish_stop()
             return
+
+        if self._online_linearization:
+            L_star = _build_interaction_matrix(
+                self._fx,
+                self._fy,
+                self._Z_star,
+                self._desired_area,
+                eu=float(eu),
+                ev=float(ev),
+            )
+            self._mpc.update_model(np.eye(3), self._Ts * L_star)
 
         s0 = np.array([eu, ev, ea])
         t0 = time.monotonic()

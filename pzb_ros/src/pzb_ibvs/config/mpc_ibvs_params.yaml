@@ -50,14 +50,16 @@ mpc_ibvs_node:
 
     # Safety: stop if no detection received within this window
     lost_timeout_s: 0.5
+    # Ignore detections below this confidence.
+    confidence_threshold: 0.5
+    # Rebuild local linear model from current (eu, ev) each cycle.
+    online_linearization: true
 
-    # ── Camera intrinsics ─────────────────────────────────────────────────
-    # Approximate values for IMX219 at 1280x720.
-    # For best results run camera calibration and replace these.
-    fx: 640.0
-    fy: 640.0
-    cx: 640.0
-    cy: 360.0
+    # ── Camera intrinsics (calibrated: RMS 0.577478 px, camera_info_8x5_3cm.yaml)
+    fx: 972.5872931058249
+    fy: 976.8162716689993
+    cx: 635.4928589069335
+    cy: 367.1861023804187
 
     # Estimated depth Z [m] at the desired goal pose (robot distance from target).
     # This is used to build the linearised interaction matrix. Tune to match your
