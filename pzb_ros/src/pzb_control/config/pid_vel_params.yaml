@@ -13,8 +13,8 @@ velocity_controller:
     kp_v: 0.5
     ki_v: 0.1
     kd_v: 0.0
-    kp_w: 0.8
-    ki_w: 0.1
+    kp_w: 0.5
+    ki_w: 0.0
     kd_w: 0.0
     integral_clamp: 0.2
     loop_hz: 50.0
@@ -22,7 +22,7 @@ velocity_controller:
     max_angular_speed: 1.50
     cmd_timeout_s: 0.50
     deadzone_comp_v: 0.0   # snap small linear commands up to this threshold (m/s); 0 = disabled
-    deadzone_comp_w: 0.10  # snap small angular commands up to this threshold (rad/s); 0 = disabled
+    deadzone_comp_w: 0.0   # snap small angular commands up to this threshold (rad/s); 0 = disabled
     robot_vel_stale_timeout_s: 0.10  # if /robot_vel is older than this, publish zero /cmd_vel
     min_dt_s: 0.005                 # reject too-small control dt to avoid transient spikes
     hold_zero_until_feedback: true  # keep /cmd_vel=0 until first /robot_vel sample arrives
@@ -32,39 +32,53 @@ waypoint_follower:
   ros__parameters:
     use_sim_time: false
     Kp_dist: 1.0
-    Kp_yaw: 2.0
-    Ki_yaw: 0.3              # integral gain for yaw alignment; 0.0 = P-only
-    yaw_integral_clamp: 0.5  # anti-windup clamp on yaw integral (rad)
-    dist_tol_m: 0.05
-    yaw_tol_rad: 0.03
-    max_linear_speed: 0.40
-    max_angular_speed: 1.20
-    min_linear_speed: 0.05  # dead zone — below this speed command 0 to prevent creep
-    align_yaw: true                # rotate to target yaw at waypoints
-    align_at_all_waypoints: true   # stop and align at every corner, not just the last
-    lookahead_dist: 0.10           # no early advance — wait for dist_tol before aligning
-    loop_hz: 20.0
-    # Waypoints: flat list [x0, y0, yaw0, x1, y1, yaw1, ...]
-    waypoints_xyyaw: [
-      0.0000, 0.0000,  0.0000,
-      0.3000, 0.0000,  2.0944,
-      0.1500, 0.2598, -2.0944,
-      0.0000, 0.0000,  0.0000
-    ]
-    # waypoints_xyyaw: [
-    #   0.8,  0.0,  0.0,
-    #   0.8,  0.8,  0.8,
-    # ]
+    Kp_yaw: 1.2
+    Ki_yaw: 0.0
 
+    # Angle parameters — specified in DEGREES, converted to radians internally
+    yaw_tol_deg: 2.0              # heading tolerance to exit ALIGNING
+    decel_zone_deg: 30.0          # start ramping ω down this many degrees before target
+    yaw_integral_clamp_deg: 30.0  # anti-windup clamp on yaw integral
+
+    # Motor deadband: omega commands below this (rad/s) are zeroed to prevent
+    # the wheel PID from hunting at the MCU deadzone boundary (~0.054 rad/s).
+    omega_deadband_rad_s: 0.08
+
+    dist_tol_m: 0.05
+    max_linear_speed: 0.40
+    max_angular_speed: 0.8
+    min_linear_speed: 0.05
+    blend_radius_m: 0.40          # start blending toward goal heading (meters from waypoint)
+    align_yaw: false
+    align_at_all_waypoints: false
+    lookahead_dist: 0.10
+    loop_hz: 20.0
+
+    # Waypoints: flat list [x0, y0, yaw0_deg, x1, y1, yaw1_deg, ...]
+    # Yaw values are in DEGREES
+    waypoints_xyyaw: [
+      0.0,  0.0,    0.0,
+      0.5,  0.0,    0.0,
+      0.5,  0.5,   90.0,
+      0.0,  0.5,  180.0,
+      0.0,  0.0,  -90.0,
+      0.0,  0.0,    0.0
+    ]
+
+    # --- Example paths (yaw in degrees) ---
+    # Simple L-shape:
+    # waypoints_xyyaw: [0.8, 0.0, 0.0,   0.8, 0.8, 90.0]
+
+    # Octagon:
     # waypoints_xyyaw: [
-    #   0.354,  0.146,  0.7854,
-    #   0.500,  0.500,  1.5708,
-    #   0.354,  0.854,  2.3562,
-    #   0.000,  1.000,  3.1416,
-    #   -0.354,  0.854, -2.3562,
-    #   -0.500,  0.500, -1.5708,
-    #   -0.354,  0.146, -0.7854,
-    #   0.000,  0.000,  0.0000
-    #   ]
+    #    0.354,  0.146,   45.0,
+    #    0.500,  0.500,   90.0,
+    #    0.354,  0.854,  135.0,
+    #    0.000,  1.000,  180.0,
+    #   -0.354,  0.854, -135.0,
+    #   -0.500,  0.500,  -90.0,
+    #   -0.354,  0.146,  -45.0,
+    #    0.000,  0.000,    0.0
+    # ]
 
 

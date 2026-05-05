@@ -2,19 +2,24 @@
 """
 Linear MPC node for Image-Based Visual Servoing (IBVS).
 
-State:    s = [eu, ev, ea]   (pixel centroid errors + scale error)
-Control:  u = [v, omega]     (linear and angular velocity)
+State:    x = [eu, ev, ea, v, omega]   (pixel errors + scale error + actual body velocities)
+Control:  u = [v_cmd, omega_cmd]       (linear and angular velocity commands)
 
-The prediction model is a linearisation of the interaction matrix at s* = 0:
+Prediction model — augmented state with first-order velocity dynamics:
 
-    s_{k+1} = A * s_k + B * u_k
-    A = I_3
-    B = Ts * L_s*             (3x2, built from camera intrinsics at goal depth)
+    x_{k+1} = A(L) * x_k + B * u_k
 
+    A is 5×5: image rows couple to velocity states via interaction matrix L;
+              velocity rows model closed-loop first-order response.
+    B is 5×2: only velocity states are directly driven by commands.
+              Image states are driven through the velocity states (captures actuator lag).
+
+Linearisation of L is refreshed each cycle from current (eu, ev) — LTV-MPC.
 The QP is condensed over the horizon N and solved with OSQP.
 
 Subscribes:
   /visual_features  (std_msgs/Float64MultiArray)  [eu, ev, ea, confidence]
+  /robot_vel        (geometry_msgs/TwistStamped)  actual body velocity from MCU
 
 Publishes:
   /cmd_vel_desired  (geometry_msgs/Twist)
@@ -27,14 +32,22 @@ import scipy.sparse as sp
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, TwistStamped
 from std_msgs.msg import Float64MultiArray
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 
 try:
     import osqp
     _OSQP_AVAILABLE = True
 except ImportError:
     _OSQP_AVAILABLE = False
+
+_MCU_QOS = QoSProfile(
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    durability=DurabilityPolicy.VOLATILE,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=10,
+)
 
 
 def _clamp(v, lo, hi):
@@ -126,9 +139,9 @@ class LinearMPC:
             polish=False,
         )
 
-    def solve(self, s0):
-        """Return optimal u_0* given initial state s0 (shape (nx,))."""
-        f = self._S_u.T @ self._Q_bar @ (self._S_x @ s0)
+    def solve(self, x0):
+        """Return optimal u_0* given initial state x0 (shape (nx,))."""
+        f = self._S_u.T @ self._Q_bar @ (self._S_x @ x0)
 
         if self._solver is not None:
             self._solver.update(q=f)
@@ -189,6 +202,48 @@ def _build_interaction_matrix(fx, fy, Z_star, desired_area, eu=0.0, ev=0.0):
     return L
 
 
+def _build_augmented_model(L: np.ndarray, Ts: float,
+                           tau_v: float, tau_o: float):
+    """
+    Build 5×5 augmented state-space model with first-order velocity dynamics.
+
+    State:   x = [eu, ev, ea, v, omega]  (5,)
+    Control: u = [v_cmd, omega_cmd]      (2,)
+
+    Image dynamics (driven by actual velocity states, not commands directly):
+        eu_{k+1}    = eu_k + Ts*(L[0,0]*v_k + L[0,1]*omega_k)
+        ev_{k+1}    = ev_k + Ts*(L[1,0]*v_k + L[1,1]*omega_k)
+        ea_{k+1}    = ea_k + Ts*(L[2,0]*v_k)
+
+    Closed-loop velocity dynamics (first-order ZOH, captures actuator lag):
+        v_{k+1}     = (1 - Ts/tau_v)*v_k     + (Ts/tau_v)*v_cmd_k
+        omega_{k+1} = (1 - Ts/tau_o)*omega_k + (Ts/tau_o)*omega_cmd_k
+
+    tau_v and tau_o are the closed-loop step-response time constants of the
+    full velocity cascade (Jetson PI + MCU PID). Identify via step response test.
+
+    Returns A (5x5), B (5x2).
+    """
+    alpha_v = Ts / tau_v
+    alpha_o = Ts / tau_o
+
+    A = np.array([
+        [1., 0., 0., Ts * L[0, 0], Ts * L[0, 1]],
+        [0., 1., 0., Ts * L[1, 0], Ts * L[1, 1]],
+        [0., 0., 1., Ts * L[2, 0], 0.           ],
+        [0., 0., 0., 1. - alpha_v, 0.            ],
+        [0., 0., 0., 0.,           1. - alpha_o  ],
+    ])
+    B = np.array([
+        [0.,      0.     ],
+        [0.,      0.     ],
+        [0.,      0.     ],
+        [alpha_v, 0.     ],
+        [0.,      alpha_o],
+    ])
+    return A, B
+
+
 class MPCIBVSNode(Node):
 
     def __init__(self):
@@ -210,6 +265,8 @@ class MPCIBVSNode(Node):
         self.declare_parameter('desired_area', 8000.0)
         self.declare_parameter('online_linearization', True)
         self.declare_parameter('confidence_threshold', 0.5)
+        self.declare_parameter('tau_v',     0.15)
+        self.declare_parameter('tau_omega', 0.10)
 
         Ts = self.get_parameter('Ts').value
         N = self.get_parameter('N').value
@@ -235,12 +292,15 @@ class MPCIBVSNode(Node):
         self._fy = fy
         self._Z_star = Z_star
         self._desired_area = desired_area
+        self._tau_v = self.get_parameter('tau_v').value
+        self._tau_omega = self.get_parameter('tau_omega').value
 
         L_star = _build_interaction_matrix(fx, fy, Z_star, desired_area)
+        A, B = _build_augmented_model(L_star, Ts, self._tau_v, self._tau_omega)
 
-        A = np.eye(3)
-        B = Ts * L_star
-        Q = np.diag(Q_diag)
+        # Q is 5×5: penalize image features only; v/omega are prediction states
+        Q_diag_full = list(Q_diag) + [0.0, 0.0]
+        Q = np.diag(Q_diag_full)
         R = np.diag(R_diag)
         u_min = np.array([v_min, -omega_max])
         u_max = np.array([v_max, omega_max])
@@ -255,12 +315,20 @@ class MPCIBVSNode(Node):
 
         self._feat = None          # latest [eu, ev, ea, conf]
         self._last_feat_time = None
+        self._v_meas = 0.0         # actual linear velocity from /robot_vel [m/s]
+        self._omega_meas = 0.0     # actual angular velocity from /robot_vel [rad/s]
 
         self.create_subscription(
             Float64MultiArray,
             '/visual_features',
             self._feat_callback,
             10,
+        )
+        self.create_subscription(
+            TwistStamped,
+            '/robot_vel',
+            self._robot_vel_callback,
+            _MCU_QOS,
         )
 
         self._cmd_pub = self.create_publisher(Twist, '/cmd_vel_desired', 10)
@@ -270,6 +338,7 @@ class MPCIBVSNode(Node):
         self.get_logger().info(
             f'MPCIBVSNode ready — N={N}, Ts={Ts}s, '
             f'v=[{v_min:.2f},{v_max:.2f}], omega_max={omega_max:.2f}, '
+            f'tau_v={self._tau_v:.3f}s, tau_omega={self._tau_omega:.3f}s, '
             f'OSQP={_OSQP_AVAILABLE}'
         )
         self.get_logger().info(f'Interaction matrix L_s*:\n{np.array2string(L_star, precision=4)}')
@@ -280,6 +349,10 @@ class MPCIBVSNode(Node):
             return
         self._feat = msg.data
         self._last_feat_time = self.get_clock().now()
+
+    def _robot_vel_callback(self, msg: TwistStamped):
+        self._v_meas = msg.twist.linear.x
+        self._omega_meas = msg.twist.angular.z
 
     def _control_loop(self):
         now = self.get_clock().now()
@@ -313,11 +386,15 @@ class MPCIBVSNode(Node):
                 eu=float(eu),
                 ev=float(ev),
             )
-            self._mpc.update_model(np.eye(3), self._Ts * L_star)
+            A_aug, B_aug = _build_augmented_model(
+                L_star, self._Ts, self._tau_v, self._tau_omega
+            )
+            self._mpc.update_model(A_aug, B_aug)
 
-        s0 = np.array([eu, ev, ea])
+        # Augmented initial state: image features + actual body velocities
+        x0 = np.array([eu, ev, ea, self._v_meas, self._omega_meas])
         t0 = time.monotonic()
-        u_opt = self._mpc.solve(s0)
+        u_opt = self._mpc.solve(x0)
         dt_solve = (time.monotonic() - t0) * 1e3
 
         v = _clamp(float(u_opt[0]), self._v_min, self._v_max)

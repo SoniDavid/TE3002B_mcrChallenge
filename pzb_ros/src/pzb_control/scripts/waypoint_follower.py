@@ -27,6 +27,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseArray, Twist
 from nav_msgs.msg import Odometry
+from std_msgs.msg import Float32
 
 
 def _wrap_to_pi(angle: float) -> float:
@@ -57,9 +58,9 @@ class WaypointFollower(Node):
         self.declare_parameter('Kp_dist', 1.0)
         self.declare_parameter('Kp_yaw', 2.0)
         self.declare_parameter('Ki_yaw', 0.3)
-        self.declare_parameter('yaw_integral_clamp', 0.5)
+        self.declare_parameter('yaw_integral_clamp_deg', 30.0)
         self.declare_parameter('dist_tol_m', 0.05)
-        self.declare_parameter('yaw_tol_rad', 0.05)
+        self.declare_parameter('yaw_tol_deg', 3.0)
         self.declare_parameter('max_linear_speed', 0.20)
         self.declare_parameter('max_angular_speed', 1.20)
         self.declare_parameter('min_linear_speed', 0.05)  # dead zone: below this → 0
@@ -71,21 +72,27 @@ class WaypointFollower(Node):
         # so the robot never slows to zero between waypoints.
         # Set to 0.0 to disable early advance (requires align_at_all_waypoints for clean corners).
         self.declare_parameter('lookahead_dist', 0.15)
+        self.declare_parameter('decel_zone_deg', 30.0)
+        self.declare_parameter('blend_radius_m', 0.20)
+        self.declare_parameter('omega_deadband_rad_s', 0.08)
         self.declare_parameter('loop_hz', 20.0)
         self.declare_parameter('waypoints_xyyaw', [0.5, 0.0, 0.0])
 
         self._kp_dist = self.get_parameter('Kp_dist').value
         self._kp_yaw = self.get_parameter('Kp_yaw').value
         self._ki_yaw = self.get_parameter('Ki_yaw').value
-        self._yaw_integral_clamp = self.get_parameter('yaw_integral_clamp').value
+        self._yaw_integral_clamp = math.radians(self.get_parameter('yaw_integral_clamp_deg').value)
         self._dist_tol = self.get_parameter('dist_tol_m').value
-        self._yaw_tol = self.get_parameter('yaw_tol_rad').value
+        self._yaw_tol = math.radians(self.get_parameter('yaw_tol_deg').value)
         self._max_v = self.get_parameter('max_linear_speed').value
         self._max_w = self.get_parameter('max_angular_speed').value
         self._min_v = self.get_parameter('min_linear_speed').value
         self._align_yaw = self.get_parameter('align_yaw').value
         self._align_all = self.get_parameter('align_at_all_waypoints').value
         self._lookahead = self.get_parameter('lookahead_dist').value
+        self._decel_zone = math.radians(self.get_parameter('decel_zone_deg').value)
+        self._blend_radius = self.get_parameter('blend_radius_m').value
+        self._omega_deadband = float(self.get_parameter('omega_deadband_rad_s').value)
 
         self._x = 0.0
         self._y = 0.0
@@ -99,8 +106,11 @@ class WaypointFollower(Node):
         raw = self.get_parameter('waypoints_xyyaw').value
         self._load_from_list(raw)
 
+        self._speed_scale = 1.0
+
         self.create_subscription(Odometry, '/odom', self._cb_odom, 10)
         self.create_subscription(PoseArray, '/waypoints', self._cb_waypoints, 10)
+        self.create_subscription(Float32, '/traffic_speed_scale', self._cb_speed_scale, 10)
         self._cmd_pub = self.create_publisher(Twist, '/cmd_vel_desired', 10)
 
         hz = self.get_parameter('loop_hz').value
@@ -116,6 +126,9 @@ class WaypointFollower(Node):
             self.get_logger().info(f'Moving to WP 0: {self._waypoints[0]}')
 
     #  Subscribers
+
+    def _cb_speed_scale(self, msg: Float32):
+        self._speed_scale = float(msg.data)
 
     def _cb_odom(self, msg: Odometry):
         self._x = msg.pose.pose.position.x
@@ -154,29 +167,51 @@ class WaypointFollower(Node):
             dx = xg - self._x
             dy = yg - self._y
             d = math.hypot(dx, dy)
-            alpha = _wrap_to_pi(math.atan2(dy, dx) - self._theta)
-
-            v = _clamp(self._kp_dist * d * max(0.0, math.cos(alpha)),
-                       0.0, self._max_v)
-            # Dead zone: ignore tiny computed speeds — prevents post-goal creep
-            if v < self._min_v:
-                v = 0.0
-            omega = _clamp(self._kp_yaw * alpha, -self._max_w, self._max_w)
-            self._publish(v, omega)
+            alpha_path = _wrap_to_pi(math.atan2(dy, dx) - self._theta)
 
             is_last = (self._wp_idx == len(self._waypoints) - 1)
+            should_align = self._align_yaw and (is_last or self._align_all)
+
+            # Heading blend: within blend_radius, smoothly rotate toward the
+            # goal heading rather than purely steering at the waypoint.
+            # v is always computed from alpha_path so forward progress is unaffected.
+            if should_align and self._blend_radius > 0.0 and d < self._blend_radius:
+                blend = _clamp(1.0 - d / self._blend_radius, 0.0, 1.0)
+                alpha_goal = _wrap_to_pi(yaw_goal - self._theta)
+                # Interpolate along the shortest angular arc
+                alpha_diff = _wrap_to_pi(alpha_goal - alpha_path)
+                alpha_for_omega = _wrap_to_pi(alpha_path + blend * alpha_diff)
+            else:
+                alpha_for_omega = alpha_path
+
+            v = _clamp(self._kp_dist * d * max(0.0, math.cos(alpha_path)),
+                       0.0, self._max_v)
+            if v < self._min_v:
+                v = 0.0
+            omega = _clamp(self._kp_yaw * alpha_for_omega, -self._max_w, self._max_w)
+
+            # Traffic light gate: scale=0.0 means full stop (red latch)
+            if self._speed_scale <= 0.0:
+                self._publish(0.0, 0.0)
+            else:
+                self._publish(v * self._speed_scale, omega)
+
             # Last waypoint: use dist_tol for precise arrival.
-            # Intermediate: use lookahead for early advance, but never below dist_tol
-            # so that lookahead=0 still triggers (d < 0 is never true otherwise).
+            # Intermediate: use lookahead for early advance, but never below dist_tol.
             threshold = self._dist_tol if is_last else max(self._lookahead, self._dist_tol)
             if d < threshold:
-                should_align = self._align_yaw and (is_last or self._align_all)
                 if should_align:
-                    self._state = State.ALIGNING
-                    self._yaw_integral = 0.0
-                    self.get_logger().info(
-                        f'[WP {self._wp_idx}] Position reached — aligning yaw'
-                    )
+                    e_yaw = _wrap_to_pi(yaw_goal - self._theta)
+                    if abs(e_yaw) > self._yaw_tol:
+                        # Blending didn't fully converge — fine-correct with ALIGNING
+                        self._state = State.ALIGNING
+                        self._yaw_integral = 0.0
+                        self.get_logger().info(
+                            f'[WP {self._wp_idx}] Position reached — '
+                            f'aligning yaw ({math.degrees(e_yaw):.1f}° remaining)'
+                        )
+                    else:
+                        self._advance()
                 else:
                     self._advance()
 
@@ -187,10 +222,18 @@ class WaypointFollower(Node):
                 -self._yaw_integral_clamp,
                 self._yaw_integral_clamp,
             )
+            # Ramp down max ω proportionally inside the decel zone so the robot
+            # decelerates into the target heading instead of snapping to zero.
+            w_cap = _clamp(abs(e_yaw) / max(self._decel_zone, 1e-6) * self._max_w,
+                           0.0, self._max_w)
             omega = _clamp(
                 self._kp_yaw * e_yaw + self._ki_yaw * self._yaw_integral,
-                -self._max_w, self._max_w,
+                -w_cap, w_cap,
             )
+            # Below the motor deadzone the wheel alternates start/stop → whine.
+            # Zero the command instead so the motor stops cleanly.
+            if abs(omega) < self._omega_deadband:
+                omega = 0.0
             self._publish(0.0, omega)
             if abs(e_yaw) < self._yaw_tol:
                 self.get_logger().info(
@@ -200,6 +243,7 @@ class WaypointFollower(Node):
                 self._advance()
 
     def _advance(self):
+        self._publish(0.0, 0.0)
         self._yaw_integral = 0.0
         self._wp_idx += 1
         if self._wp_idx >= len(self._waypoints):
@@ -223,7 +267,10 @@ class WaypointFollower(Node):
                 f'waypoints_xyyaw has {len(raw)} elements — must be multiple of 3.'
             )
             return
-        self._waypoints = [(raw[i], raw[i+1], raw[i+2]) for i in range(0, len(raw), 3)]
+        self._waypoints = [
+            (raw[i], raw[i + 1], math.radians(raw[i + 2]))
+            for i in range(0, len(raw), 3)
+        ]
 
 
 def main(args=None):

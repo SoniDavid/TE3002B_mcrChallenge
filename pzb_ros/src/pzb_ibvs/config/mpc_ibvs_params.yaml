@@ -11,17 +11,16 @@ visual_detector_node:
     cy: -1.0
 
     # Apparent area (pixels²) of the target when at the desired servoing distance.
-    # Tune this by placing the robot at the goal distance and reading the area from
-    # the debug image.
-    desired_area: 8000.0
+    # Yellow cube 5.5×5.5 cm face at 0.5 m → side ≈ 107 px → area ≈ 11444 px²
+    # Tune by placing the robot at goal distance and reading area from debug image.
+    desired_area: 11444.0
 
-    # ── Color blob (ball) ──────────────────────────────────────────────────
-    # HSV range for the ball. Use the HSV tuner to find these values.
-    # Example: orange ball  lower=[5,120,80] upper=[20,255,255]
-    #          red ball      requires two ranges (hue wraps at 180)
-    hsv_lower: [5, 120, 80]
-    hsv_upper: [20, 255, 255]
-    ball_diameter_m: 0.065      # physical diameter of the ball in metres
+    # ── Color blob (yellow cube) ───────────────────────────────────────────
+    # HSV range for the yellow cube. OpenCV HSV: H∈[0,180], S/V∈[0,255].
+    # Yellow hue is ~20–35. Adjust under your lighting if needed.
+    hsv_lower: [20, 100, 100]
+    hsv_upper: [35, 255, 255]
+    ball_diameter_m: 0.055      # cube side length [m] — used for depth estimation
     min_contour_area: 500.0     # discard detections smaller than this (px²)
 
     # ── ArUco marker ───────────────────────────────────────────────────────
@@ -67,4 +66,15 @@ mpc_ibvs_node:
     nominal_depth_Z: 0.50
 
     # Must match visual_detector_node/desired_area
-    desired_area: 8000.0
+    desired_area: 11444.0
+
+    # ── Velocity dynamics augmentation ────────────────────────────────────────
+    # First-order closed-loop time constants for the velocity step response.
+    # They model the combined lag of the Jetson velocity_controller PI + MCU wheel PID.
+    # Identify via step response:
+    #   ros2 topic pub /cmd_vel_desired geometry_msgs/msg/Twist \
+    #     "{linear: {x: 0.15}}" --rate 20
+    #   rqt_plot /robot_vel/twist/linear/x
+    # tau = time for the response to reach 63% of the commanded value.
+    tau_v:     0.15   # linear velocity time constant [s]
+    tau_omega: 0.10   # angular velocity time constant [s] (typically faster)
