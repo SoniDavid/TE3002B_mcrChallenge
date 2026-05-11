@@ -11,9 +11,12 @@ visual_detector_node:
     cy: -1.0
 
     # Apparent area (pixels²) of the target when at the desired servoing distance.
-    # Yellow cube 5.5×5.5 cm face at 0.5 m → side ≈ 107 px → area ≈ 11444 px²
-    # Tune by placing the robot at goal distance and reading area from debug image.
-    desired_area: 11444.0
+    # Formula: (cube_side_m * fx / nominal_depth_Z)^2
+    #   640x480 USB cam  (fx≈486): (0.055 * 486 / 0.5)^2 ≈  2862 px²  ← current
+    #   1280x720 CSI cam (fx≈972): (0.055 * 972 / 0.5)^2 ≈ 11444 px²
+    # Calibrate physically: place cube at 0.5 m, run detect_only, read ea from
+    # /visual_features. When ea≈0, desired_area is correct.
+    desired_area: 2862.0
 
     # ── Color blob (yellow cube) ───────────────────────────────────────────
     # HSV range for the yellow cube. OpenCV HSV: H∈[0,180], S/V∈[0,255].
@@ -54,11 +57,15 @@ mpc_ibvs_node:
     # Rebuild local linear model from current (eu, ev) each cycle.
     online_linearization: true
 
-    # ── Camera intrinsics (calibrated: RMS 0.577478 px, camera_info_8x5_3cm.yaml)
-    fx: 972.5872931058249
-    fy: 976.8162716689993
-    cx: 635.4928589069335
-    cy: 367.1861023804187
+    # ── Camera intrinsics
+    # USB camera 640x480 — scaled from CSI calibration (fx_csi=972.59, same horizontal FOV).
+    # Square-pixel assumption: fy scaled by same factor as fx (640/1280 = 0.5).
+    # cx/cy = image center, matches auto-detect in visual_detector_node.
+    # For best accuracy, run a proper calibration on the USB camera.
+    fx: 486.2936
+    fy: 488.4081
+    cx: 320.0
+    cy: 240.0
 
     # Estimated depth Z [m] at the desired goal pose (robot distance from target).
     # This is used to build the linearised interaction matrix. Tune to match your
@@ -66,7 +73,8 @@ mpc_ibvs_node:
     nominal_depth_Z: 0.50
 
     # Must match visual_detector_node/desired_area
-    desired_area: 11444.0
+    # Also update fx/fy if using USB cam at 640x480 (fx≈486, fy≈488)
+    desired_area: 2862.0
 
     # ── Velocity dynamics augmentation ────────────────────────────────────────
     # First-order closed-loop time constants for the velocity step response.

@@ -63,12 +63,13 @@ class VisualDetectorNode(Node):
 
         # Read params
         self._det_type = self.get_parameter('detector_type').value
-        w = self.get_parameter('image_width').value
-        h = self.get_parameter('image_height').value
-        cx = self.get_parameter('cx').value
-        cy = self.get_parameter('cy').value
-        self._cx = cx if cx >= 0 else w / 2.0
-        self._cy = cy if cy >= 0 else h / 2.0
+        _cx_param = self.get_parameter('cx').value
+        _cy_param = self.get_parameter('cy').value
+        # None means "auto-detect from the first received frame".
+        # This handles cameras that negotiate a different resolution than the params say
+        # (e.g. USB camera giving 640x480 when image_width=1280 is in the YAML).
+        self._cx = float(_cx_param) if _cx_param >= 0 else None
+        self._cy = float(_cy_param) if _cy_param >= 0 else None
         self._desired_area = float(self.get_parameter('desired_area').value)
         self._sqrt_desired_area = np.sqrt(self._desired_area)
         self._min_contour_area = self.get_parameter('min_contour_area').value
@@ -107,9 +108,11 @@ class VisualDetectorNode(Node):
             _BEST_EFFORT_QOS,
         )
 
+        cx_str = 'auto' if self._cx is None else f'{self._cx:.1f}'
+        cy_str = 'auto' if self._cy is None else f'{self._cy:.1f}'
         self.get_logger().info(
             f'VisualDetectorNode ready — detector={self._det_type}, '
-            f'cx={self._cx:.1f}, cy={self._cy:.1f}, '
+            f'cx={cx_str}, cy={cy_str}, '
             f'desired_area={self._desired_area:.1f}'
         )
 
@@ -138,6 +141,18 @@ class VisualDetectorNode(Node):
         frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
         if frame is None:
             return
+
+        # Auto-set cx/cy from the actual frame on the first callback.
+        # This is correct regardless of what image_width/height params say,
+        # so a USB camera that negotiates 640x480 is handled automatically.
+        if self._cx is None:
+            frame_h, frame_w = frame.shape[:2]
+            self._cx = frame_w / 2.0
+            self._cy = frame_h / 2.0
+            self.get_logger().info(
+                f'Auto-detected frame {frame_w}x{frame_h} — '
+                f'cx={self._cx:.1f}, cy={self._cy:.1f}'
+            )
 
         if self._det_type == 'aruco':
             eu, ev, ea, conf, frame = self._detect_aruco(frame)
