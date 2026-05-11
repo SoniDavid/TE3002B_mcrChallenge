@@ -71,19 +71,25 @@ class USBCameraPublisher(Node):
         # ── Camera Initialization ──────────────────────────────────────────
         self.get_logger().info(f'Opening USB camera at /dev/video{device_index}')
         self._cap = cv2.VideoCapture(device_index, cv2.CAP_V4L2)
-        
+
         if not self._cap.isOpened():
             self.get_logger().fatal(f'Failed to open /dev/video{device_index}.')
             raise RuntimeError('USB Camera open failed')
 
-        # Set resolution
+        # Request MJPEG from the camera before setting resolution.
+        # At resolutions above 640x480 most USB cameras only support MJPEG (not raw
+        # YUYV), and without this flag V4L2 returns garbled green frames.
+        self._cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
-        # Attempt to set FPS
         self._cap.set(cv2.CAP_PROP_FPS, self._fps)
 
+        actual_w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        actual_fps = self._cap.get(cv2.CAP_PROP_FPS)
         self.get_logger().info(
-            f'USB Camera ready: {self._width}x{self._height} '
+            f'USB Camera ready: {actual_w}x{actual_h} @ {actual_fps:.1f} fps '
+            f'(requested {self._width}x{self._height}) '
             f'publish_compressed={self._publish_compressed_enabled} '
             f'publish_raw={self._publish_raw_enabled}'
         )

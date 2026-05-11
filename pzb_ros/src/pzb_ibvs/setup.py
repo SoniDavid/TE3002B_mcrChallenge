@@ -19,8 +19,6 @@ setup(
         'setuptools',
         'numpy',
         'scipy',
-        'osqp',
-        'opencv-python',
     ],
     zip_safe=True,
     maintainer='Student',
