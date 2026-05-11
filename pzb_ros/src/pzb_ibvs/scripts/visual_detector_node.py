@@ -13,8 +13,8 @@ Subscribes:
   /camera/image_compressed  (sensor_msgs/CompressedImage)
 
 Publishes:
-  /visual_features           (std_msgs/Float64MultiArray)  [eu, ev, ea, confidence]
-  /visual_detector/debug_image (sensor_msgs/Image)          annotated frame
+  /visual_features                          (std_msgs/Float64MultiArray)  [eu, ev, ea, confidence]
+  /visual_detector/debug_image/compressed  (sensor_msgs/CompressedImage) annotated frame (JPEG)
 """
 
 import signal
@@ -88,9 +88,16 @@ class VisualDetectorNode(Node):
         # Morphological kernel for noise removal
         self._morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
 
+        self.declare_parameter('debug_jpeg_quality', 60)
+        self._dbg_quality = int(self.get_parameter('debug_jpeg_quality').value)
+
         # Publishers
         self._feat_pub = self.create_publisher(Float64MultiArray, '/visual_features', 10)
-        self._dbg_pub = self.create_publisher(Image, '/visual_detector/debug_image', 1)
+        # Publish debug image compressed so it can be streamed over the network at full fps.
+        # Subscribe with: rqt_image_view /visual_detector/debug_image/compressed
+        # Or decompress with: ros2 run pzb_camera image_decompressor
+        self._dbg_pub = self.create_publisher(
+            CompressedImage, '/visual_detector/debug_image/compressed', 1)
 
         # Subscriber
         self.create_subscription(
@@ -242,16 +249,14 @@ class VisualDetectorNode(Node):
         cv2.line(frame, (cx, cy - 20), (cx, cy + 20), (255, 255, 0), 1)
 
     def _publish_debug(self, frame, stamp):
-        h, w, c = frame.shape
-        msg = Image()
+        ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, self._dbg_quality])
+        if not ok:
+            return
+        msg = CompressedImage()
         msg.header.stamp = stamp
         msg.header.frame_id = 'camera_optical_frame'
-        msg.height = h
-        msg.width = w
-        msg.encoding = 'bgr8'
-        msg.is_bigendian = 0
-        msg.step = w * c
-        msg.data = frame.tobytes()
+        msg.format = 'jpeg'
+        msg.data = buf.tobytes()
         self._dbg_pub.publish(msg)
 
 
