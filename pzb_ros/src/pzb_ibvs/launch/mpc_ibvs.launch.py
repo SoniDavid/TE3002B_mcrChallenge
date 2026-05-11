@@ -3,11 +3,12 @@
 Full MPC-IBVS stack launch file.
 
 Brings up:
-  1. camera_publisher        (pzb_camera)  — CSI (Jetson) or USB
-  2. odometry_node           (pzb_control)
-  3. velocity_controller     (pzb_control)
-  4. visual_detector_node    (pzb_ibvs)
-  5. mpc_ibvs_node           (pzb_ibvs)
+  1. micro_ros_agent         (micro_ros_agent) — bridges /dev/ttyUSB0 → ROS2 topics
+  2. camera_publisher        (pzb_camera)  — CSI (Jetson) or USB
+  3. odometry_node           (pzb_control)
+  4. velocity_controller     (pzb_control)
+  5. visual_detector_node    (pzb_ibvs)
+  6. mpc_ibvs_node           (pzb_ibvs)
 
 The MPC outputs /cmd_vel_desired which feeds directly into the existing
 velocity_controller inner loop.
@@ -55,6 +56,14 @@ def generate_launch_description():
     detector_type   = LaunchConfiguration('detector_type')
     camera_type     = LaunchConfiguration('camera_type')
     device_index    = LaunchConfiguration('device_index')
+
+    micro_ros_node = Node(
+        package='micro_ros_agent',
+        executable='micro_ros_agent',
+        name='micro_ros_agent',
+        output='screen',
+        arguments=['serial', '--dev', '/dev/ttyUSB0'],
+    )
 
     is_usb = PythonExpression(["'", camera_type, "' == 'usb'"])
 
@@ -123,6 +132,7 @@ def generate_launch_description():
         detector_arg,
         camera_type_arg,
         device_index_arg,
+        micro_ros_node,
         csi_camera_node,
         usb_camera_node,
         odom_node,
