@@ -6,9 +6,11 @@ visual_detector_node:
 
     image_width: 1280
     image_height: 720
-    # cx/cy: image principal point (negative → use image_width/2, image_height/2)
+    # cx/cy: desired convergence point in the image (negative → use image_width/2, image_height/2).
+    # Camera is mounted near the floor → target appears in the lower part of the image.
+    # cy=360 places the reference at 75% of 480p height (row 360 from top). Tune as needed.
     cx: -1.0
-    cy: -1.0
+    cy: 360.0
 
     # Apparent area (pixels²) of the target when at the desired servoing distance.
     # Formula: (cube_side_m * fx / nominal_depth_Z)^2
@@ -20,11 +22,16 @@ visual_detector_node:
 
     # ── Color blob (yellow cube) ───────────────────────────────────────────
     # HSV range for the yellow cube. OpenCV HSV: H∈[0,180], S/V∈[0,255].
-    # Yellow hue is ~20–35. Adjust under your lighting if needed.
-    hsv_lower: [20, 100, 100]
-    hsv_upper: [35, 255, 255]
+    # Yellow hue is ~20–35. Widened ±2° in hue, S/V lowered to handle dim lighting.
+    hsv_lower: [18, 70, 70]
+    hsv_upper: [38, 255, 255]
     ball_diameter_m: 0.055      # cube side length [m] — used for depth estimation
     min_contour_area: 500.0     # discard detections smaller than this (px²)
+
+    # Temporal holdoff: keep last valid detection for this many consecutive
+    # failed frames before reporting conf=0. Prevents single-frame dropouts
+    # from triggering the lost_timeout countdown in the MPC.
+    detection_holdoff_frames: 3
 
     # ── ArUco marker ───────────────────────────────────────────────────────
     marker_id: 0                # integer ID to track
@@ -40,20 +47,36 @@ mpc_ibvs_node:
     Ts: 0.08           # control period [s]  (12.5 Hz)
     N: 15              # prediction horizon [steps]  → 1.2 s lookahead
 
-    # Feature error weights [eu, ev, ea] — increase to servo more aggressively
-    Q_diag: [1.0, 1.0, 0.5]
-    # Control effort weights [v, omega] — increase to slow down commands
-    R_diag: [0.1, 0.6]
+    # Feature error weights [eu, ev, ea], applied to the *normalized* errors
+    # (eu/feat_norm_uv, ev/feat_norm_uv, ea/feat_norm_a) so they balance against
+    # R_diag. ev is set to 0: once eu→0 the vertical-pixel error and the area
+    # error are both driven essentially only by forward v (a 1-DOF redundancy),
+    # so penalizing both makes the controller park at a non-zero compromise.
+    # Distance is regulated via the area channel (ea) alone.
+    Q_diag: [1.0, 0.0, 0.8]
+    # Control effort weights [v, omega] — higher values = smaller, smoother commands
+    R_diag: [0.40, 1.00]
+    # Feature-error normalization (denominators for Q). See mpc_ibvs_node.py.
+    feat_norm_uv: 600.0   # ≈ half image width, pixels
+    feat_norm_a:   50.0   # ≈ sqrt(area) dynamic range, pixels
 
     # Velocity constraints
-    v_max: 0.30        # max forward speed [m/s]  (hardware limit is 0.60)
-    v_min: -0.05       # allow slight backward motion to correct overshoot
-    omega_max: 0.50    # max angular speed [rad/s]  (was 1.20 — caused limit-cycle saturation)
+    v_max: 0.25        # max forward speed [m/s]  (was 0.30 — reduced to limit MCU current)
+    v_min: -0.10       # allow backward motion to correct "too close" after sign fix
+    omega_max: 0.45    # max angular speed [rad/s]  (was 0.50)
 
     # Safety: stop if no detection received within this window
-    lost_timeout_s: 0.5
-    # Ignore detections below this confidence.
-    confidence_threshold: 0.5
+    lost_timeout_s: 1.5   # camera publishes at ~2 Hz (frame every ~450 ms); was 0.5 → too tight
+    # Ignore detections below this confidence. Lowered 0.5 → 0.3 so a marginal
+    # detection still drives the loop instead of dropping to zero.
+    confidence_threshold: 0.3
+    # Decay time for the MPC's own falling-edge ramp on staleness / low conf.
+    # Mirrors the slew limiter's rising-edge behavior on the falling edge so
+    # the MCU never sees a sudden non-zero → 0 transition.
+    lost_decel_s: 0.4
+    # Period for the per-second diag log that tells the operator *why* the
+    # controller is silent in any given window (servo / lost / low_conf / dead_zone).
+    diag_period_s: 1.0
     # Rebuild local linear model from current (eu, ev) each cycle.
     online_linearization: true
 
@@ -84,19 +107,16 @@ mpc_ibvs_node:
     #     "{linear: {x: 0.15}}" --rate 20
     #   rqt_plot /robot_vel/twist/linear/x
     # tau = time for the response to reach 63% of the commanded value.
-    tau_v:     0.15   # linear velocity time constant [s]
-    tau_omega: 0.20   # angular velocity time constant [s] (was 0.10 — too optimistic, caused overshoot)
-
-    # ── Slew rate limiting ─────────────────────────────────────────────────────
-    # Max rate of change of the velocity command per second.
-    # Lower values = smoother but slower response; raise if robot feels sluggish.
-    v_slew_rate:     0.40   # m/s²   (~0.75s to reach v_max=0.30 from rest)
-    omega_slew_rate: 1.00   # rad/s² (was 2.00 — halved for gentler angular acceleration)
+    tau_v:     0.40   # effective time constant [s] — accounts for external twist_slew_limiter lag
+    tau_omega: 0.40   # angular time constant [s]
 
     # ── Dead zone ──────────────────────────────────────────────────────────────
     # Robot stops commanding motion when ALL three errors are within these bounds.
-    # Prevents jitter when the target is approximately centred.
-    # Increase if the robot keeps oscillating at the goal; decrease for tighter positioning.
-    dead_zone_eu: 20.0    # pixels  — horizontal error dead zone (~3% of 640px width)
-    dead_zone_ev: 20.0    # pixels  — vertical error dead zone
-    dead_zone_ea: 150.0   # pixels² — area/depth error dead zone (~5% of desired_area)
+    # Exit requires any error to exceed  threshold × dead_zone_exit_factor.
+    # Hysteresis prevents stutter at the boundary.
+    dead_zone_eu: 20.0       # pixels  — horizontal error dead zone (~3% of 640px width)
+    dead_zone_ev: 100000.0   # effectively disabled: ev is not a controlled channel
+                             # (Q_diag[1]=0), so it must not gate the dead zone
+    dead_zone_ea: 30.0       # pixels  — area/depth error dead zone (sqrt-area units)
+    dead_zone_exit_factor: 3.0    # exit only when error > 3× entry threshold (wider hysteresis)
+    dead_zone_persist_frames: 3   # consecutive frames required to enter or exit dead zone

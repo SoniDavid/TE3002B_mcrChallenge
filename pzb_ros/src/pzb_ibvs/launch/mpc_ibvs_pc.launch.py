@@ -24,10 +24,15 @@ def generate_launch_description():
         FindPackageShare('pzb_ibvs'), 'config', 'mpc_ibvs_params.yaml',
     ])
 
-    ibvs_params_arg = DeclareLaunchArgument('params_file',    default_value=ibvs_params)
-    sim_arg         = DeclareLaunchArgument('use_sim_time',   default_value='false')
-    detector_arg    = DeclareLaunchArgument('detector_type',  default_value='color_blob',
-                                            description="'color_blob' or 'aruco'")
+    ctrl_params_default = PathJoinSubstitution([
+        FindPackageShare('pzb_control'), 'config', 'pid_vel_params.yaml',
+    ])
+
+    ibvs_params_arg  = DeclareLaunchArgument('params_file',      default_value=ibvs_params)
+    ctrl_params_arg  = DeclareLaunchArgument('ctrl_params_file', default_value=ctrl_params_default)
+    sim_arg          = DeclareLaunchArgument('use_sim_time',     default_value='false')
+    detector_arg     = DeclareLaunchArgument('detector_type',    default_value='color_blob',
+                                             description="'color_blob' or 'aruco'")
 
     ctrl_params_cfg = LaunchConfiguration('ctrl_params_file')
     params        = LaunchConfiguration('params_file')
@@ -46,17 +51,38 @@ def generate_launch_description():
     )
 
     # ── 2. MPC IBVS controller ────────────────────────────────────────────────
-    # Subscribes /visual_features + /robot_vel (both available over the network).
-    # Publishes /cmd_vel_desired → picked up by velocity_controller on the Jetson.
+    # Publishes /cmd_vel_desired_raw — TwistSlewLimiter re-publishes as /cmd_vel_desired.
     mpc_node = Node(
         package='pzb_ibvs',
         executable='mpc_ibvs_node',
         name='mpc_ibvs_node',
         output='screen',
         parameters=[params, {'use_sim_time': sim}],
+        remappings=[('/cmd_vel_desired', '/cmd_vel_desired_raw')],
     )
 
-    # ── 3. Odometry ───────────────────────────────────────────────────────────
+    # ── 3. Slew limiter — protects MCU from current spikes ───────────────────
+    # Sits between MPC output and the velocity controller. Enforces a hard
+    # acceleration cap on the command that reaches the MCU so that sudden
+    # detection losses / re-acquisitions cannot cause large current transients.
+    slew_node = Node(
+        package='pzb_utils',
+        executable='twist_slew_limiter',
+        name='twist_slew_limiter',
+        output='screen',
+        parameters=[{
+            'input_topic':       '/cmd_vel_desired_raw',
+            'output_topic':      '/cmd_vel_desired',
+            'loop_hz':           50.0,
+            'max_linear_accel':  0.20,   # m/s²
+            'max_angular_accel': 0.50,   # rad/s²
+            'max_linear_speed':  0.25,
+            'max_angular_speed': 0.45,
+            'cmd_timeout_s':     0.60,
+        }],
+    )
+
+    # ── 4. Odometry ───────────────────────────────────────────────────────────
     odom_node = Node(
         package='pzb_control',
         executable='odometry_node',
@@ -65,7 +91,7 @@ def generate_launch_description():
         parameters=[ctrl_params_cfg, {'use_sim_time': sim}],
     )
 
-    # ── 4. Velocity controller (inner PI loop) ────────────────────────────────
+    # ── 5. Velocity controller (inner PI loop) ────────────────────────────────
     vel_ctrl_node = Node(
         package='pzb_control',
         executable='velocity_controller',
@@ -73,14 +99,15 @@ def generate_launch_description():
         output='screen',
         parameters=[ctrl_params_cfg, {'use_sim_time': sim}],
     )
-    
 
     return LaunchDescription([
         ibvs_params_arg,
+        ctrl_params_arg,
         sim_arg,
         detector_arg,
         detector_node,
         mpc_node,
+        slew_node,
         odom_node,
         vel_ctrl_node,
     ])

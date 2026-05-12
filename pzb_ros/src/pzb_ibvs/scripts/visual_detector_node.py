@@ -60,6 +60,7 @@ class VisualDetectorNode(Node):
         self.declare_parameter('min_contour_area', 500.0)
 
         self.declare_parameter('confidence_threshold', 0.5)
+        self.declare_parameter('detection_holdoff_frames', 3)
 
         # Read params
         self._det_type = self.get_parameter('detector_type').value
@@ -73,6 +74,9 @@ class VisualDetectorNode(Node):
         self._desired_area = float(self.get_parameter('desired_area').value)
         self._sqrt_desired_area = np.sqrt(self._desired_area)
         self._min_contour_area = self.get_parameter('min_contour_area').value
+        self._holdoff_frames = int(self.get_parameter('detection_holdoff_frames').value)
+        self._consecutive_failures = 0
+        self._last_valid = (0.0, 0.0, 0.0, 0.0)  # eu, ev, ea, conf
 
         # ArUco detector (lazy-init so it doesn't fail when using color_blob)
         self._aruco_detector = None
@@ -223,11 +227,13 @@ class VisualDetectorNode(Node):
             mask2 = cv2.inRange(hsv, lo2, self._hsv_upper)
             mask = cv2.bitwise_or(mask1, mask2)
 
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._morph_kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  self._morph_kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._morph_kernel)
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         eu, ev, ea, conf = 0.0, 0.0, 0.0, 0.0
+        detected = False
 
         if contours:
             best = max(contours, key=cv2.contourArea)
@@ -242,6 +248,7 @@ class VisualDetectorNode(Node):
                     ev = cy_det - self._cy
                     ea = np.sqrt(area) - self._sqrt_desired_area
                     conf = 1.0
+                    detected = True
 
                     cv2.drawContours(frame, [best], -1, (0, 255, 0), 2)
                     cv2.circle(frame, (int(cx_det), int(cy_det)), 6, (0, 255, 0), -1)
@@ -251,6 +258,17 @@ class VisualDetectorNode(Node):
                         (int(cx_det) + 10, int(cy_det) - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1,
                     )
+
+        if detected:
+            self._consecutive_failures = 0
+            self._last_valid = (eu, ev, ea, conf)
+        else:
+            self._consecutive_failures += 1
+            # Hold last valid detection until holdoff window expires
+            if self._consecutive_failures < self._holdoff_frames:
+                eu, ev, ea, conf = self._last_valid
+                cv2.putText(frame, 'HELD', (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
 
         self._draw_crosshair(frame)
         return eu, ev, ea, conf, frame

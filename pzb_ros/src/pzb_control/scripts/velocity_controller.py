@@ -84,7 +84,18 @@ class VelocityController(Node):
         self.declare_parameter('robot_vel_stale_timeout_s', 0.10)
         self.declare_parameter('min_dt_s', 0.005)
         self.declare_parameter('hold_zero_until_feedback', True)
-        self.declare_parameter('diag_period_s', 5.0)
+        self.declare_parameter('diag_period_s', 1.0)
+        # When /robot_vel is stale, hold the last published /cmd_vel for up to
+        # this long before dropping to zero. Smooths brief MCU/serial dropouts
+        # that would otherwise cause 0/non-zero bursts and MCU current spikes.
+        self.declare_parameter('hold_on_stale_s', 0.30)
+        # Cap on the PI correction term as a fraction of |v_des| (with a floor
+        # so we still authorise small absolute corrections). Prevents the
+        # feedforward+feedback structure from overshooting v_des on the
+        # rising edge when v_actual hasn't caught up yet.
+        self.declare_parameter('pi_correction_clip_frac', 0.3)
+        self.declare_parameter('pi_correction_clip_floor_v', 0.05)
+        self.declare_parameter('pi_correction_clip_floor_w', 0.15)
 
         self._max_v = self.get_parameter('max_linear_speed').value
         self._max_w = self.get_parameter('max_angular_speed').value
@@ -95,6 +106,10 @@ class VelocityController(Node):
         self._min_dt = self.get_parameter('min_dt_s').value
         self._hold_zero_until_feedback = self.get_parameter('hold_zero_until_feedback').value
         self._diag_period = self.get_parameter('diag_period_s').value
+        self._hold_on_stale_s = float(self.get_parameter('hold_on_stale_s').value)
+        self._pi_clip_frac = float(self.get_parameter('pi_correction_clip_frac').value)
+        self._pi_clip_floor_v = float(self.get_parameter('pi_correction_clip_floor_v').value)
+        self._pi_clip_floor_w = float(self.get_parameter('pi_correction_clip_floor_w').value)
 
         ic = self.get_parameter('integral_clamp').value
         self._pi_v = PIDController(
@@ -125,6 +140,15 @@ class VelocityController(Node):
         self._count_stale_feedback = 0
         self._count_dt_rejected = 0
         self._count_cmd_timeout = 0
+        self._count_held_on_stale = 0
+        self._count_pi_clipped = 0
+        self._count_overshoot = 0
+
+        # Last published Twist; used to hold across brief /robot_vel stalls so
+        # the MCU sees a continuous command surface instead of 0/non-zero bursts.
+        self._last_cmd_v = 0.0
+        self._last_cmd_w = 0.0
+        self._stale_started_time = None
 
         self.create_subscription(Twist, '/cmd_vel_desired', self._cb_desired, 10)
         # /robot_vel is the MCU's body velocity — read-only feedback
@@ -176,6 +200,8 @@ class VelocityController(Node):
             self._warn_startup_hold()
             self._pi_v.reset()
             self._pi_w.reset()
+            self._last_cmd_v = 0.0
+            self._last_cmd_w = 0.0
             self._cmd_pub.publish(Twist())
             return
 
@@ -186,8 +212,24 @@ class VelocityController(Node):
                 self._warn_stale_feedback(robot_vel_age)
                 self._pi_v.reset()
                 self._pi_w.reset()
-                self._cmd_pub.publish(Twist())
+                # Track when the stall started so we can hold the last command
+                # for at most hold_on_stale_s, then fall back to zero.
+                if self._stale_started_time is None:
+                    self._stale_started_time = now
+                stale_dur = (now - self._stale_started_time).nanoseconds * 1e-9
+                if stale_dur <= self._hold_on_stale_s:
+                    self._count_held_on_stale += 1
+                    held = Twist()
+                    held.linear.x = self._last_cmd_v
+                    held.angular.z = self._last_cmd_w
+                    self._cmd_pub.publish(held)
+                else:
+                    self._last_cmd_v = 0.0
+                    self._last_cmd_w = 0.0
+                    self._cmd_pub.publish(Twist())
                 return
+            else:
+                self._stale_started_time = None
 
         # Safety: stale /cmd_vel_desired → stop and reset integrators
         if self._last_desired_time is not None:
@@ -204,17 +246,35 @@ class VelocityController(Node):
         if self._v_des == 0.0 and self._w_des == 0.0:
             self._pi_v.reset()
             self._pi_w.reset()
+            self._last_cmd_v = 0.0
+            self._last_cmd_w = 0.0
             self._cmd_pub.publish(Twist())
             return
 
-        v_cmd = _clamp(
-            self._v_des + self._pi_v.update(self._v_des - self._v_actual, dt),
-            -self._max_v, self._max_v,
-        )
-        w_cmd = _clamp(
-            self._w_des + self._pi_w.update(self._w_des - self._w_actual, dt),
-            -self._max_w, self._max_w,
-        )
+        # PI feedback with correction clamping. The raw PI output is bounded to
+        # `pi_correction_clip_frac * max(|v_des|, floor)` so the feedforward+
+        # feedback structure cannot overshoot v_des by more than this fraction
+        # on the rising edge before v_actual catches up. Counted via _count_pi_clipped.
+        raw_corr_v = self._pi_v.update(self._v_des - self._v_actual, dt)
+        raw_corr_w = self._pi_w.update(self._w_des - self._w_actual, dt)
+
+        clip_v = self._pi_clip_frac * max(abs(self._v_des), self._pi_clip_floor_v)
+        clip_w = self._pi_clip_frac * max(abs(self._w_des), self._pi_clip_floor_w)
+        corr_v = _clamp(raw_corr_v, -clip_v, clip_v)
+        corr_w = _clamp(raw_corr_w, -clip_w, clip_w)
+        if corr_v != raw_corr_v or corr_w != raw_corr_w:
+            self._count_pi_clipped += 1
+
+        v_cmd = _clamp(self._v_des + corr_v, -self._max_v, self._max_v)
+        w_cmd = _clamp(self._w_des + corr_w, -self._max_w, self._max_w)
+
+        # Overshoot diagnostic: cycles where |v_cmd - v_des| exceeds 25% of v_des
+        # (with the same small absolute floor as the clip). Surfaces the H3
+        # transient-spike hypothesis.
+        over_v = abs(v_cmd - self._v_des) > 0.25 * max(abs(self._v_des), self._pi_clip_floor_v)
+        over_w = abs(w_cmd - self._w_des) > 0.25 * max(abs(self._w_des), self._pi_clip_floor_w)
+        if over_v or over_w:
+            self._count_overshoot += 1
 
         v_cmd = _deadzone_comp(v_cmd, self._dz_v)
         w_cmd = _deadzone_comp(w_cmd, self._dz_w)
@@ -223,6 +283,8 @@ class VelocityController(Node):
         msg.linear.x = v_cmd
         msg.angular.z = w_cmd
         self._cmd_pub.publish(msg)
+        self._last_cmd_v = v_cmd
+        self._last_cmd_w = w_cmd
 
     def _warn_startup_hold(self):
         now_s = time.monotonic()
@@ -273,14 +335,25 @@ class VelocityController(Node):
             self._last_diag_warn_time = now_s
 
     def _publish_diag_summary(self):
-        # Periodic health snapshot helps correlate safety gates with runtime behavior.
+        # Periodic health snapshot. Counters reset each window so a one-second
+        # cadence reads like an instantaneous rate at debug time.
         self.get_logger().info(
             'Safety summary: '
             f'startup_hold={self._count_startup_hold}, '
             f'stale_feedback={self._count_stale_feedback}, '
+            f'held_on_stale={self._count_held_on_stale}, '
             f'dt_rejected={self._count_dt_rejected}, '
-            f'cmd_timeout={self._count_cmd_timeout}'
+            f'cmd_timeout={self._count_cmd_timeout}, '
+            f'pi_clipped={self._count_pi_clipped}, '
+            f'overshoot={self._count_overshoot}'
         )
+        self._count_startup_hold = 0
+        self._count_stale_feedback = 0
+        self._count_held_on_stale = 0
+        self._count_dt_rejected = 0
+        self._count_cmd_timeout = 0
+        self._count_pi_clipped = 0
+        self._count_overshoot = 0
 
 
 def main(args=None):

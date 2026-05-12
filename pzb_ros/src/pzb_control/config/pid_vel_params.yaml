@@ -23,10 +23,20 @@ velocity_controller:
     cmd_timeout_s: 0.50
     deadzone_comp_v: 0.0   # snap small linear commands up to this threshold (m/s); 0 = disabled
     deadzone_comp_w: 0.0   # snap small angular commands up to this threshold (rad/s); 0 = disabled
-    robot_vel_stale_timeout_s: 0.10  # if /robot_vel is older than this, publish zero /cmd_vel
+    robot_vel_stale_timeout_s: 0.25  # if /robot_vel is older than this, publish zero /cmd_vel; rosbag shows ~7 Hz (145 ms gaps)
     min_dt_s: 0.005                 # reject too-small control dt to avoid transient spikes
     hold_zero_until_feedback: true  # disabled: feedforward only until /robot_vel is confirmed working
-    diag_period_s: 5.0              # emit periodic safety counters for debugging
+    diag_period_s: 1.0              # emit safety counters every second for debugging
+    # When /robot_vel is stale, hold the last published /cmd_vel for up to this long
+    # before dropping to zero. Smooths brief MCU/serial dropouts so the MCU never
+    # sees a sudden non-zero → 0 → non-zero burst that triggers current spikes.
+    hold_on_stale_s: 0.30
+    # PI correction clamp: caps |PI output| at clip_frac * max(|v_des|, floor).
+    # Prevents the feedforward+feedback structure from overshooting v_des on the
+    # rising edge when v_actual hasn't caught up yet (was a 50% spike with kp_v=0.5).
+    pi_correction_clip_frac:    0.3
+    pi_correction_clip_floor_v: 0.05
+    pi_correction_clip_floor_w: 0.15
 
 waypoint_follower:
   ros__parameters:
