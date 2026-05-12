@@ -43,12 +43,12 @@ mpc_ibvs_node:
     # Feature error weights [eu, ev, ea] — increase to servo more aggressively
     Q_diag: [1.0, 1.0, 0.5]
     # Control effort weights [v, omega] — increase to slow down commands
-    R_diag: [0.1, 0.2]
+    R_diag: [0.1, 0.6]
 
     # Velocity constraints
     v_max: 0.30        # max forward speed [m/s]  (hardware limit is 0.60)
     v_min: -0.05       # allow slight backward motion to correct overshoot
-    omega_max: 1.20    # max angular speed [rad/s]
+    omega_max: 0.50    # max angular speed [rad/s]  (was 1.20 — caused limit-cycle saturation)
 
     # Safety: stop if no detection received within this window
     lost_timeout_s: 0.5
@@ -85,13 +85,13 @@ mpc_ibvs_node:
     #   rqt_plot /robot_vel/twist/linear/x
     # tau = time for the response to reach 63% of the commanded value.
     tau_v:     0.15   # linear velocity time constant [s]
-    tau_omega: 0.10   # angular velocity time constant [s] (typically faster)
+    tau_omega: 0.20   # angular velocity time constant [s] (was 0.10 — too optimistic, caused overshoot)
 
     # ── Slew rate limiting ─────────────────────────────────────────────────────
     # Max rate of change of the velocity command per second.
     # Lower values = smoother but slower response; raise if robot feels sluggish.
     v_slew_rate:     0.40   # m/s²   (~0.75s to reach v_max=0.30 from rest)
-    omega_slew_rate: 2.00   # rad/s² (~0.60s to reach omega_max=1.20 from rest)
+    omega_slew_rate: 1.00   # rad/s² (was 2.00 — halved for gentler angular acceleration)
 
     # ── Dead zone ──────────────────────────────────────────────────────────────
     # Robot stops commanding motion when ALL three errors are within these bounds.

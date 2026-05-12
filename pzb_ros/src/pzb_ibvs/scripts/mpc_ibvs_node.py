@@ -195,9 +195,9 @@ def _build_interaction_matrix(fx, fy, Z_star, desired_area, eu=0.0, ev=0.0):
     # The optimizer applies opposite-signed omega to reduce eu.
 
     L = np.array([
-        [eu / Z_star,   fx * (1.0 + xn * xn)],
-        [ev / Z_star,   fy * (xn * yn)],
-        [-sqrt_A_des / Z_star, 0.0],  # d_ea/dt = -sqrt_A_des/Z * v
+        [eu / Z_star,          fx * (1.0 + xn * xn)],
+        [ev / Z_star,          fy * (xn * yn)       ],
+        [-sqrt_A_des / Z_star, 0.0                  ],  # d_ea/dt = -sqrt_A_des/Z * v
     ])
     return L
 

@@ -6,12 +6,6 @@ Brings up the computation-heavy nodes that do not need robot hardware:
   1. visual_detector_node  — CV feature detector; subscribes /camera/image_compressed
   2. mpc_ibvs_node         — Linear MPC controller; publishes /cmd_vel_desired
 
-The robot-side launch (mpc_ibvs_robot.launch.py) must already be running on
-the Jetson. Both machines must share the same ROS2 network:
-  - Same ROS_DOMAIN_ID (default 0; set with: export ROS_DOMAIN_ID=<n>)
-  - Reachable via UDP multicast OR unicast with ROS_DISCOVERY_SERVER / FastDDS XML.
-  - Tip: verify with `ros2 topic list` on the PC — you should see /camera/image_compressed.
-
 Usage:
   ros2 launch pzb_ibvs mpc_ibvs_pc.launch.py
   ros2 launch pzb_ibvs mpc_ibvs_pc.launch.py detector_type:=aruco
@@ -35,6 +29,7 @@ def generate_launch_description():
     detector_arg    = DeclareLaunchArgument('detector_type',  default_value='color_blob',
                                             description="'color_blob' or 'aruco'")
 
+    ctrl_params_cfg = LaunchConfiguration('ctrl_params_file')
     params        = LaunchConfiguration('params_file')
     sim           = LaunchConfiguration('use_sim_time')
     detector_type = LaunchConfiguration('detector_type')
@@ -61,10 +56,31 @@ def generate_launch_description():
         parameters=[params, {'use_sim_time': sim}],
     )
 
+    # ── 3. Odometry ───────────────────────────────────────────────────────────
+    odom_node = Node(
+        package='pzb_control',
+        executable='odometry_node',
+        name='odometry_node',
+        output='screen',
+        parameters=[ctrl_params_cfg, {'use_sim_time': sim}],
+    )
+
+    # ── 4. Velocity controller (inner PI loop) ────────────────────────────────
+    vel_ctrl_node = Node(
+        package='pzb_control',
+        executable='velocity_controller',
+        name='velocity_controller',
+        output='screen',
+        parameters=[ctrl_params_cfg, {'use_sim_time': sim}],
+    )
+    
+
     return LaunchDescription([
         ibvs_params_arg,
         sim_arg,
         detector_arg,
         detector_node,
         mpc_node,
+        odom_node,
+        vel_ctrl_node,
     ])

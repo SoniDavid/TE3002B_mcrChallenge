@@ -13,9 +13,9 @@ node. Both machines must be on the same ROS2 network (ROS_DOMAIN_ID must match).
 
 Usage:
   ros2 launch pzb_ibvs mpc_ibvs_robot.launch.py
-  ros2 launch pzb_ibvs mpc_ibvs_robot.launch.py camera_type:=usb device_index:=2
+  ros2 launch pzb_ibvs mpc_ibvs_robot.launch.py camera_type:=usb device_index:=1
   ros2 launch pzb_ibvs mpc_ibvs_robot.launch.py ctrl_params_file:=/path/to/custom.yaml
-"""
+""" 
 import os
 
 from launch import LaunchDescription
@@ -38,7 +38,7 @@ def generate_launch_description():
     sim_arg          = DeclareLaunchArgument('use_sim_time',      default_value='false')
     camera_type_arg  = DeclareLaunchArgument('camera_type',       default_value='csi',
                                              description="'csi' (Jetson native) or 'usb'")
-    device_index_arg = DeclareLaunchArgument('device_index',      default_value='2',
+    device_index_arg = DeclareLaunchArgument('device_index',      default_value='1',
                                              description='USB /dev/videoN index')
 
     ctrl_params_cfg = LaunchConfiguration('ctrl_params_file')
@@ -74,8 +74,8 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'device_index':       device_index,
-            'width':              1280,
-            'height':             720,
+            'width':              640,
+            'height':             480,
             'framerate':          30.0,
             'jpeg_quality':       80,
             'publish_compressed': True,
@@ -84,6 +84,7 @@ def generate_launch_description():
         condition=IfCondition(is_usb),
     )
 
+    # 3 AND 4 RUNNING ON PC FOR EASIER SETUP 
     # ── 3. Odometry ───────────────────────────────────────────────────────────
     odom_node = Node(
         package='pzb_control',
@@ -102,6 +103,7 @@ def generate_launch_description():
         parameters=[ctrl_params_cfg, {'use_sim_time': sim}],
     )
 
+
     return LaunchDescription([
         ctrl_params_arg,
         sim_arg,
@@ -110,6 +112,7 @@ def generate_launch_description():
         micro_ros_node,
         csi_camera_node,
         usb_camera_node,
-        odom_node,
-        vel_ctrl_node,
+        # odom_node, # RUNNING ON PC FOR EASIER SETUP
+        # vel_ctrl_node,
+
     ])
