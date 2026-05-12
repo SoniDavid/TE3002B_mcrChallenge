@@ -11,9 +11,9 @@ Brings up the full chain:
   6. odometry_node         — wheel odometry from /robot_vel
   7. velocity_controller   — inner PI: /cmd_vel_desired → /cmd_vel → MCU
 
-⚠️  MUTUALLY EXCLUSIVE with the pc/robot split launches. Run EITHER this file
-    alone, OR `mpc_ibvs_robot.launch.py` (Jetson) + `mpc_ibvs_pc.launch.py`
-    (PC) — NEVER both. Two mpc_ibvs_node instances publishing to
+WARNING: MUTUALLY EXCLUSIVE with the pc/robot split launches. Run EITHER this
+    file alone, OR `mpc_ibvs_robot.launch.py` (Jetson) + `mpc_ibvs_pc.launch.py`
+    (PC) -- NEVER both. Two mpc_ibvs_node instances publishing to
     /cmd_vel_desired make the motor command thrash and brown out the MCU.
 
 Usage:

@@ -11,10 +11,10 @@ Brings up hardware-dependent nodes that must live on the robot:
 The PC-side launch (mpc_ibvs_pc.launch.py) runs the vision detector and MPC
 node. Both machines must be on the same ROS2 network (ROS_DOMAIN_ID must match).
 
-⚠️  Use this together with mpc_ibvs_pc.launch.py — OR use the single-machine
-    mpc_ibvs.launch.py alone. NEVER run mpc_ibvs.launch.py at the same time as
-    the pc launch: two mpc_ibvs_node instances driving /cmd_vel_desired makes
-    the motor command thrash and browns out the MCU.
+WARNING: Use this together with mpc_ibvs_pc.launch.py -- OR use the
+    single-machine mpc_ibvs.launch.py alone. NEVER run mpc_ibvs.launch.py at
+    the same time as the pc launch: two mpc_ibvs_node instances driving
+    /cmd_vel_desired makes the motor command thrash and browns out the MCU.
 
 Usage:
   ros2 launch pzb_ibvs mpc_ibvs_robot.launch.py
@@ -117,5 +117,5 @@ def generate_launch_description():
         csi_camera_node,
         usb_camera_node,
         odom_node,
-        vel_ctrl_node,   # inner PI loop — must run here so /cmd_vel ↔ /robot_vel stays local
+        vel_ctrl_node,   # inner PI loop -- run here so /cmd_vel <-> /robot_vel stays local
     ])

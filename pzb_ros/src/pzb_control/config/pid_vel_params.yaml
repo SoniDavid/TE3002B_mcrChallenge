@@ -25,7 +25,7 @@ velocity_controller:
     deadzone_comp_w: 0.0   # snap small angular commands up to this threshold (rad/s); 0 = disabled
     robot_vel_stale_timeout_s: 0.25  # if /robot_vel is older than this, publish zero /cmd_vel; rosbag shows ~7 Hz (145 ms gaps)
     min_dt_s: 0.005                 # reject too-small control dt to avoid transient spikes
-    hold_zero_until_feedback: true  # disabled: feedforward only until /robot_vel is confirmed working
+    hold_zero_until_feedback: false  # feedforward only — no /robot_vel feedback available from MCU
     diag_period_s: 1.0              # emit safety counters every second for debugging
     # When /robot_vel is stale, hold the last published /cmd_vel for up to this long
     # before dropping to zero. Smooths brief MCU/serial dropouts so the MCU never

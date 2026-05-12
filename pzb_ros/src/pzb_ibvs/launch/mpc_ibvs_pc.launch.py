@@ -14,9 +14,9 @@ here, or two velocity_controllers will fight over /cmd_vel.
 
 Both machines must share the same ROS_DOMAIN_ID.
 
-⚠️  Use this PC launch together with mpc_ibvs_robot.launch.py — OR use the
-    single-machine mpc_ibvs.launch.py alone. NEVER run mpc_ibvs.launch.py at
-    the same time as this one: you'd get two mpc_ibvs_node instances both
+WARNING: Use this PC launch together with mpc_ibvs_robot.launch.py -- OR use
+    the single-machine mpc_ibvs.launch.py alone. NEVER run mpc_ibvs.launch.py
+    at the same time as this one: you'd get two mpc_ibvs_node instances both
     driving /cmd_vel_desired, which makes the motor command thrash and browns
     out the MCU.
 
@@ -98,7 +98,7 @@ def generate_launch_description():
 
     # NOTE: odometry_node + velocity_controller intentionally NOT launched here —
     # they run on the robot side (mpc_ibvs_robot.launch.py) to keep the
-    # /cmd_vel ↔ /robot_vel inner loop off the wireless link.
+    # /cmd_vel <-> /robot_vel inner loop off the wireless link.
 
     return LaunchDescription([
         ibvs_params_arg,
