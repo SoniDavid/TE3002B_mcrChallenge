@@ -4,7 +4,21 @@ PC-SIDE launch file (run on your laptop / desktop).
 
 Brings up the computation-heavy nodes that do not need robot hardware:
   1. visual_detector_node  — CV feature detector; subscribes /camera/image_compressed
-  2. mpc_ibvs_node         — Linear MPC controller; publishes /cmd_vel_desired
+  2. mpc_ibvs_node         — Linear MPC controller; publishes /cmd_vel_desired_raw
+  3. twist_slew_limiter    — rate-limits /cmd_vel_desired_raw → /cmd_vel_desired
+
+The inner velocity loop (odometry_node + velocity_controller, which turns
+/cmd_vel_desired into /cmd_vel for the MCU) runs on the ROBOT side
+(mpc_ibvs_robot.launch.py) so it does not cross Wi-Fi — do NOT also start it
+here, or two velocity_controllers will fight over /cmd_vel.
+
+Both machines must share the same ROS_DOMAIN_ID.
+
+⚠️  Use this PC launch together with mpc_ibvs_robot.launch.py — OR use the
+    single-machine mpc_ibvs.launch.py alone. NEVER run mpc_ibvs.launch.py at
+    the same time as this one: you'd get two mpc_ibvs_node instances both
+    driving /cmd_vel_desired, which makes the motor command thrash and browns
+    out the MCU.
 
 Usage:
   ros2 launch pzb_ibvs mpc_ibvs_pc.launch.py
@@ -82,23 +96,9 @@ def generate_launch_description():
         }],
     )
 
-    # ── 4. Odometry ───────────────────────────────────────────────────────────
-    odom_node = Node(
-        package='pzb_control',
-        executable='odometry_node',
-        name='odometry_node',
-        output='screen',
-        parameters=[ctrl_params_cfg, {'use_sim_time': sim}],
-    )
-
-    # ── 5. Velocity controller (inner PI loop) ────────────────────────────────
-    vel_ctrl_node = Node(
-        package='pzb_control',
-        executable='velocity_controller',
-        name='velocity_controller',
-        output='screen',
-        parameters=[ctrl_params_cfg, {'use_sim_time': sim}],
-    )
+    # NOTE: odometry_node + velocity_controller intentionally NOT launched here —
+    # they run on the robot side (mpc_ibvs_robot.launch.py) to keep the
+    # /cmd_vel ↔ /robot_vel inner loop off the wireless link.
 
     return LaunchDescription([
         ibvs_params_arg,
@@ -108,6 +108,4 @@ def generate_launch_description():
         detector_node,
         mpc_node,
         slew_node,
-        odom_node,
-        vel_ctrl_node,
     ])

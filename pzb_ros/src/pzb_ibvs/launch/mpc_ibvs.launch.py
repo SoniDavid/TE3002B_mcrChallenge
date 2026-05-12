@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """
-Full MPC-IBVS stack launch file.
+SINGLE-MACHINE MPC-IBVS stack launch file (everything on one box).
 
-Brings up:
-  1. micro_ros_agent         (micro_ros_agent) — bridges /dev/ttyUSB0 → ROS2 topics
-  2. camera_publisher        (pzb_camera)  — CSI (Jetson) or USB
-  3. odometry_node           (pzb_control)
-  4. velocity_controller     (pzb_control)
-  5. visual_detector_node    (pzb_ibvs)
-  6. mpc_ibvs_node           (pzb_ibvs)
+Brings up the full chain:
+  1. micro_ros_agent       — bridges /dev/ttyUSB0 → ROS2 topics
+  2. camera_publisher      — CSI (Jetson) or USB, 640x480
+  3. visual_detector_node  — /camera/image_compressed → /visual_features
+  4. mpc_ibvs_node         — Linear MPC; publishes /cmd_vel_desired_raw
+  5. twist_slew_limiter    — rate-limits /cmd_vel_desired_raw → /cmd_vel_desired
+  6. odometry_node         — wheel odometry from /robot_vel
+  7. velocity_controller   — inner PI: /cmd_vel_desired → /cmd_vel → MCU
 
-The MPC outputs /cmd_vel_desired which feeds directly into the existing
-velocity_controller inner loop.
+⚠️  MUTUALLY EXCLUSIVE with the pc/robot split launches. Run EITHER this file
+    alone, OR `mpc_ibvs_robot.launch.py` (Jetson) + `mpc_ibvs_pc.launch.py`
+    (PC) — NEVER both. Two mpc_ibvs_node instances publishing to
+    /cmd_vel_desired make the motor command thrash and brown out the MCU.
 
 Usage:
   ros2 launch pzb_ibvs mpc_ibvs.launch.py
@@ -83,8 +86,8 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'device_index':       device_index,
-            'width':              1280,
-            'height':             720,
+            'width':              640,
+            'height':             480,
             'framerate':          30.0,
             'jpeg_quality':       80,
             'publish_compressed': True,
@@ -123,6 +126,27 @@ def generate_launch_description():
         name='mpc_ibvs_node',
         output='screen',
         parameters=[params, {'use_sim_time': sim}],
+        remappings=[('/cmd_vel_desired', '/cmd_vel_desired_raw')],
+    )
+
+    # Slew limiter — sits between the MPC and the velocity controller, caps the
+    # rate of change of the command reaching the MCU. The MPC publishes
+    # /cmd_vel_desired_raw; this re-publishes the rate-limited /cmd_vel_desired.
+    slew_node = Node(
+        package='pzb_utils',
+        executable='twist_slew_limiter',
+        name='twist_slew_limiter',
+        output='screen',
+        parameters=[{
+            'input_topic':       '/cmd_vel_desired_raw',
+            'output_topic':      '/cmd_vel_desired',
+            'loop_hz':           50.0,
+            'max_linear_accel':  0.20,   # m/s²
+            'max_angular_accel': 0.50,   # rad/s²
+            'max_linear_speed':  0.25,
+            'max_angular_speed': 0.45,
+            'cmd_timeout_s':     0.60,
+        }],
     )
 
     return LaunchDescription([
@@ -135,8 +159,9 @@ def generate_launch_description():
         micro_ros_node,
         csi_camera_node,
         usb_camera_node,
-        odom_node,
-        vel_ctrl_node,
         detector_node,
         mpc_node,
+        slew_node,
+        odom_node,
+        vel_ctrl_node,
     ])

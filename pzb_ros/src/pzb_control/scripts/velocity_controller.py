@@ -317,14 +317,16 @@ class VelocityController(Node):
         self._last_dt_warn_time = now_s
 
     def _warn_if_robot_interface_missing(self):
-        # Emit this warning periodically so missing bring-up is obvious at runtime.
+        # Emit these warnings periodically so a bad bring-up is obvious at runtime.
         now_s = time.monotonic()
         if now_s - self._last_diag_warn_time < 2.0:
             return
 
         cmd_vel_subs = self.count_subscribers('/cmd_vel')
         robot_vel_pubs = self.count_publishers('/robot_vel')
+        cmd_des_pubs = self.count_publishers('/cmd_vel_desired')
 
+        warned = False
         if cmd_vel_subs == 0 or robot_vel_pubs == 0:
             self.get_logger().warn(
                 'Robot interface missing: '
@@ -332,6 +334,18 @@ class VelocityController(Node):
                 f'/robot_vel publishers={robot_vel_pubs}. '
                 'Start the base/MCU bridge node so the robot can move.'
             )
+            warned = True
+        if cmd_des_pubs > 1:
+            # Two MPC/launch instances both driving /cmd_vel_desired → the
+            # command alternates between them every cycle, the motors thrash,
+            # and the MCU can brown out. Run ONE launch path only.
+            self.get_logger().warn(
+                f'Multiple publishers on /cmd_vel_desired ({cmd_des_pubs}) — '
+                'you are running more than one MPC / launch file. '
+                'Use mpc_ibvs.launch.py alone, OR the pc+robot pair — never both.'
+            )
+            warned = True
+        if warned:
             self._last_diag_warn_time = now_s
 
     def _publish_diag_summary(self):
