@@ -267,6 +267,11 @@ class MPCIBVSNode(Node):
         self.declare_parameter('confidence_threshold', 0.5)
         self.declare_parameter('tau_v',     0.15)
         self.declare_parameter('tau_omega', 0.10)
+        self.declare_parameter('v_slew_rate',     0.40)
+        self.declare_parameter('omega_slew_rate', 2.00)
+        self.declare_parameter('dead_zone_eu',   20.0)
+        self.declare_parameter('dead_zone_ev',   20.0)
+        self.declare_parameter('dead_zone_ea',  150.0)
 
         Ts = self.get_parameter('Ts').value
         N = self.get_parameter('N').value
@@ -294,6 +299,11 @@ class MPCIBVSNode(Node):
         self._desired_area = desired_area
         self._tau_v = self.get_parameter('tau_v').value
         self._tau_omega = self.get_parameter('tau_omega').value
+        self._v_slew_rate     = float(self.get_parameter('v_slew_rate').value)
+        self._omega_slew_rate = float(self.get_parameter('omega_slew_rate').value)
+        self._dz_eu = float(self.get_parameter('dead_zone_eu').value)
+        self._dz_ev = float(self.get_parameter('dead_zone_ev').value)
+        self._dz_ea = float(self.get_parameter('dead_zone_ea').value)
 
         L_star = _build_interaction_matrix(fx, fy, Z_star, desired_area)
         A, B = _build_augmented_model(L_star, Ts, self._tau_v, self._tau_omega)
@@ -317,6 +327,8 @@ class MPCIBVSNode(Node):
         self._last_feat_time = None
         self._v_meas = 0.0         # actual linear velocity from /robot_vel [m/s]
         self._omega_meas = 0.0     # actual angular velocity from /robot_vel [rad/s]
+        self._v_prev = 0.0         # last published linear velocity (for slew limiting)
+        self._omega_prev = 0.0     # last published angular velocity (for slew limiting)
 
         self.create_subscription(
             Float64MultiArray,
@@ -343,6 +355,10 @@ class MPCIBVSNode(Node):
         )
         self.get_logger().info(f'Interaction matrix L_s*:\n{np.array2string(L_star, precision=4)}')
 
+    def _slew(self, target: float, prev: float, max_rate: float) -> float:
+        max_delta = max_rate * self._Ts
+        return prev + _clamp(target - prev, -max_delta, max_delta)
+
     def _feat_callback(self, msg: Float64MultiArray):
         if len(msg.data) < 4:
             self.get_logger().warn('Received malformed /visual_features (expected 4 values).')
@@ -356,60 +372,64 @@ class MPCIBVSNode(Node):
 
     def _control_loop(self):
         now = self.get_clock().now()
+        target_v, target_omega = 0.0, 0.0   # default: decelerate to stop
 
-        # Safety stop if detection is lost or stale
-        if self._feat is None or self._last_feat_time is None:
-            self._publish_stop()
-            return
+        # Determine whether to servo
+        servo = False
+        if self._feat is not None and self._last_feat_time is not None:
+            age = (now - self._last_feat_time).nanoseconds * 1e-9
+            if age > self._lost_timeout:
+                if age < self._lost_timeout + 1.0:  # log once per second
+                    self.get_logger().warn(
+                        f'Visual features stale ({age:.2f}s > {self._lost_timeout}s) — stopping.'
+                    )
+            else:
+                eu, ev, ea, conf = self._feat
+                if conf >= self._conf_threshold:
+                    # Dead zone: all errors within thresholds → hold still
+                    if abs(eu) < self._dz_eu and abs(ev) < self._dz_ev and abs(ea) < self._dz_ea:
+                        pass  # target stays (0, 0); slew will decelerate smoothly
+                    else:
+                        servo = True
 
-        age = (now - self._last_feat_time).nanoseconds * 1e-9
-        if age > self._lost_timeout:
-            if age < self._lost_timeout + 1.0:  # log once per second
-                self.get_logger().warn(
-                    f'Visual features stale ({age:.2f}s > {self._lost_timeout}s) — stopping.'
+        # MPC solve (only when actively servoing)
+        if servo:
+            eu, ev, ea, conf = self._feat
+            if self._online_linearization:
+                L_star = _build_interaction_matrix(
+                    self._fx,
+                    self._fy,
+                    self._Z_star,
+                    self._desired_area,
+                    eu=float(eu),
+                    ev=float(ev),
                 )
-            self._publish_stop()
-            return
+                A_aug, B_aug = _build_augmented_model(
+                    L_star, self._Ts, self._tau_v, self._tau_omega
+                )
+                self._mpc.update_model(A_aug, B_aug)
 
-        eu, ev, ea, conf = self._feat
+            x0 = np.array([eu, ev, ea, self._v_meas, self._omega_meas])
+            t0 = time.monotonic()
+            u_opt = self._mpc.solve(x0)
+            dt_solve = (time.monotonic() - t0) * 1e3
 
-        if conf < self._conf_threshold:
-            self._publish_stop()
-            return
+            target_v     = _clamp(float(u_opt[0]), self._v_min, self._v_max)
+            target_omega = _clamp(float(u_opt[1]), -self._omega_max, self._omega_max)
 
-        if self._online_linearization:
-            L_star = _build_interaction_matrix(
-                self._fx,
-                self._fy,
-                self._Z_star,
-                self._desired_area,
-                eu=float(eu),
-                ev=float(ev),
-            )
-            A_aug, B_aug = _build_augmented_model(
-                L_star, self._Ts, self._tau_v, self._tau_omega
-            )
-            self._mpc.update_model(A_aug, B_aug)
+            if dt_solve > 10.0:
+                self.get_logger().warn(f'MPC solve took {dt_solve:.1f} ms')
 
-        # Augmented initial state: image features + actual body velocities
-        x0 = np.array([eu, ev, ea, self._v_meas, self._omega_meas])
-        t0 = time.monotonic()
-        u_opt = self._mpc.solve(x0)
-        dt_solve = (time.monotonic() - t0) * 1e3
-
-        v = _clamp(float(u_opt[0]), self._v_min, self._v_max)
-        omega = _clamp(float(u_opt[1]), -self._omega_max, self._omega_max)
+        # Slew limiting — always applied, including during stops and detection loss
+        v     = self._slew(target_v,     self._v_prev,     self._v_slew_rate)
+        omega = self._slew(target_omega, self._omega_prev, self._omega_slew_rate)
+        self._v_prev     = v
+        self._omega_prev = omega
 
         msg = Twist()
         msg.linear.x = v
         msg.angular.z = omega
         self._cmd_pub.publish(msg)
-
-        if dt_solve > 10.0:
-            self.get_logger().warn(f'MPC solve took {dt_solve:.1f} ms')
-
-    def _publish_stop(self):
-        self._cmd_pub.publish(Twist())
 
 
 def main(args=None):

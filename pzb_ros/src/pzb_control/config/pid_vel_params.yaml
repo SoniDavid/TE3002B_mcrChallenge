@@ -25,7 +25,7 @@ velocity_controller:
     deadzone_comp_w: 0.0   # snap small angular commands up to this threshold (rad/s); 0 = disabled
     robot_vel_stale_timeout_s: 0.10  # if /robot_vel is older than this, publish zero /cmd_vel
     min_dt_s: 0.005                 # reject too-small control dt to avoid transient spikes
-    hold_zero_until_feedback: true  # keep /cmd_vel=0 until first /robot_vel sample arrives
+    hold_zero_until_feedback: true  # disabled: feedforward only until /robot_vel is confirmed working
     diag_period_s: 5.0              # emit periodic safety counters for debugging
 
 waypoint_follower:
