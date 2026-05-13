@@ -4,10 +4,9 @@ Traffic light FSM node.
 
 Consumes detected traffic light color and applies behavioral rules:
   - Green  → full speed (scale = 1.0)
-  - Yellow → slow speed (scale = yellow_speed_scale param)
-  - Red    → full stop, LATCHED — stays stopped even if red disappears;
-             only resumes when green is explicitly seen
-  - None   → drive normally (scale = 1.0), unless latched on red
+  - Yellow → fixed reduced speed (yellow_speed_scale, e.g. 0.4) while yellow visible
+  - Red    → immediate stop (scale = 0.0)
+  - None   → treat as green, resume full speed
 
 Subscribes:
   /traffic_light_color  (std_msgs/String)  "red" | "green" | "yellow" | "none"
@@ -27,8 +26,8 @@ from std_msgs.msg import String, Float32
 
 class TrafficState(enum.Enum):
     RUNNING = 'running'   # scale = 1.0
-    SLOW    = 'slow'      # scale = yellow_speed_scale
-    STOPPED = 'stopped'   # scale = 0.0, latched
+    SLOW    = 'slow'      # scale = yellow_speed_scale (fixed)
+    STOPPED = 'stopped'   # scale ramps 1.0 → 0.0 over red_ramp_duration_s
 
 
 class TrafficLightFSMNode(Node):
@@ -38,14 +37,15 @@ class TrafficLightFSMNode(Node):
 
         self.declare_parameter('yellow_speed_scale', 0.4)
         self.declare_parameter('color_lost_timeout', 1.5)
-        self.declare_parameter('loop_hz', 20.0)
+        self.declare_parameter('loop_hz',            20.0)
 
-        self._yellow_scale    = float(self.get_parameter('yellow_speed_scale').value)
-        self._lost_timeout    = float(self.get_parameter('color_lost_timeout').value)
+        self._yellow_scale = float(self.get_parameter('yellow_speed_scale').value)
+        self._lost_timeout = float(self.get_parameter('color_lost_timeout').value)
 
-        self._state           = TrafficState.RUNNING
-        self._last_color      = 'none'
-        self._last_color_time = None   # wall time of last /traffic_light_color message
+        self._state              = TrafficState.RUNNING
+        self._last_color         = 'none'
+        self._last_color_time    = None
+        self._waiting_for_green  = False   # latched True on red; only green clears it
 
         self.create_subscription(String, '/traffic_light_color', self._color_callback, 10)
         self._scale_pub = self.create_publisher(Float32, '/traffic_speed_scale', 10)
@@ -79,24 +79,20 @@ class TrafficLightFSMNode(Node):
 
     def _transition(self, color: str):
         if color == 'green':
-            # Green always resumes, regardless of current state
+            self._waiting_for_green = False
             self._set_state(TrafficState.RUNNING)
 
+        elif color == 'none':
+            if not self._waiting_for_green:
+                self._set_state(TrafficState.RUNNING)
+
         elif color == 'red':
-            # Red always stops, regardless of current state
+            self._waiting_for_green = True
             self._set_state(TrafficState.STOPPED)
 
         elif color == 'yellow':
             if self._state == TrafficState.RUNNING:
                 self._set_state(TrafficState.SLOW)
-            # If STOPPED (latched on red), yellow does NOT resume
-
-        elif color == 'none':
-            # Lost detection:
-            # - STOPPED: latch holds — stay stopped until green
-            # - SLOW: will time out back to RUNNING via _publish_loop
-            # - RUNNING: no change
-            pass
 
     def _set_state(self, new_state: TrafficState):
         if new_state != self._state:
@@ -109,8 +105,8 @@ class TrafficLightFSMNode(Node):
         if self._state == TrafficState.RUNNING:
             return 1.0
         if self._state == TrafficState.SLOW:
-            return self._yellow_scale
-        return 0.0   # STOPPED
+            return self._yellow_scale   # fixed reduced speed while yellow visible
+        return 0.0   # STOPPED — immediate
 
     @staticmethod
     def _state_for_color(color: str) -> str:
@@ -121,8 +117,7 @@ class TrafficLightFSMNode(Node):
     def _publish_loop(self):
         now = time.monotonic()
 
-        # If SLOW and we haven't seen a color for lost_timeout, return to RUNNING.
-        # STOPPED does NOT time out — it requires explicit green to resume.
+        # If SLOW and detection lost for too long, resume
         if (self._state == TrafficState.SLOW
                 and self._last_color_time is not None
                 and now - self._last_color_time > self._lost_timeout):
@@ -142,7 +137,6 @@ def main(args=None):
     node = TrafficLightFSMNode()
 
     def _shutdown(signum, frame):
-        # Publish zero scale on shutdown for safety
         msg = Float32()
         msg.data = 0.0
         node._scale_pub.publish(msg)

@@ -1,21 +1,14 @@
 #!/usr/bin/env python3
 """
-Full traffic-light challenge stack.
+DEPRECATED — use the split pair instead:
 
-Launches:
-  micro_ros_agent     — MCU serial bridge
-  camera_publisher    — IMX219 CSI camera
-  odometry_node       — integrates /robot_vel → /odom
-  velocity_controller — inner-loop PI
-  waypoint_follower   — outer-loop position controller
-  color_detector_node — HSV traffic light color detection
-  traffic_light_fsm_node — behavioral FSM, publishes /traffic_speed_scale
+  Jetson:  ros2 launch pzb_traffic traffic_challenge_robot.launch.py
+  PC:      ros2 launch pzb_traffic traffic_challenge_pc.launch.py
 
-Usage:
-    ros2 launch pzb_traffic traffic_challenge.launch.py
-    ros2 launch pzb_traffic traffic_challenge.launch.py \
-        control_params:=/path/to/my_params.yaml \
-        traffic_params:=/path/to/my_traffic.yaml
+Running this all-in-one file alongside either of the above will put duplicate
+nodes on the same topics and cause MCU brown-outs (see memory for root cause).
+
+This file is kept only as a fallback for single-machine testing.
 """
 import os
 
@@ -29,26 +22,18 @@ from launch_ros.actions import Node
 def generate_launch_description():
     control_pkg = get_package_share_directory('pzb_control')
     traffic_pkg  = get_package_share_directory('pzb_traffic')
-    camera_pkg   = get_package_share_directory('pzb_camera')
 
     default_control_params = os.path.join(control_pkg, 'config', 'pid_vel_params.yaml')
     default_traffic_params = os.path.join(traffic_pkg,  'config', 'traffic_params.yaml')
-    default_camera_params  = os.path.join(camera_pkg,   'config', 'camera_params.yaml')
 
     control_params_arg = DeclareLaunchArgument(
-        'control_params', default_value=default_control_params,
-        description='Path to control stack YAML config')
+        'control_params', default_value=default_control_params)
     traffic_params_arg = DeclareLaunchArgument(
-        'traffic_params', default_value=default_traffic_params,
-        description='Path to traffic light YAML config')
-    camera_params_arg = DeclareLaunchArgument(
-        'camera_params', default_value=default_camera_params,
-        description='Path to camera YAML config')
+        'traffic_params', default_value=default_traffic_params)
     sim_arg = DeclareLaunchArgument('use_sim_time', default_value='false')
 
     control_params = LaunchConfiguration('control_params')
     traffic_params = LaunchConfiguration('traffic_params')
-    camera_params  = LaunchConfiguration('camera_params')
     sim            = LaunchConfiguration('use_sim_time')
 
     micro_ros = Node(
@@ -59,12 +44,19 @@ def generate_launch_description():
         output='screen',
     )
 
-    camera_node = Node(
+    camera = Node(
         package='pzb_camera',
-        executable='camera_publisher',
-        name='camera_publisher',
+        executable='usb_camera_publisher',
+        name='usb_camera_publisher',
         output='screen',
-        parameters=[camera_params, {'use_sim_time': sim}],
+        parameters=[{
+            'device_index':       0,
+            'width':              640,
+            'height':             480,
+            'framerate':          30.0,
+            'publish_compressed': True,
+            'publish_raw':        False,
+        }],
     )
 
     odom_node = Node(
@@ -110,10 +102,9 @@ def generate_launch_description():
     return LaunchDescription([
         control_params_arg,
         traffic_params_arg,
-        camera_params_arg,
         sim_arg,
         micro_ros,
-        camera_node,
+        camera,
         odom_node,
         vel_ctrl_node,
         wp_node,

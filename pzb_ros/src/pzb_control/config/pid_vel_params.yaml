@@ -58,7 +58,7 @@ waypoint_follower:
     max_linear_speed: 0.40
     max_angular_speed: 0.8
     min_linear_speed: 0.05
-    blend_radius_m: 0.40          # start blending toward goal heading (meters from waypoint)
+    blend_radius_m: 0.20          # start blending toward goal heading (meters from waypoint)
     align_yaw: false
     align_at_all_waypoints: false
     lookahead_dist: 0.10
@@ -66,29 +66,33 @@ waypoint_follower:
 
     # Waypoints: flat list [x0, y0, yaw0_deg, x1, y1, yaw1_deg, ...]
     # Yaw values are in DEGREES
-    waypoints_xyyaw: [
-      0.0,  0.0,    0.0,
-      0.5,  0.0,    0.0,
-      0.5,  0.5,   90.0,
-      0.0,  0.5,  180.0,
-      0.0,  0.0,  -90.0,
-      0.0,  0.0,    0.0
-    ]
+    # waypoints_xyyaw: [
+    #   0.0,  0.0,    0.0,
+    #   0.5,  0.0,    0.0,
+    #   0.5,  0.5,   90.0,
+    #   0.0,  0.5,  180.0,
+    #   0.0,  0.0,  -90.0,
+    #   0.0,  0.0,    0.0
+    # ]
+
+    # waypoints_xyyaw: [
+    #   3.0, 0.0, 0.0,
+    # ]
 
     # --- Example paths (yaw in degrees) ---
     # Simple L-shape:
     # waypoints_xyyaw: [0.8, 0.0, 0.0,   0.8, 0.8, 90.0]
 
     # Octagon:
-    # waypoints_xyyaw: [
-    #    0.354,  0.146,   45.0,
-    #    0.500,  0.500,   90.0,
-    #    0.354,  0.854,  135.0,
-    #    0.000,  1.000,  180.0,
-    #   -0.354,  0.854, -135.0,
-    #   -0.500,  0.500,  -90.0,
-    #   -0.354,  0.146,  -45.0,
-    #    0.000,  0.000,    0.0
-    # ]
+    waypoints_xyyaw: [
+       0.354,  0.146,   45.0,
+       0.500,  0.500,   90.0,
+       0.354,  0.854,  135.0,
+       0.000,  1.000,  180.0,
+      -0.354,  0.854, -135.0,
+      -0.500,  0.500,  -90.0,
+      -0.354,  0.146,  -45.0,
+       0.000,  0.000,    0.0
+    ]
 
 

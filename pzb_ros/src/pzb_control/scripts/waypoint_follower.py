@@ -198,22 +198,26 @@ class WaypointFollower(Node):
 
             # Last waypoint: use dist_tol for precise arrival.
             # Intermediate: use lookahead for early advance, but never below dist_tol.
-            threshold = self._dist_tol if is_last else max(self._lookahead, self._dist_tol)
-            if d < threshold:
-                if should_align:
-                    e_yaw = _wrap_to_pi(yaw_goal - self._theta)
-                    if abs(e_yaw) > self._yaw_tol:
-                        # Blending didn't fully converge — fine-correct with ALIGNING
-                        self._state = State.ALIGNING
-                        self._yaw_integral = 0.0
-                        self.get_logger().info(
-                            f'[WP {self._wp_idx}] Position reached — '
-                            f'aligning yaw ({math.degrees(e_yaw):.1f}° remaining)'
-                        )
+            # Freeze advancement while stopped — prevents the slew limiter's
+            # coast-down from pushing the robot past the lookahead threshold
+            # and skipping to the wrong waypoint during a traffic-light stop.
+            if self._speed_scale > 0.0:
+                threshold = self._dist_tol if is_last else max(self._lookahead, self._dist_tol)
+                if d < threshold:
+                    if should_align:
+                        e_yaw = _wrap_to_pi(yaw_goal - self._theta)
+                        if abs(e_yaw) > self._yaw_tol:
+                            # Blending didn't fully converge — fine-correct with ALIGNING
+                            self._state = State.ALIGNING
+                            self._yaw_integral = 0.0
+                            self.get_logger().info(
+                                f'[WP {self._wp_idx}] Position reached — '
+                                f'aligning yaw ({math.degrees(e_yaw):.1f}° remaining)'
+                            )
+                        else:
+                            self._advance()
                     else:
                         self._advance()
-                else:
-                    self._advance()
 
         elif self._state == State.ALIGNING:
             e_yaw = _wrap_to_pi(yaw_goal - self._theta)
