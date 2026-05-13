@@ -4,7 +4,8 @@ Traffic light FSM node.
 
 Consumes detected traffic light color and applies behavioral rules:
   - Green  → full speed (scale = 1.0)
-  - Yellow → slow speed (scale = yellow_speed_scale param)
+  - Yellow → ramp from yellow_speed_scale down to 0.0 over yellow_ramp_duration_s;
+             resumes instantly on green; if yellow lost, times out back to RUNNING
   - Red    → full stop, LATCHED — stays stopped even if red disappears;
              only resumes when green is explicitly seen
   - None   → drive normally (scale = 1.0), unless latched on red
@@ -37,15 +38,18 @@ class TrafficLightFSMNode(Node):
         super().__init__('traffic_light_fsm_node')
 
         self.declare_parameter('yellow_speed_scale', 0.4)
+        self.declare_parameter('yellow_ramp_duration_s', 3.0)
         self.declare_parameter('color_lost_timeout', 1.5)
         self.declare_parameter('loop_hz', 20.0)
 
         self._yellow_scale    = float(self.get_parameter('yellow_speed_scale').value)
+        self._ramp_duration   = float(self.get_parameter('yellow_ramp_duration_s').value)
         self._lost_timeout    = float(self.get_parameter('color_lost_timeout').value)
 
         self._state           = TrafficState.RUNNING
         self._last_color      = 'none'
         self._last_color_time = None   # wall time of last /traffic_light_color message
+        self._yellow_start    = None   # wall time when SLOW state was entered
 
         self.create_subscription(String, '/traffic_light_color', self._color_callback, 10)
         self._scale_pub = self.create_publisher(Float32, '/traffic_speed_scale', 10)
@@ -55,7 +59,8 @@ class TrafficLightFSMNode(Node):
 
         self.get_logger().info(
             f'TrafficLightFSMNode ready — '
-            f'yellow_scale={self._yellow_scale}, lost_timeout={self._lost_timeout}s'
+            f'yellow_scale={self._yellow_scale}, ramp={self._ramp_duration}s, '
+            f'lost_timeout={self._lost_timeout}s'
         )
         self.get_logger().info(f'Initial state: {self._state.value}')
 
@@ -104,12 +109,16 @@ class TrafficLightFSMNode(Node):
                 f'FSM: {self._state.value} → {new_state.value}'
             )
             self._state = new_state
+            if new_state == TrafficState.SLOW:
+                self._yellow_start = time.monotonic()
 
     def _current_scale(self) -> float:
         if self._state == TrafficState.RUNNING:
             return 1.0
         if self._state == TrafficState.SLOW:
-            return self._yellow_scale
+            elapsed = time.monotonic() - self._yellow_start
+            frac = min(elapsed / self._ramp_duration, 1.0)
+            return self._yellow_scale * (1.0 - frac)
         return 0.0   # STOPPED
 
     @staticmethod

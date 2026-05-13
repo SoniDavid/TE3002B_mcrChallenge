@@ -30,6 +30,7 @@ traffic_light_fsm_node:
   ros__parameters:
     use_sim_time: false
 
-    yellow_speed_scale:  0.4   # v multiplier when yellow (0 < scale ≤ 1)
-    color_lost_timeout:  1.5   # s — treat color as "none" if no detection this long
-    loop_hz:             20.0
+    yellow_speed_scale:     0.4   # initial v multiplier when yellow first seen
+    yellow_ramp_duration_s: 3.0   # s — ramp from yellow_speed_scale → 0.0 while yellow persists
+    color_lost_timeout:     1.5   # s — treat color as "none" if no detection this long
+    loop_hz:                20.0
