@@ -3,34 +3,40 @@ color_detector_node:
     use_sim_time: false
 
     # --- HSV ranges (OpenCV: H in [0,180], S and V in [0,255]) ---
+    # Calibrated from camera images of the actual color sources:
+    #   Red    — backlit tablet screen (bright, very saturated)
+    #   Yellow — paper card #FFF200 / RGB(255,242,0) under room light
+    #   Green  — backlit tablet screen, lime/chartreuse (bright, very saturated)
+
     # Red wraps around H=0/180, so two sub-ranges are needed.
-    red_h_low1:  0       # lower red range lower bound
-    red_h_high1: 10      # lower red range upper bound
-    red_h_low2:  165     # upper red range lower bound
-    red_h_high2: 180     # upper red range upper bound
-    red_s_min:   100
-    red_v_min:   80
+    red_h_low1:  0       # lower sub-range [0, 10]
+    red_h_high1: 10
+    red_h_low2:  170     # upper sub-range [170, 180]
+    red_h_high2: 180
+    red_s_min:   175     # raised from 140 — skin S is ~50-140, iPad red S is ~200-255
+    red_v_min:   140     # raised from 120 — screen red is bright
 
-    green_h_low:  45
-    green_h_high: 85
-    green_s_min:  80
-    green_v_min:  80
+    # Yellow: #FFF200 → OpenCV H≈28; paper reflects so S is lower than a screen
+    green_h_low:  42
+    green_h_high: 75
+    green_s_min:  150    # lime screen green is highly saturated
+    green_v_min:  120    # screen green is bright
 
-    yellow_h_low:  18
-    yellow_h_high: 35
-    yellow_s_min:  120
-    yellow_v_min:  100
+    # Yellow: #FFF200 → OpenCV H≈28; paper under room light has lower saturation
+    yellow_h_low:  20
+    yellow_h_high: 38
+    yellow_s_min:  50    # paper diffuses light → lower S than screen colors
+    yellow_v_min:  160   # still bright white-ish paper
 
     # --- Detection robustness ---
     min_blob_area:   800.0   # px² — blobs smaller than this are ignored
-    confirm_frames:  3       # consecutive frames of same color before updating output
+    confirm_frames:  4       # consecutive frames of same color before updating output
     loop_hz:         30.0
 
 traffic_light_fsm_node:
   ros__parameters:
     use_sim_time: false
 
-    yellow_speed_scale:     0.4   # initial v multiplier when yellow first seen
-    yellow_ramp_duration_s: 3.0   # s — ramp from yellow_speed_scale → 0.0 while yellow persists
-    color_lost_timeout:     1.5   # s — treat color as "none" if no detection this long
-    loop_hz:                20.0
+    yellow_speed_scale: 0.4   # fixed v multiplier while yellow is visible
+    color_lost_timeout: 1.5   # s — treat color as "none" if no detection this long
+    loop_hz:             20.0

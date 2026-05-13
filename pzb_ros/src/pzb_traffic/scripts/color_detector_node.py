@@ -73,6 +73,7 @@ class ColorDetectorNode(Node):
         self._confirmed_color = 'none'   # last published color
 
         self._morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
         self.create_subscription(
             CompressedImage,
@@ -147,9 +148,13 @@ class ColorDetectorNode(Node):
         if frame is None:
             return
 
-        # Blur before HSV conversion to reduce noise
-        blurred = cv2.GaussianBlur(frame, (5, 5), 0)
+        # Bilateral filter: reduces noise while preserving color edges (better than Gaussian for screen glare)
+        blurred = cv2.bilateralFilter(frame, d=9, sigmaColor=75, sigmaSpace=75)
         hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+        # CLAHE on V channel normalizes brightness variation from screen angle/glare
+        h, s, v = cv2.split(hsv)
+        v = self._clahe.apply(v)
+        hsv = cv2.merge([h, s, v])
 
         ranges = self._hsv_ranges()
         areas = {}
