@@ -14,6 +14,9 @@ GStreamer pipeline used:
 This path is fully hardware-accelerated on the Jetson Nano.
 """
 
+import threading
+import time
+
 import cv2
 import numpy as np
 
@@ -87,14 +90,30 @@ class CameraPublisher(Node):
             raise RuntimeError('Camera open failed')
 
         self.get_logger().info(
-            f'Camera ready  {self._width}x{self._height}@{self._fps}fps  '
-            f'JPEG quality={self._quality}  '
+            f'Camera ready  {self._width}x{self._height}@{self._sensor_framerate()}fps(sensor)'
+            f'  publish@{self._fps}fps'
+            f'  JPEG quality={self._quality}  '
             f'publish_compressed={self._publish_compressed_enabled}  '
             f'publish_raw={self._publish_raw_enabled}'
         )
 
+        # ── Shared capture state ──────────────────────────────────────────────
+        self._lock = threading.Lock()
+        self._latest_frame: np.ndarray | None = None
+        self._latest_stamp = None
+        self._capture_thread_running = True
+        self._consecutive_failures = 0
+        self._reconnect_attempts = 0
+        self._MAX_CONSECUTIVE_FAILURES = 10
+        self._MAX_RECONNECT_ATTEMPTS = 5
+        self._RECONNECT_SLEEP_SEC = 3.0
+
+        self._cap_thread = threading.Thread(
+            target=self._capture_loop, name='camera_capture', daemon=True)
+        self._cap_thread.start()
+
         # ── Timer ─────────────────────────────────────────────────────────────
-        # Timer period matches the requested framerate.
+        # Timer period matches the requested publish framerate.
         self._timer = self.create_timer(1.0 / self._fps, self._capture_and_publish)
 
         # ── JPEG encode params ────────────────────────────────────────────────
@@ -119,37 +138,87 @@ class CameraPublisher(Node):
 
     # ── GStreamer pipeline builder ────────────────────────────────────────────
 
+    def _sensor_framerate(self) -> int:
+        """Return the native IMX219 sensor framerate for the configured resolution.
+
+        At 1280x720 the IMX219 has no 30fps mode; its lowest is 60fps.
+        Requesting 30fps causes Argus to pick the 120fps mode instead.
+        """
+        if self._width == 1280 and self._height == 720:
+            return 60
+        return self._fps
+
     def _gstreamer_pipeline(self, sensor_id: int) -> str:
+        sensor_fps = self._sensor_framerate()
         return (
             f'nvarguscamerasrc sensor-id={sensor_id} ! '
             f'video/x-raw(memory:NVMM), '
             f'width={self._width}, height={self._height}, '
-            f'framerate={self._fps}/1 ! '
+            f'framerate={sensor_fps}/1 ! '
             f'nvvidconv flip-method={self._flip_method} ! '
             f'video/x-raw, width={self._width}, height={self._height}, format=BGRx ! '
             f'videoconvert ! '
             f'video/x-raw, format=BGR ! '
-            f'appsink drop=1 max-buffers=1 sync=false'
+            f'appsink drop=true max-buffers=2 sync=false'
         )
 
-    # ── Capture + publish callback ────────────────────────────────────────────
+    # ── Background capture loop ───────────────────────────────────────────────
+
+    def _capture_loop(self):
+        self.get_logger().info('Capture thread started.')
+        while self._capture_thread_running:
+            ret, frame = self._cap.read()
+            if ret:
+                self._consecutive_failures = 0
+                stamp = self.get_clock().now().to_msg()
+                with self._lock:
+                    self._latest_frame = frame
+                    self._latest_stamp = stamp
+            else:
+                self._consecutive_failures += 1
+                self.get_logger().warning(
+                    f'cap.read() failed (consecutive={self._consecutive_failures})')
+                if self._consecutive_failures >= self._MAX_CONSECUTIVE_FAILURES:
+                    if self._reconnect_attempts >= self._MAX_RECONNECT_ATTEMPTS:
+                        self.get_logger().error(
+                            f'Camera failed after {self._MAX_RECONNECT_ATTEMPTS} '
+                            'reconnect attempts. Shutting down.')
+                        self._capture_thread_running = False
+                        rclpy.shutdown()
+                        return
+                    self._reconnect_attempts += 1
+                    self.get_logger().warning(
+                        f'Reconnecting {self._reconnect_attempts}/'
+                        f'{self._MAX_RECONNECT_ATTEMPTS} ...')
+                    self._cap.release()
+                    time.sleep(self._RECONNECT_SLEEP_SEC)
+                    sensor_id = self.get_parameter('sensor_id').value
+                    self._cap = cv2.VideoCapture(
+                        self._gstreamer_pipeline(sensor_id), cv2.CAP_GSTREAMER)
+                    if self._cap.isOpened():
+                        self.get_logger().info('Reconnect succeeded.')
+                        self._consecutive_failures = 0
+                    else:
+                        self.get_logger().error('Reconnect failed — will retry.')
+        self.get_logger().info('Capture thread exiting.')
+
+    # ── Publish callback (non-blocking — reads shared frame reference) ────────
 
     def _capture_and_publish(self):
-        ret, frame = self._cap.read()
-        if not ret:
-            self.get_logger().warning('Frame capture failed — skipping')
+        with self._lock:
+            frame = self._latest_frame
+            stamp = self._latest_stamp
+
+        if frame is None:
             return
 
-        now = self.get_clock().now().to_msg()
         self._frame_count += 1
 
-        # Publish compressed only when enabled and needed to avoid unnecessary JPEG load.
         if self._publish_compressed_enabled and self._pub_compressed.get_subscription_count() > 0:
-            self._publish_compressed(frame, now)
+            self._publish_compressed(frame, stamp)
 
-        # Only publish raw if someone is subscribed (saves CPU when unused)
         if self._publish_raw_enabled and self._pub_raw.get_subscription_count() > 0:
-            self._publish_raw(frame, now)
+            self._publish_raw(frame, stamp)
 
     def _publish_compressed(self, frame: np.ndarray, stamp) -> None:
         ok, buf = cv2.imencode('.jpg', frame, self._encode_params)
@@ -180,7 +249,10 @@ class CameraPublisher(Node):
     # ── Cleanup ───────────────────────────────────────────────────────────────
 
     def destroy_node(self):
-        if self._cap.isOpened():
+        self._capture_thread_running = False
+        if hasattr(self, '_cap_thread') and self._cap_thread.is_alive():
+            self._cap_thread.join(timeout=2.0)
+        if hasattr(self, '_cap') and self._cap.isOpened():
             self._cap.release()
             self.get_logger().info(
                 f'Camera released after {self._frame_count} frames.')

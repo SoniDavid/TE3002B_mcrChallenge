@@ -7,6 +7,11 @@ camera_publisher:
     # Supported: 3264x2464@21, 3264x1848@28, 1920x1080@30, 1640x1232@30, 1280x720@60
     width: 1280
     height: 720
+
+    # Publish framerate for ROS2 topics (ROS2 timer rate).
+    # The GStreamer pipeline uses the native sensor framerate automatically
+    # (60fps for 1280x720 — the IMX219 has no 30fps mode at that resolution).
+    # Keep this <= native sensor rate.
     framerate: 30
 
     # JPEG quality for CompressedImage (1-100). 80 is a good balance.
