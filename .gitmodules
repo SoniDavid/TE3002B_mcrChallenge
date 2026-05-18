@@ -1,3 +1,6 @@
 [submodule "pzb_ros/src/deps/rosshow"]
 	path = pzb_ros/src/deps/rosshow
 	url = https://github.com/dheera/rosshow.git
+[submodule "pzb_ros/src/pzb_ibvs"]
+	path = pzb_ros/src/pzb_ibvs
+	url = https://github.com/SoniDavid/TE3002B_pzbIBVS.git
