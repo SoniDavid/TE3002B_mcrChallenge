@@ -17,13 +17,6 @@ Repository for coursework and practical challenges in TE3002B Intelligent Roboti
 | Abraham de Jesús Maldonado Mata | A00838581 |
 | Carla Elizabeth Regalado Luna | A00837070 |
 
-Aportaciones:
-Abraham Maldonado: Ingeniero de Percepción y Visión Computacional Clásica
-Irvin Ornelas: Ingeniero de Modelado Cinemático y Espacio de Estados
-David Soni: Ingeniero de Control Óptimo Predictivo y Optimización Numérica
-David Lomelí: Ingeniero de Integración de Hardware, Actuación y Filtros No Lineales
-Carla Regalado: DevOps, QA Engineer y Analista de Datos Experimentales
-
 ## Featured Project: Week 2 Challenge
 
 ### Puzzlebot Open-Loop Path Execution
@@ -68,3 +61,10 @@ ros2 launch pzb_control mini_challenge.launch.py use_sim_time:=false
 ```bash
 ros2 run pzb_utils emergency_stop
 ```
+
+Aportaciones:
+- Abraham Maldonado: Ingeniero de Percepción y Visión Computacional Clásica
+- Irvin Ornelas: Ingeniero de Modelado Cinemático y Espacio de Estados
+- David Soni: Ingeniero de Control Óptimo Predictivo y Optimización Numérica
+- David Lomelí: Ingeniero de Integración de Hardware, Actuación y Filtros No Lineales
+- Carla Regalado: DevOps, QA Engineer y Analista de Datos Experimentales
