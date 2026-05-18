@@ -1,5 +1,5 @@
 {
-  "name": "ROS 2 Humble Dev Container",
+  "name": "ROS 1 Humble Dev Container",
   "dockerComposeFile": "docker-compose.yml",
   "service": "ros-dev",
   "workspaceFolder": "/home/dev/ws",

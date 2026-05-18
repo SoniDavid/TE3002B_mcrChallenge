@@ -76,20 +76,32 @@ class USBCameraPublisher(Node):
             self.get_logger().fatal(f'Failed to open /dev/video{device_index}.')
             raise RuntimeError('USB Camera open failed')
 
-        # Request MJPEG from the camera before setting resolution.
-        # At resolutions above 640x480 most USB cameras only support MJPEG (not raw
-        # YUYV), and without this flag V4L2 returns garbled green frames.
+        # Request MJPEG from the camera hardware — keeps USB bandwidth low and
+        # reduces capture latency vs raw YUYV.  Falls back silently if not supported.
         self._cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
-        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
-        self._cap.set(cv2.CAP_PROP_FPS, self._fps)
 
-        actual_w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        actual_h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        # Set resolution and force FPS
+        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self._cap.set(cv2.CAP_PROP_FPS, 30)
+
+        # Shrink the V4L2 internal buffer to 1 frame so cap.read() always
+        # returns the LATEST frame, not one that is several frames old.
+        # Default is 4 frames (≈133 ms stale at 30 fps) — far too much for MPC.
+        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        # Attempt to lock exposure so HSV thresholds stay stable.
+        # Many UVC webcams ignore this; the set() will just return False.
+        self._cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)   # 1 = manual on V4L2
+
+        actual_w   = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h   = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         actual_fps = self._cap.get(cv2.CAP_PROP_FPS)
+        fourcc_int = int(self._cap.get(cv2.CAP_PROP_FOURCC))
+        fourcc_str = ''.join([chr((fourcc_int >> (8 * i)) & 0xFF) for i in range(4)])
         self.get_logger().info(
-            f'USB Camera ready: {actual_w}x{actual_h} @ {actual_fps:.1f} fps '
-            f'(requested {self._width}x{self._height}) '
+            f'USB Camera ready: {actual_w}x{actual_h} @ {actual_fps:.0f} fps '
+            f'fourcc={fourcc_str} '
             f'publish_compressed={self._publish_compressed_enabled} '
             f'publish_raw={self._publish_raw_enabled}'
         )

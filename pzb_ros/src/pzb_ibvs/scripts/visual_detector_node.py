@@ -2,7 +2,7 @@
 """
 Visual detector node for IBVS.
 
-Detects a target (ArUco marker or colored ball) in the camera image and
+Detects a target (ArUco marker or colored blob) in the camera image and
 publishes a 4-element feature vector [eu, ev, ea, confidence] where:
   eu = u_centroid - cx       (horizontal pixel error, + = target is right of center)
   ev = v_centroid - cy       (vertical pixel error,   + = target is below center)
@@ -11,10 +11,23 @@ publishes a 4-element feature vector [eu, ev, ea, confidence] where:
 
 Subscribes:
   /camera/image_compressed  (sensor_msgs/CompressedImage)
+    The CompressedImage.data field is a raw JPEG byte buffer. This node decodes
+    it directly with cv2.imdecode — no cv_bridge or image_transport decompression
+    step is needed. The camera publisher (usb_camera_publisher.py) sends JPEG
+    so this is correct and efficient.
 
 Publishes:
-  /visual_features                          (std_msgs/Float64MultiArray)  [eu, ev, ea, confidence]
-  /visual_detector/debug_image/compressed  (sensor_msgs/CompressedImage) annotated frame (JPEG)
+  /visual_features              (std_msgs/Float64MultiArray)  [eu, ev, ea, confidence]
+  /visual_detector/debug_image  (sensor_msgs/Image)  annotated BGR frame
+  /visual_detector/debug_mask   (sensor_msgs/Image)  binary HSV mask (mono8)
+
+Robustness features (color_blob mode):
+  - Gaussian blur before HSV conversion (reduces JPEG compression artifacts)
+  - CLAHE on the Value channel (normalises for uneven / changing illumination)
+  - Hue-wrap support for red blobs (H near 0/180)
+  - Morphological open to remove speckle
+  - Solidity filter: rejects non-convex false positives (shadows, table edges)
+  - Area computed from convex hull for stable ea under partial occlusion
 """
 
 import signal
@@ -41,28 +54,32 @@ class VisualDetectorNode(Node):
     def __init__(self):
         super().__init__('visual_detector_node')
 
-        self.declare_parameter('detector_type', 'color_blob')  # 'aruco' or 'color_blob'
+        # ── General params ────────────────────────────────────────────────────
+        self.declare_parameter('detector_type', 'color_blob')
         self.declare_parameter('image_width', 1280)
         self.declare_parameter('image_height', 720)
-        self.declare_parameter('cx', -1.0)   # <0 → use image_width/2
-        self.declare_parameter('cy', -1.0)   # <0 → use image_height/2
-        self.declare_parameter('desired_area', 8000.0)  # pixels² at goal distance
+        self.declare_parameter('cx', -1.0)
+        self.declare_parameter('cy', -1.0)
+        self.declare_parameter('desired_area', 8000.0)
+        self.declare_parameter('confidence_threshold', 0.5)
 
-        # ArUco params
+        # ── ArUco params ──────────────────────────────────────────────────────
         self.declare_parameter('marker_id', 0)
         self.declare_parameter('marker_size_m', 0.10)
         self.declare_parameter('aruco_dict', 'DICT_4X4_50')
 
-        # Color blob params
-        self.declare_parameter('hsv_lower', [0, 120, 70])
-        self.declare_parameter('hsv_upper', [10, 255, 255])
+        # ── Color blob params ─────────────────────────────────────────────────
+        self.declare_parameter('hsv_lower', [20, 160, 100])
+        self.declare_parameter('hsv_upper', [38, 255, 255])
         self.declare_parameter('ball_diameter_m', 0.065)
         self.declare_parameter('min_contour_area', 500.0)
+        self.declare_parameter('min_solidity', 0.75)   # reject non-convex blobs
+        self.declare_parameter('use_clahe', True)
+        self.declare_parameter('clahe_clip_limit', 2.0)
 
-        self.declare_parameter('confidence_threshold', 0.5)
         self.declare_parameter('detection_holdoff_frames', 3)
 
-        # Read params
+        # ── Read params ───────────────────────────────────────────────────────
         self._det_type = self.get_parameter('detector_type').value
         _cx_param = self.get_parameter('cx').value
         _cy_param = self.get_parameter('cy').value
@@ -74,37 +91,43 @@ class VisualDetectorNode(Node):
         self._desired_area = float(self.get_parameter('desired_area').value)
         self._sqrt_desired_area = np.sqrt(self._desired_area)
         self._min_contour_area = self.get_parameter('min_contour_area').value
+        self._min_solidity = self.get_parameter('min_solidity').value
         self._holdoff_frames = int(self.get_parameter('detection_holdoff_frames').value)
         self._consecutive_failures = 0
         self._last_valid = (0.0, 0.0, 0.0, 0.0)  # eu, ev, ea, conf
 
-        # ArUco detector (lazy-init so it doesn't fail when using color_blob)
-        self._aruco_detector = None
-        self._target_marker_id = self.get_parameter('marker_id').value
-        if self._det_type == 'aruco':
-            self._init_aruco_detector()
-
-        # HSV bounds (list params)
         lo = self.get_parameter('hsv_lower').value
         hi = self.get_parameter('hsv_upper').value
         self._hsv_lower = np.array(lo, dtype=np.uint8)
         self._hsv_upper = np.array(hi, dtype=np.uint8)
 
-        # Morphological kernel for noise removal
+        # CLAHE on Value channel — normalises brightness variation between lighting
+        # conditions without touching hue or saturation, which carry the color signal.
+        use_clahe = self.get_parameter('use_clahe').value
+        clip = self.get_parameter('clahe_clip_limit').value
+        self._clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8)) if use_clahe else None
+
+        # Fixed 5×5 Gaussian blur before HSV — softens JPEG block artifacts
+        self._blur_ksize = (5, 5)
+
+        # Elliptical kernel for morphological open (removes speckle noise)
         self._morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
 
-        self.declare_parameter('debug_jpeg_quality', 60)
-        self._dbg_quality = int(self.get_parameter('debug_jpeg_quality').value)
+        # ── ArUco setup ───────────────────────────────────────────────────────
+        self._aruco_detector = None
+        self._target_marker_id = self.get_parameter('marker_id').value
+        if self._det_type == 'aruco':
+            self._init_aruco_detector()
 
-        # Publishers
+        # ── Publishers ────────────────────────────────────────────────────────
         self._feat_pub = self.create_publisher(Float64MultiArray, '/visual_features', 10)
-        # Publish debug image compressed so it can be streamed over the network at full fps.
-        # Subscribe with: rqt_image_view /visual_detector/debug_image/compressed
-        # Or decompress with: ros2 run pzb_camera image_decompressor
-        self._dbg_pub = self.create_publisher(
-            CompressedImage, '/visual_detector/debug_image/compressed', 1)
+        self._dbg_pub  = self.create_publisher(Image, '/visual_detector/debug_image', 1)
+        self._mask_pub = self.create_publisher(Image, '/visual_detector/debug_mask', 1)
 
-        # Subscriber
+        # ── Subscriber ────────────────────────────────────────────────────────
+        # CompressedImage carries a raw JPEG buffer in .data. We decode it with
+        # cv2.imdecode — equivalent to cv_bridge.compressed_imgmsg_to_cv2 but
+        # without the ROS image_transport overhead.
         self.create_subscription(
             CompressedImage,
             '/camera/image_compressed',
@@ -117,7 +140,8 @@ class VisualDetectorNode(Node):
         self.get_logger().info(
             f'VisualDetectorNode ready — detector={self._det_type}, '
             f'cx={cx_str}, cy={cy_str}, '
-            f'desired_area={self._desired_area:.1f}'
+            f'desired_area={self._desired_area:.1f}, '
+            f'clahe={"on" if self._clahe else "off"}'
         )
 
     # ── ArUco setup ──────────────────────────────────────────────────────────
@@ -141,14 +165,13 @@ class VisualDetectorNode(Node):
     # ── Image callback ───────────────────────────────────────────────────────
 
     def _image_callback(self, msg: CompressedImage):
+        # Decode JPEG directly from the CompressedImage byte buffer.
         buf = np.frombuffer(msg.data, dtype=np.uint8)
         frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
         if frame is None:
             return
 
         # Auto-set cx/cy from the actual frame on the first callback.
-        # This is correct regardless of what image_width/height params say,
-        # so a USB camera that negotiates 640x480 is handled automatically.
         if self._cx is None:
             frame_h, frame_w = frame.shape[:2]
             self._cx = frame_w / 2.0
@@ -158,18 +181,33 @@ class VisualDetectorNode(Node):
                 f'cx={self._cx:.1f}, cy={self._cy:.1f}'
             )
 
+        mask = None
         if self._det_type == 'aruco':
             eu, ev, ea, conf, frame = self._detect_aruco(frame)
         else:
-            eu, ev, ea, conf, frame = self._detect_color_blob(frame)
+            eu, ev, ea, conf, frame, mask = self._detect_color_blob(frame)
 
         feat = Float64MultiArray()
         feat.data = [eu, ev, ea, conf]
         self._feat_pub.publish(feat)
 
-        # Only publish debug image when someone is watching
+        stamp = msg.header.stamp
         if self._dbg_pub.get_subscription_count() > 0:
-            self._publish_debug(frame, msg.header.stamp)
+            self._publish_debug(frame, stamp)
+        if mask is not None and self._mask_pub.get_subscription_count() > 0:
+            self._publish_mask(mask, stamp)
+
+    # ── Preprocessing ────────────────────────────────────────────────────────
+
+    def _to_hsv(self, frame):
+        """Blur → CLAHE on V → return HSV image."""
+        blurred = cv2.GaussianBlur(frame, self._blur_ksize, 0)
+        hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+        if self._clahe is not None:
+            h, s, v = cv2.split(hsv)
+            v = self._clahe.apply(v)
+            hsv = cv2.merge([h, s, v])
+        return hsv
 
     # ── ArUco detection ──────────────────────────────────────────────────────
 
@@ -183,10 +221,9 @@ class VisualDetectorNode(Node):
             for i, marker_id in enumerate(ids.flatten()):
                 if marker_id != self._target_marker_id:
                     continue
-                pts = corners[i][0]  # shape (4, 2)
+                pts = corners[i][0]
                 cx_det = float(np.mean(pts[:, 0]))
                 cy_det = float(np.mean(pts[:, 1]))
-                # Area from convex hull of corners
                 hull = cv2.convexHull(pts.astype(np.float32))
                 area = float(cv2.contourArea(hull))
 
@@ -195,16 +232,10 @@ class VisualDetectorNode(Node):
                 ea = np.sqrt(max(area, 0.0)) - self._sqrt_desired_area
                 conf = 1.0
 
-                # Draw on frame
                 cv2.aruco.drawDetectedMarkers(frame, corners)
                 cv2.circle(frame, (int(cx_det), int(cy_det)), 6, (0, 255, 0), -1)
-                cv2.putText(
-                    frame,
-                    f'eu={eu:.0f} ev={ev:.0f} ea={ea:.1f}',
-                    (int(cx_det) + 10, int(cy_det) - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1,
-                )
-                break  # Use first matching marker only
+                self._draw_stats(frame, int(cx_det), int(cy_det), eu, ev, ea, conf)
+                break
 
         self._draw_crosshair(frame)
         return eu, ev, ea, conf, frame
@@ -212,20 +243,18 @@ class VisualDetectorNode(Node):
     # ── Color blob detection ─────────────────────────────────────────────────
 
     def _detect_color_blob(self, frame):
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        hsv = self._to_hsv(frame)
 
-        # Handle hue wrap-around for reds (hue near 0/180)
+        # Support hue wrap-around (e.g. red spans 170–10)
         if self._hsv_lower[0] <= self._hsv_upper[0]:
             mask = cv2.inRange(hsv, self._hsv_lower, self._hsv_upper)
         else:
-            # Hue wraps: e.g. lower=[170,..] upper=[10,..]
-            lo2 = self._hsv_lower.copy()
-            lo2[0] = 0
-            hi2 = self._hsv_upper.copy()
-            hi2[0] = 180
-            mask1 = cv2.inRange(hsv, self._hsv_lower, hi2)
-            mask2 = cv2.inRange(hsv, lo2, self._hsv_upper)
-            mask = cv2.bitwise_or(mask1, mask2)
+            lo2 = self._hsv_lower.copy(); lo2[0] = 0
+            hi2 = self._hsv_upper.copy(); hi2[0] = 180
+            mask = cv2.bitwise_or(
+                cv2.inRange(hsv, self._hsv_lower, hi2),
+                cv2.inRange(hsv, lo2, self._hsv_upper),
+            )
 
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  self._morph_kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._morph_kernel)
@@ -235,29 +264,26 @@ class VisualDetectorNode(Node):
         eu, ev, ea, conf = 0.0, 0.0, 0.0, 0.0
         detected = False
 
-        if contours:
-            best = max(contours, key=cv2.contourArea)
-            area = cv2.contourArea(best)
+        best = self._best_contour(contours)
+        if best is not None:
+            hull = cv2.convexHull(best)
+            # Use hull area for ea — more stable than raw contour area under
+            # partial occlusion or JPEG block artifacts at the blob boundary.
+            hull_area = float(cv2.contourArea(hull))
 
-            if area >= self._min_contour_area:
-                M = cv2.moments(best)
-                if M['m00'] > 0:
-                    cx_det = M['m10'] / M['m00']
-                    cy_det = M['m01'] / M['m00']
-                    eu = cx_det - self._cx
-                    ev = cy_det - self._cy
-                    ea = np.sqrt(area) - self._sqrt_desired_area
-                    conf = 1.0
-                    detected = True
+            M = cv2.moments(hull)
+            if M['m00'] > 0:
+                cx_det = M['m10'] / M['m00']
+                cy_det = M['m01'] / M['m00']
+                eu = cx_det - self._cx
+                ev = cy_det - self._cy
+                ea = np.sqrt(hull_area) - self._sqrt_desired_area
+                conf = 1.0
+                detected = True
 
-                    cv2.drawContours(frame, [best], -1, (0, 255, 0), 2)
-                    cv2.circle(frame, (int(cx_det), int(cy_det)), 6, (0, 255, 0), -1)
-                    cv2.putText(
-                        frame,
-                        f'eu={eu:.0f} ev={ev:.0f} ea={ea:.1f}',
-                        (int(cx_det) + 10, int(cy_det) - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1,
-                    )
+                cv2.drawContours(frame, [hull], -1, (0, 255, 0), 2)
+                cv2.circle(frame, (int(cx_det), int(cy_det)), 6, (0, 255, 0), -1)
+                self._draw_stats(frame, int(cx_det), int(cy_det), eu, ev, ea, conf)
 
         if detected:
             self._consecutive_failures = 0
@@ -271,12 +297,38 @@ class VisualDetectorNode(Node):
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
 
         self._draw_crosshair(frame)
-        return eu, ev, ea, conf, frame
+        return eu, ev, ea, conf, frame, mask
+
+    def _best_contour(self, contours):
+        """Return the largest contour that passes area and solidity filters."""
+        if not contours:
+            return None
+        # Sort by area descending so we short-circuit on the first valid blob
+        for c in sorted(contours, key=cv2.contourArea, reverse=True):
+            area = cv2.contourArea(c)
+            if area < self._min_contour_area:
+                break  # remaining contours are even smaller
+            hull = cv2.convexHull(c)
+            hull_area = cv2.contourArea(hull)
+            if hull_area == 0:
+                continue
+            solidity = area / hull_area
+            if solidity >= self._min_solidity:
+                return c
+        return None
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 
+    def _draw_stats(self, frame, x, y, eu, ev, ea, conf):
+        for line, txt in enumerate([
+            f'eu={eu:.0f}px  ev={ev:.0f}px',
+            f'ea={ea:.1f}',
+            f'conf={conf:.2f}',
+        ]):
+            cv2.putText(frame, txt, (x + 10, y - 10 + line * 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+
     def _draw_crosshair(self, frame):
-        h, w = frame.shape[:2]
         cx, cy = int(self._cx), int(self._cy)
         cv2.line(frame, (cx - 20, cy), (cx + 20, cy), (255, 255, 0), 1)
         cv2.line(frame, (cx, cy - 20), (cx, cy + 20), (255, 255, 0), 1)
@@ -291,6 +343,19 @@ class VisualDetectorNode(Node):
         msg.format = 'jpeg'
         msg.data = buf.tobytes()
         self._dbg_pub.publish(msg)
+
+    def _publish_mask(self, mask, stamp):
+        h, w = mask.shape
+        msg = Image()
+        msg.header.stamp = stamp
+        msg.header.frame_id = 'camera_optical_frame'
+        msg.height = h
+        msg.width = w
+        msg.encoding = 'mono8'
+        msg.is_bigendian = 0
+        msg.step = w
+        msg.data = mask.tobytes()
+        self._mask_pub.publish(msg)
 
 
 def main(args=None):

@@ -14,8 +14,10 @@ Prediction model — augmented state with first-order velocity dynamics:
     B is 5×2: only velocity states are directly driven by commands.
               Image states are driven through the velocity states (captures actuator lag).
 
-Linearisation of L is refreshed each cycle from current (eu, ev) — LTV-MPC.
-The QP is condensed over the horizon N and solved with OSQP.
+Linearisation of L is refreshed each cycle from current (eu, ev) and depth
+estimated from the measured area — LTV-MPC with depth adaptation.
+The QP is condensed over the horizon N and solved with OSQP, which is kept
+alive between cycles so warm-starting actually works.
 
 Subscribes:
   /visual_features  (std_msgs/Float64MultiArray)  [eu, ev, ea, confidence]
@@ -56,13 +58,17 @@ def _clamp(v, lo, hi):
 
 class LinearMPC:
     """
-    Condensed linear MPC.
+    Condensed linear MPC with warm-starting OSQP.
 
     Lifts N steps of the linear model into a single QP:
         min  0.5 * U' H U + f' U
         s.t. lb <= U <= ub          (box constraints on each u_k)
 
     where U = [u_0; u_1; ... u_{N-1}], shape (N*nu,).
+
+    The OSQP instance is created once and updated in-place on each model
+    change, so the previous solution is always available as a warm start.
+    Q_bar and R_bar are computed once at construction (they never change).
     """
 
     def __init__(self, A, B, Q, R, N, u_min, u_max):
@@ -79,57 +85,61 @@ class LinearMPC:
         self._lb = np.tile(u_min, N)
         self._ub = np.tile(u_max, N)
 
+        # Q_bar, R_bar never change — compute once
+        self._Q_bar = np.kron(np.eye(N), Q)
+        self._R_bar = np.kron(np.eye(N), R)
+
         self._solver = None
+        self._osqp_H_upper = None  # stores the sparse upper-tri H used in setup
+        self.last_status = 'init'  # last solve outcome — readable by the node
         self._build_problem()
+
+    # ── Internal builders ────────────────────────────────────────────────────
 
     def _build_problem(self):
-        """Build condensed prediction and QP matrices for current A, B."""
-        A = self._A
-        B = self._B
-        N = self._N
-        nx = self._nx
-        nu = self._nu
+        """Rebuild condensed prediction matrices and refresh the QP Hessian."""
+        A, B, N, nx, nu = self._A, self._B, self._N, self._nx, self._nu
 
-        # Build prediction matrices: S_x (N*nx x nx), S_u (N*nx x N*nu)
-        S_x = np.zeros((N * nx, nx))
+        # Precompute A^0 .. A^N to avoid repeated matrix_power calls
+        A_pows = [np.eye(nx)]
+        for _ in range(N):
+            A_pows.append(A @ A_pows[-1])
+
+        # S_x (N*nx, nx): S_x[k] = A^(k+1)  maps x0 → predicted states
+        S_x = np.vstack([A_pows[k + 1] for k in range(N)])
+
+        # S_u (N*nx, N*nu): S_u[k,j] = A^(k-j) @ B  maps U → predicted states
         S_u = np.zeros((N * nx, N * nu))
-        Ak = np.eye(nx)
         for k in range(N):
-            Ak = A @ Ak
-            S_x[k * nx:(k + 1) * nx, :] = Ak
             for j in range(k + 1):
-                S_u[k * nx:(k + 1) * nx, j * nu:(j + 1) * nu] = (
-                    np.linalg.matrix_power(A, k - j) @ B
-                )
-
-        # Block-diagonal cost matrices over horizon
-        Q_bar = np.kron(np.eye(N), self._Q)
-        R_bar = np.kron(np.eye(N), self._R)
+                S_u[k * nx:(k + 1) * nx, j * nu:(j + 1) * nu] = A_pows[k - j] @ B
 
         # QP Hessian: H = S_u' Q_bar S_u + R_bar
-        self._H = S_u.T @ Q_bar @ S_u + R_bar
-        self._H = (self._H + self._H.T) / 2  # ensure symmetry
+        H = S_u.T @ self._Q_bar @ S_u + self._R_bar
+        self._H = (H + H.T) / 2  # guarantee numerical symmetry
         self._S_u = S_u
         self._S_x = S_x
-        self._Q_bar = Q_bar
 
         if _OSQP_AVAILABLE:
-            self._setup_osqp()
+            self._update_or_setup_osqp()
 
-    def update_model(self, A, B):
-        """Update model matrices and rebuild the condensed QP data."""
-        self._A = A
-        self._B = B
-        self._build_problem()
+    def _update_or_setup_osqp(self):
+        """Create the OSQP solver on first call; update H in-place on subsequent calls."""
+        if self._solver is None:
+            self._setup_osqp()
+        else:
+            self._refresh_osqp_h()
 
     def _setup_osqp(self):
+        """Create a fresh OSQP instance (called once at startup)."""
         N_u = self._N * self._nu
-        H_sp = sp.csc_matrix(self._H)
-        # Identity constraint matrix for box bounds
+        # OSQP only needs the upper triangle of the symmetric H
+        H_upper = sp.triu(sp.csc_matrix(self._H), format='csc')
         I_sp = sp.eye(N_u, format='csc')
+        self._osqp_H_upper = H_upper
         self._solver = osqp.OSQP()
         self._solver.setup(
-            H_sp, np.zeros(N_u),
+            H_upper, np.zeros(N_u),
             I_sp, self._lb, self._ub,
             warm_starting=True,
             verbose=False,
@@ -139,6 +149,37 @@ class LinearMPC:
             polish=False,
         )
 
+    def _refresh_osqp_h(self):
+        """
+        Update the Hessian inside the existing OSQP instance without recreating it.
+
+        OSQP's update(Px=...) requires the same sparsity structure (same indices)
+        as the original setup call.  If the structure has changed (rare, but
+        possible when interaction-matrix entries are exactly zero at equilibrium),
+        we fall back to a full solver rebuild.
+        """
+        H_upper_new = sp.triu(sp.csc_matrix(self._H), format='csc')
+        old = self._osqp_H_upper
+        structure_changed = (
+            H_upper_new.nnz != old.nnz
+            or not np.array_equal(H_upper_new.indices, old.indices)
+            or not np.array_equal(H_upper_new.indptr, old.indptr)
+        )
+        if structure_changed:
+            # Sparsity pattern changed — rebuild solver (keeps warm-start on next step)
+            self._setup_osqp()
+            return
+        self._solver.update(Px=H_upper_new.data)
+        self._osqp_H_upper = H_upper_new
+
+    # ── Public interface ──────────────────────────────────────────────────────
+
+    def update_model(self, A, B):
+        """Update A, B and refresh all QP data.  OSQP warm-start is preserved."""
+        self._A = A
+        self._B = B
+        self._build_problem()
+
     def solve(self, x0):
         """Return optimal u_0* given initial state x0 (shape (nx,))."""
         f = self._S_u.T @ self._Q_bar @ (self._S_x @ x0)
@@ -147,11 +188,13 @@ class LinearMPC:
             self._solver.update(q=f)
             result = self._solver.solve()
             if result.info.status in ('solved', 'solved_inaccurate'):
+                self.last_status = result.info.status
                 return result.x[:self._nu]
-            # Fall through to numpy fallback on solver failure
+            self.last_status = 'osqp_failed'
+        else:
+            self.last_status = 'numpy_fallback'
 
-        # Unconstrained fallback: U* = -H^{-1} f, clipped to bounds.
-        # Use least squares if H is singular/ill-conditioned.
+        # Unconstrained fallback: U* = -H^{-1} f, then clip to box bounds.
         try:
             U = np.linalg.solve(self._H, -f)
         except np.linalg.LinAlgError:
@@ -160,46 +203,40 @@ class LinearMPC:
         return U[:self._nu]
 
 
-def _build_interaction_matrix(fx, fy, Z_star, desired_area, eu=0.0, ev=0.0):
+# ── Interaction matrix and augmented model ───────────────────────────────────
+
+def _build_interaction_matrix(fx, fy, Z, desired_area, eu=0.0, ev=0.0):
     """
-    Build a local 3x2 interaction matrix L evaluated at current feature error
-    (eu, ev) and depth Z_star.
+    Build the 3×2 interaction matrix L at the current operating point.
 
-    Camera frame convention: z_cam = forward, x_cam = right, y_cam = down.
-    Robot control inputs: [v (forward), omega (yaw, CCW positive)].
+    Camera frame: z_cam = forward, x_cam = right, y_cam = down.
+    Robot inputs:  v (forward m/s), omega (yaw rad/s, CCW positive).
 
-    Camera velocity induced by robot:
-        v_cam  = [0, 0, v]     (forward translation)
-        omega_cam = [0, -omega, 0]  (yaw: robot CCW -> camera rotates CW about y_cam)
+    Camera velocity from robot motion:
+        vz_cam = v,   wy_cam = -omega   (CCW yaw → CW rotation about y_cam_down)
 
-    Standard interaction matrix for a point at normalised coords (xn, yn), depth Z:
-        d/dt [xn] = [xn*vz/Z - (1+xn^2)*wy + yn*wz - vx/Z]
-        d/dt [yn] = [yn*vz/Z - xn*yn*wy - xn*wz - vy/Z]
+    Standard IBVS point interaction (Chaumette 2006), mapped to pixel errors
+    eu = fx*xn, ev = fy*yn:
 
-        With pixel errors eu = fx*xn, ev = fy*yn, and wy = -omega:
-            d_eu/dt = (eu/Z)*v + fx*(1 + xn^2)*omega
-            d_ev/dt = (ev/Z)*v + fy*(xn*yn)*omega
+        d_eu/dt = (eu/Z)*v + fx*(1 + xn^2)*omega
+        d_ev/dt = (ev/Z)*v + fy*(xn*yn)*omega
 
-        At s* = 0 this simplifies to:
-            d_eu/dt = fx*omega, d_ev/dt = 0.
-    Area of a projected circle: A = pi*(fx*r/Z)^2, so sqrt(A) = sqrt(pi)*fx*r/Z.
-    Moving forward (v > 0) decreases Z, so:
-        d(sqrt(A))/dt = sqrt(pi)*fx*r * d(1/Z)/dt = sqrt(pi)*fx*r * v/Z^2
-                      = sqrt(A_des)/Z_star * v  (positive — forward motion grows area)
+    For the area feature ea = sqrt(area) - sqrt(desired_area):
+        sqrt(area) = sqrt(pi)*fx*r / Z,  so d(sqrt(A))/dt = sqrt(A)/Z * vz.
+        dZ/dt = -vz  (depth decreases as camera approaches), therefore:
+        d(1/Z)/dt = +vz/Z^2  →  d_ea/dt = +sqrt(A_des)/Z * v   (POSITIVE)
+        Forward motion increases projected area — this is the correct sign.
 
-    Returns L (3x2) mapping [v, omega] to [d_eu/dt, d_ev/dt, d_ea/dt].
+    Returns L (3×2) mapping [v, omega] → [d_eu/dt, d_ev/dt, d_ea/dt].
     """
     sqrt_A_des = np.sqrt(desired_area)
     xn = eu / fx if fx != 0.0 else 0.0
     yn = ev / fy if fy != 0.0 else 0.0
 
-    # Positive omega (robot CCW) pushes the target right in the image.
-    # The optimizer applies opposite-signed omega to reduce eu.
-
     L = np.array([
-        [-eu / Z_star,          -fx * (1.0 + xn * xn)],
-        [-ev / Z_star,          -fy * (xn * yn)       ],
-        [-sqrt_A_des / Z_star,   0.0                  ],  # d_ea/dt = -sqrt_A_des/Z * v (physical sign)
+        [eu / Z,              fx * (1.0 + xn * xn)],
+        [ev / Z,              fy * (xn * yn)       ],
+        [sqrt_A_des / Z,      0.0                  ],
     ])
     return L
 
@@ -207,24 +244,17 @@ def _build_interaction_matrix(fx, fy, Z_star, desired_area, eu=0.0, ev=0.0):
 def _build_augmented_model(L: np.ndarray, Ts: float,
                            tau_v: float, tau_o: float):
     """
-    Build 5×5 augmented state-space model with first-order velocity dynamics.
+    Build the 5×5 discrete-time augmented model x_{k+1} = A*x_k + B*u_k.
 
-    State:   x = [eu, ev, ea, v, omega]  (5,)
-    Control: u = [v_cmd, omega_cmd]      (2,)
+    State:   x = [eu, ev, ea, v, omega]
+    Control: u = [v_cmd, omega_cmd]
 
-    Image dynamics (driven by actual velocity states, not commands directly):
-        eu_{k+1}    = eu_k + Ts*(L[0,0]*v_k + L[0,1]*omega_k)
-        ev_{k+1}    = ev_k + Ts*(L[1,0]*v_k + L[1,1]*omega_k)
-        ea_{k+1}    = ea_k + Ts*(L[2,0]*v_k)
+    Image states are driven by *actual* velocities (not commands) — this
+    separates the actuation lag from the visual dynamics.
 
-    Closed-loop velocity dynamics (first-order ZOH, captures actuator lag):
+    Velocity dynamics are first-order ZOH (identified from step-response):
         v_{k+1}     = (1 - Ts/tau_v)*v_k     + (Ts/tau_v)*v_cmd_k
         omega_{k+1} = (1 - Ts/tau_o)*omega_k + (Ts/tau_o)*omega_cmd_k
-
-    tau_v and tau_o are the closed-loop step-response time constants of the
-    full velocity cascade (Jetson PI + MCU PID). Identify via step response test.
-
-    Returns A (5x5), B (5x2).
     """
     alpha_v = Ts / tau_v
     alpha_o = Ts / tau_o
@@ -245,6 +275,29 @@ def _build_augmented_model(L: np.ndarray, Ts: float,
     ])
     return A, B
 
+
+def _estimate_depth(ea, desired_area, Z_star,
+                    z_min: float = 0.10, z_max: float = 3.0) -> float:
+    """
+    Recover current depth from the measured area error.
+
+    From the feature definition:  ea = sqrt(area) - sqrt(desired_area)
+    => sqrt(area) = ea + sqrt(desired_area)
+    => area = (ea + sqrt(desired_area))^2
+
+    From the projection model:  sqrt(area) = C / Z  (C = sqrt(pi)*fx*r)
+    => Z = Z_star * sqrt(desired_area) / sqrt(area)  = Z_star * sqrt(desired_area / area)
+
+    Clamped to [z_min, z_max] to guard against degenerate detections.
+    """
+    sqrt_area = ea + np.sqrt(desired_area)
+    if sqrt_area <= 0.0:
+        return Z_star
+    area = sqrt_area ** 2
+    return float(np.clip(Z_star * np.sqrt(desired_area / area), z_min, z_max))
+
+
+# ── ROS 2 node ────────────────────────────────────────────────────────────────
 
 class MPCIBVSNode(Node):
 
@@ -284,21 +337,20 @@ class MPCIBVSNode(Node):
         self.declare_parameter('feat_norm_uv', 600.0)   # ≈ half-width of the image, px
         self.declare_parameter('feat_norm_a',   50.0)   # ≈ sqrt(area) dynamic range, px
 
-        Ts = self.get_parameter('Ts').value
-        N = self.get_parameter('N').value
-        Q_diag = self.get_parameter('Q_diag').value
-        R_diag = self.get_parameter('R_diag').value
-        v_max = self.get_parameter('v_max').value
-        v_min = self.get_parameter('v_min').value
-        omega_max = self.get_parameter('omega_max').value
-
-        fx = self.get_parameter('fx').value
-        fy = self.get_parameter('fy').value
-        Z_star = self.get_parameter('nominal_depth_Z').value
+        Ts          = self.get_parameter('Ts').value
+        N           = self.get_parameter('N').value
+        Q_diag      = self.get_parameter('Q_diag').value
+        R_diag      = self.get_parameter('R_diag').value
+        v_max       = self.get_parameter('v_max').value
+        v_min       = self.get_parameter('v_min').value
+        omega_max   = self.get_parameter('omega_max').value
+        fx          = self.get_parameter('fx').value
+        fy          = self.get_parameter('fy').value
+        Z_star      = self.get_parameter('nominal_depth_Z').value
         desired_area = float(self.get_parameter('desired_area').value)
+
         self._online_linearization = bool(self.get_parameter('online_linearization').value)
         self._conf_threshold = float(self.get_parameter('confidence_threshold').value)
-
         self._lost_timeout = self.get_parameter('lost_timeout_s').value
         self._v_max = v_max
         self._v_min = v_min
@@ -320,6 +372,7 @@ class MPCIBVSNode(Node):
         feat_norm_uv = float(self.get_parameter('feat_norm_uv').value)
         feat_norm_a  = float(self.get_parameter('feat_norm_a').value)
 
+        # Initial model at equilibrium (eu=0, ev=0, Z=Z_star)
         L_star = _build_interaction_matrix(fx, fy, Z_star, desired_area)
         A, B = _build_augmented_model(L_star, Ts, self._tau_v, self._tau_omega)
 
@@ -331,7 +384,7 @@ class MPCIBVSNode(Node):
         Q = np.diag(Q_diag_full)
         R = np.diag(R_diag)
         u_min = np.array([v_min, -omega_max])
-        u_max = np.array([v_max, omega_max])
+        u_max = np.array([v_max,  omega_max])
 
         self._mpc = LinearMPC(A, B, Q, R, N, u_min, u_max)
 
@@ -341,7 +394,7 @@ class MPCIBVSNode(Node):
                 'Install with: pip install osqp'
             )
 
-        self._feat = None          # latest [eu, ev, ea, conf]
+        self._feat           = None   # latest [eu, ev, ea, conf]
         self._last_feat_time = None
         self._v_meas = 0.0         # actual linear velocity from /robot_vel [m/s]
         self._omega_meas = 0.0     # actual angular velocity from /robot_vel [rad/s]
@@ -349,16 +402,11 @@ class MPCIBVSNode(Node):
         self._dz_entry_count = 0   # consecutive frames inside entry threshold
         self._dz_exit_count  = 0   # consecutive frames outside exit threshold
 
-        # Soft-stop state: remember the last commanded velocity so we can ramp
-        # toward zero over `lost_decel_s` instead of stepping when features go
-        # stale or the conf gate fails. Removes the falling edge that the MCU
-        # currently reads as a current spike.
+        # Soft-stop state: ramp toward zero over `lost_decel_s` instead of stepping
         self._last_cmd_v = 0.0
         self._last_cmd_omega = 0.0
 
-        # Per-branch counters for the 1 Hz diag log. n_servo means a real MPC
-        # solve ran; the other three count cycles that published zero (or a
-        # decaying ramp toward zero) and tell us *why*.
+        # Per-branch counters for the 1 Hz diag log
         self._n_servo = 0
         self._n_zero_lost = 0
         self._n_zero_low_conf = 0
@@ -367,19 +415,27 @@ class MPCIBVSNode(Node):
         self._diag_age_samples = []
 
         self.create_subscription(
-            Float64MultiArray,
-            '/visual_features',
-            self._feat_callback,
-            10,
-        )
+            Float64MultiArray, '/visual_features', self._feat_callback, 10)
         self.create_subscription(
-            TwistStamped,
-            '/robot_vel',
-            self._robot_vel_callback,
-            _MCU_QOS,
-        )
+            TwistStamped, '/robot_vel', self._robot_vel_callback, _MCU_QOS)
 
         self._cmd_pub = self.create_publisher(Twist, '/cmd_vel_desired', 10)
+
+        # Debug topic — published every cycle when at least one subscriber exists.
+        # Float64MultiArray indices:
+        #   [0]  eu           pixel error horizontal    [px]
+        #   [1]  ev           pixel error vertical      [px]
+        #   [2]  ea           scale/depth error         [sqrt(px²)]
+        #   [3]  v_meas       measured linear velocity  [m/s]
+        #   [4]  omega_meas   measured angular velocity [rad/s]
+        #   [5]  v_cmd        commanded linear velocity [m/s]
+        #   [6]  omega_cmd    commanded angular velocity[rad/s]
+        #   [7]  Z_est        estimated depth           [m]
+        #   [8]  solve_ms     QP solve time             [ms]
+        #   [9]  feat_age_ms  age of last feature msg   [ms]
+        #   [10] status       2=solved 1=inaccurate 0=numpy_fallback
+        #                     -1=osqp_failed -2=safety_stop
+        self._dbg_pub = self.create_publisher(Float64MultiArray, '/mpc_ibvs/debug', 1)
 
         self.create_timer(Ts, self._control_loop)
         self.create_timer(self._diag_period_s, self._publish_diag_summary)
@@ -390,18 +446,24 @@ class MPCIBVSNode(Node):
             f'tau_v={self._tau_v:.3f}s, tau_omega={self._tau_omega:.3f}s, '
             f'OSQP={_OSQP_AVAILABLE}'
         )
-        self.get_logger().info(f'Interaction matrix L_s*:\n{np.array2string(L_star, precision=4)}')
+        self.get_logger().info(
+            f'Interaction matrix at equilibrium L*:\n{np.array2string(L_star, precision=4)}'
+        )
+
+    # ── Callbacks ─────────────────────────────────────────────────────────────
 
     def _feat_callback(self, msg: Float64MultiArray):
         if len(msg.data) < 4:
-            self.get_logger().warn('Received malformed /visual_features (expected 4 values).')
+            self.get_logger().warn('Malformed /visual_features — expected 4 values.')
             return
         self._feat = msg.data
         self._last_feat_time = self.get_clock().now()
 
     def _robot_vel_callback(self, msg: TwistStamped):
-        self._v_meas = msg.twist.linear.x
+        self._v_meas     = msg.twist.linear.x
         self._omega_meas = msg.twist.angular.z
+
+    # ── Control loop ──────────────────────────────────────────────────────────
 
     def _control_loop(self):
         now = self.get_clock().now()
@@ -468,20 +530,23 @@ class MPCIBVSNode(Node):
             self._diag_age_samples.append(feat_age)
 
         # MPC solve (only when actively servoing)
+        Z_est = self._Z_star
+        dt_solve = 0.0
+        feat_age_ms = 0.0
+        eu = ev = ea = 0.0
+
         if servo:
             self._n_servo += 1
             eu, ev, ea, conf = self._feat
+            feat_age_ms = feat_age * 1e3 if feat_age is not None else 0.0
+            Z_est = _estimate_depth(ea, self._desired_area, self._Z_star)
             if self._online_linearization:
-                L_star = _build_interaction_matrix(
-                    self._fx,
-                    self._fy,
-                    self._Z_star,
-                    self._desired_area,
-                    eu=float(eu),
-                    ev=float(ev),
+                L_cur = _build_interaction_matrix(
+                    self._fx, self._fy, Z_est, self._desired_area,
+                    eu=float(eu), ev=float(ev),
                 )
                 A_aug, B_aug = _build_augmented_model(
-                    L_star, self._Ts, self._tau_v, self._tau_omega
+                    L_cur, self._Ts, self._tau_v, self._tau_omega
                 )
                 self._mpc.update_model(A_aug, B_aug)
 
@@ -496,12 +561,6 @@ class MPCIBVSNode(Node):
             if dt_solve > 10.0:
                 self.get_logger().warn(f'MPC solve took {dt_solve:.1f} ms')
         else:
-            # Falling edge: ramp the previous command toward zero instead of
-            # stepping. Step size per cycle = (|last_cmd| * Ts / lost_decel_s).
-            # This mirrors the rising-edge slew-limiter behavior and prevents
-            # the MCU from seeing a sudden non-zero → 0 transition that the
-            # downstream PI feedforward could turn into a current spike on the
-            # next re-acquisition.
             if no_servo_reason == 'lost':
                 self._n_zero_lost += 1
             elif no_servo_reason == 'low_conf':
@@ -513,7 +572,6 @@ class MPCIBVSNode(Node):
                 decay = self._Ts / self._lost_decel_s
                 target_v     = self._last_cmd_v     * max(0.0, 1.0 - decay)
                 target_omega = self._last_cmd_omega * max(0.0, 1.0 - decay)
-                # Snap small residuals to zero so the publisher reaches an exact 0.
                 if abs(target_v) < 1e-3:
                     target_v = 0.0
                 if abs(target_omega) < 1e-3:
@@ -526,6 +584,12 @@ class MPCIBVSNode(Node):
         msg.linear.x = target_v
         msg.angular.z = target_omega
         self._cmd_pub.publish(msg)
+
+        _STATUS = {'solved': 2.0, 'solved_inaccurate': 1.0,
+                   'numpy_fallback': 0.0, 'osqp_failed': -1.0}
+        self._publish_debug(eu, ev, ea, target_v, target_omega,
+                            Z_est, dt_solve, feat_age_ms,
+                            _STATUS.get(self._mpc.last_status, -2.0))
 
     def _publish_diag_summary(self):
         # Per-second snapshot of which branch dominated. If `lost` dominates the
@@ -555,9 +619,33 @@ class MPCIBVSNode(Node):
         self._diag_conf_samples.clear()
         self._diag_age_samples.clear()
 
+    def _publish_debug(self, eu, ev, ea, v_cmd, omega_cmd,
+                        Z_est, solve_ms, feat_age_ms, status_code):
+        if self._dbg_pub.get_subscription_count() == 0:
+            return
+        msg = Float64MultiArray()
+        msg.data = [
+            float(eu), float(ev), float(ea),
+            self._v_meas, self._omega_meas,
+            float(v_cmd), float(omega_cmd),
+            float(Z_est),
+            float(solve_ms),
+            float(feat_age_ms),
+            float(status_code),
+        ]
+        self._dbg_pub.publish(msg)
+
     def _publish_stop(self):
         self._cmd_pub.publish(Twist())
+        # Publish debug so you can see what triggered the stop even when stopped
+        age_ms = 0.0
+        if self._feat is not None and self._last_feat_time is not None:
+            age_ms = (self.get_clock().now() - self._last_feat_time).nanoseconds * 1e-6
+        eu, ev, ea = (self._feat[0], self._feat[1], self._feat[2]) if self._feat else (0., 0., 0.)
+        self._publish_debug(eu, ev, ea, 0.0, 0.0, self._Z_star, 0.0, age_ms, -2.0)
 
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 def main(args=None):
     rclpy.init(args=args)
