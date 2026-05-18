@@ -1,48 +1,94 @@
 # TE3002B Intelligent Robotics Challenge
 
-Repository for coursework and practical challenges in TE3002B Intelligent Robotics.
+Repository for coursework and mini-challenge deliverables in TE3002B — Optimal Control for Visual Servoing in Robotics.
 
 ## Course Information
 
-- Course: TE3002B - Intelligent Robotics - Optimal Control for Visual Servoing in Robotics
-- Professor: Nezih Nieto Gutiérrez 
+- **Course:** TE3002B — Intelligent Robotics
+- **Professor:** Nezih Nieto Gutiérrez
 
-### Students
+## Team
 
-| Name | Student ID |
-|---|---|
-| David Alejandro Soni Cuevas | A01571777 |
-| David Gilberto Lomelí Leal | A01571193 |
-| Irving David Ornelas García | A00839065 |
-| Abraham de Jesús Maldonado Mata | A00838581 |
-| Carla Elizabeth Regalado Luna | A00837070 |
+| Name | Student ID | Role |
+|---|---|---|
+| David Alejandro Soni Cuevas | A01571777 | Optimal Control & MPC |
+| David Gilberto Lomelí Leal | A01571193 | Hardware Integration & Actuation |
+| Abraham de Jesús Maldonado Mata | A00838581 | Computer Vision & Perception |
 
-## Featured Project: Week 2 Challenge
+## Repository Layout
 
-### Puzzlebot Open-Loop Path Execution
+```
+pzb_ros/src/
+├── pzb_camera/     Camera drivers (USB cam, CSI cam, image decompressor)
+├── pzb_control/    Open-loop and PID waypoint controller (Mini Challenge 2)
+├── pzb_ibvs/       MPC-based Image-Based Visual Servoing (Mini Challenge 5)
+├── pzb_traffic/    Traffic light detection and FSM (Mini Challenge 4)
+├── pzb_utils/      Shared utilities (emergency stop, micro-ROS agent, teleop)
+└── deps/           Third-party dependencies
+cam_calibration/    USB camera calibration scripts and YAML outputs
+```
 
-Goal: execute user-defined trajectories on Puzzlebot using open-loop control with robust safety behavior.
+## Packages
 
-Core approach:
+### `pzb_control` — Motion Controllers
 
-- YAML-defined action sequence (`move` and `turn` segments)
-- Open-loop timing model using commanded velocities
-- Reachability checks against dynamic limits
-- State-machine segment execution
-- Emergency stop utility node for hard stop bursts
+Velocity and trajectory controllers for the Puzzlebot.
 
-Detailed package documentation is available in:
+- **Open-loop controller** (`open_loop_controller.py`): executes YAML-defined action sequences (`move` / `turn` segments) using timed open-loop commands with reachability checks
+- **Velocity controller** (`velocity_controller.py`): PID inner-loop for linear and angular velocity tracking
+- **Waypoint follower** (`waypoint_follower.py`): drives the robot through a sequence of 2D waypoints using the velocity controller
+- **Odometry node** (`odometry_node.py`): integrates wheel encoder data to estimate pose
 
-- [pzb_ros/src/pzb_control/README.md](pzb_ros/src/pzb_control/README.md)
+```bash
+# Open-loop path execution
+ros2 launch pzb_control open_loop_controller.launch.py
 
-## Workspace Quick Start
+# PID waypoint mission
+ros2 launch pzb_control pid_waypoint_mission.launch.py
+```
 
-### Repository Layout
+### `pzb_traffic` — Traffic Light Detection
 
-- `pzb_ros/src/pzb_control`: challenge controller package
-- `pzb_ros/src/pzb_utils`: utility package (emergency stop)
+Detects traffic light color from the camera and controls the robot with a finite-state machine.
 
-### Build
+- **Color detector** (`color_detector_node.py`): HSV-based detection of red / green / yellow
+- **Traffic FSM** (`traffic_light_fsm_node.py`): stops on red, proceeds on green
+
+```bash
+# On the robot
+ros2 launch pzb_traffic traffic_challenge_robot.launch.py
+
+# PC side (visualization)
+ros2 launch pzb_traffic traffic_challenge_pc.launch.py
+```
+
+### `pzb_ibvs` — MPC Image-Based Visual Servoing
+
+Servos the Puzzlebot toward a colored target using a Model Predictive Controller driven by image features.
+
+- **Visual detector** (`visual_detector_node.py`): color blob or ArUco marker detection
+  - CLAHE normalisation, solidity filter, Gaussian pre-blur
+  - Temporal holdoff to suppress single-frame dropouts
+- **MPC controller** (`mpc_ibvs_node.py`):
+  - 5-state augmented model: `[eu, ev, ea, v, ω]`
+  - Calibrated interaction matrix with dynamic depth estimation
+  - Dead zone with persistence hysteresis to prevent stutter at convergence
+  - Soft-stop ramp on feature loss
+  - OSQP solver with numpy fallback
+- Camera: USB cam at 640×480, calibrated at RMS < 0.7 px
+
+```bash
+# Detection only (debug / tuning)
+ros2 launch pzb_ibvs detect_only.launch.py
+
+# Full MPC loop on the robot
+ros2 launch pzb_ibvs mpc_ibvs_robot.launch.py
+
+# PC side (visualization)
+ros2 launch pzb_ibvs mpc_ibvs_pc.launch.py
+```
+
+## Workspace Build
 
 ```bash
 cd pzb_ros
@@ -50,21 +96,15 @@ colcon build --symlink-install
 source install/setup.bash
 ```
 
-### Run Challenge Controller
+## Utilities
 
 ```bash
-ros2 launch pzb_control mini_challenge.launch.py use_sim_time:=false
+# Emergency stop (hard-stop burst)
+ros2 launch pzb_utils emergency_stop.launch.py
+
+# Start micro-ROS agent (required for MCU communication)
+ros2 launch pzb_utils micro_ros_agent.launch.py
+
+# Teleoperation with PID velocity control
+ros2 launch pzb_utils teleop_pid.launch.py
 ```
-
-### Emergency Stop
-
-```bash
-ros2 run pzb_utils emergency_stop
-```
-
-Aportaciones:
-- Abraham Maldonado: Ingeniero de Percepción y Visión Computacional Clásica
-- Irvin Ornelas: Ingeniero de Modelado Cinemático y Espacio de Estados
-- David Soni: Ingeniero de Control Óptimo Predictivo y Optimización Numérica
-- David Lomelí: Ingeniero de Integración de Hardware, Actuación y Filtros No Lineales
-- Carla Regalado: DevOps, QA Engineer y Analista de Datos Experimentales
