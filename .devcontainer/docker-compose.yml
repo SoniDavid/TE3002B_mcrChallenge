@@ -1,0 +1,24 @@
+services:
+  ros-dev:
+    container_name: ros2humble_pzb
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ..:/home/dev/ws:cached
+      - /tmp/.X11-unix:/tmp/.X11-unix # X11 Socket
+    environment:
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+    network_mode: host
+      # devices:
+      # - "/dev/video2:/dev/video2"
+    command: sleep infinity
+    # NVIDIA GPU support
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

@@ -1,0 +1,17 @@
+{
+  "name": "ROS 1 Humble Dev Container",
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "ros-dev",
+  "workspaceFolder": "/home/dev/ws",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cpptools",
+        "ms-python.python",
+        "ms-iot.vscode-ros",
+        "redhat.vscode-yaml"
+      ]
+    }
+  },
+  "remoteUser": "dev"
+}

@@ -121,6 +121,43 @@ ros2 topic bw /camera/image_compressed
 ros2 topic echo --once /camera/image_compressed
 ```
 
+## Offline Intrinsics Calibration (From ROS2 Bag)
+
+If you cannot calibrate during flight, record a rosbag with a visible chessboard and calibrate offline.
+
+### 1. Record a bag (example)
+
+```bash
+ros2 bag record /camera/image_compressed
+```
+
+You can also use `/camera/image_raw` if available.
+
+### 2. Run offline calibration
+
+From workspace root `pzb_ros`:
+
+```bash
+source install/setup.bash
+ros2 run pzb_camera calibrate_from_rosbag \
+	--bag /absolute/path/to/your_bag \
+	--topic /camera/image_compressed \
+	--chessboard-size 9 6 \
+	--square-size 0.024 \
+	--min-detections 20 \
+	--skip 3 \
+	--output /absolute/path/to/camera_info.yaml
+```
+
+Parameters:
+
+- `--chessboard-size COLUMNS ROWS`: number of inner corners (not squares). If your board is `A x B` squares, pass `(A-1) x (B-1)`.
+- `--square-size`: square edge length in meters.
+- `--skip`: process every N-th frame (useful for large bags).
+- `--show`: optional live preview of detections.
+
+The script saves a ROS-compatible `camera_info` YAML and reports RMS reprojection error.
+
 ## View the Stream
 
 ### rqt_image_view (remote machine)
