@@ -9,11 +9,13 @@ Repository for coursework and mini-challenge deliverables in TE3002B — Optimal
 
 ## Team
 
+
 | Name | Student ID | Role |
 |---|---|---|
 | David Alejandro Soni Cuevas | A01571777 | Optimal Control & MPC |
 | David Gilberto Lomelí Leal | A01571193 | Hardware Integration & Actuation |
 | Abraham de Jesús Maldonado Mata | A00838581 | Computer Vision & Perception |
+
 
 ## Repository Layout
 
