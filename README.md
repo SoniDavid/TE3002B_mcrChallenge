@@ -4,8 +4,8 @@ Repository for coursework and practical challenges in TE3002B Intelligent Roboti
 
 ## Course Information
 
-- Course: TE3002B - Intelligent Robotics - Manchester Robotics Puzzlebot Module
-- Professor: Dr. Mario Martinez (Or I don't actually know who checks this in Campus MTY lol)
+- Course: TE3002B - Intelligent Robotics - Optimal Control for Visual Servoing in Robotics
+- Professor: Nezih Nieto Gutiérrez 
 
 ### Students
 
