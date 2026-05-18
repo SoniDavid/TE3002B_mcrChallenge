@@ -11,7 +11,7 @@ Repository for coursework and practical challenges in TE3002B Intelligent Roboti
 
 | Name | Student ID |
 |---|---|
-| David Soni | A01571777 |
+| David Alejandro Soni Cuevas | A01571777 |
 | David Gilberto Lomelí Leal | A01571193 |
 | Irving David Ornelas García | A00839065 |
 | Abraham de Jesús Maldonado Mata | A00838581 |
