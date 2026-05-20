@@ -1,0 +1,28 @@
+line_follower_node:
+  ros__parameters:
+    # Input image size (detector expects 320x240)
+    image_width:  320
+    image_height: 240
+
+    # Proportional steering gain (rad/s per pixel of error)
+    # Increase to react more aggressively to line offset
+    Kp_angular: 0.003
+
+    # Pixel dead band around image center — no steering correction within this range
+    dead_band_px: 8
+
+    # Forward speed in m/s
+    linear_speed: 0.10
+
+    # Maximum angular velocity output (rad/s)
+    max_angular: 0.8
+
+    # If true, sets linear_speed=0 when a dashed line (intersection) is detected
+    stop_on_dashed: false
+
+    # Publish pipeline debug visualization on /line_follower/debug_image
+    publish_debug: true
+
+    # Input and output topic names
+    topic_image_in: /camera/image_compressed
+    topic_cmd_vel:  /cmd_vel_desired

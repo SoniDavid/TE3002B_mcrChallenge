@@ -33,3 +33,17 @@ camera_publisher:
 
     # Camera frame id for the header
     frame_id: camera_optical_frame
+
+    # Color calibration: path to .npz with per-pixel gain array 'arr_0'.
+    # Leave empty ('') to disable color correction.
+    color_cal_file: '/home/puzzlebot/color_cal/colorCalibration.npz'
+
+    # Publish /camera/camera_info from the calibration YAML below.
+    publish_camera_info: true
+
+    # Path to the camera intrinsics YAML (ROS camera_info format).
+    # Leave empty to disable; the launch file sets this to the installed share path.
+    camera_info_file: ''
+
+    # Topic name for CameraInfo
+    topic_camera_info: /camera/camera_info

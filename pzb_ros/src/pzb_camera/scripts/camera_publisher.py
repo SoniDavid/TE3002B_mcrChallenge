@@ -16,6 +16,7 @@ This path is fully hardware-accelerated on the Jetson Nano.
 
 import threading
 import time
+import yaml
 
 import cv2
 import numpy as np
@@ -30,7 +31,7 @@ from rclpy.qos import (
 )
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 
-from sensor_msgs.msg import Image, CompressedImage
+from sensor_msgs.msg import Image, CompressedImage, CameraInfo
 from std_msgs.msg import Header
 
 
@@ -63,7 +64,7 @@ class CameraPublisher(Node):
         )
 
         # RViz Image display defaults to RELIABLE; keep raw compatible.
-        raw_qos = QoSProfile(
+        reliable_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.VOLATILE,
             history=HistoryPolicy.KEEP_LAST,
@@ -73,7 +74,39 @@ class CameraPublisher(Node):
         self._pub_compressed = self.create_publisher(
             CompressedImage, topic_compressed, compressed_qos)
         self._pub_raw = self.create_publisher(
-            Image, topic_raw, raw_qos)
+            Image, topic_raw, reliable_qos)
+
+        # ── Color calibration ─────────────────────────────────────────────────
+        self._color_gains = None
+        cal_file = self.get_parameter('color_cal_file').value
+        if cal_file:
+            try:
+                cal = np.load(cal_file)
+                self._color_gains = cal['arr_0'].astype(np.float32)
+                self.get_logger().info(f'Color calibration loaded: {cal_file}')
+            except Exception as e:
+                self.get_logger().warning(f'Could not load color_cal_file "{cal_file}": {e}')
+
+        # ── CameraInfo publisher ──────────────────────────────────────────────
+        self._pub_camera_info = None
+        self._camera_info_msg = None
+        if self.get_parameter('publish_camera_info').value:
+            info_file = self.get_parameter('camera_info_file').value
+            if info_file:
+                try:
+                    self._camera_info_msg = self._load_camera_info(info_file)
+                    self._pub_camera_info = self.create_publisher(
+                        CameraInfo,
+                        self.get_parameter('topic_camera_info').value,
+                        reliable_qos,
+                    )
+                    self.get_logger().info(f'CameraInfo loaded: {info_file}')
+                except Exception as e:
+                    self.get_logger().warning(f'Could not load camera_info_file "{info_file}": {e}')
+            else:
+                self.get_logger().warning(
+                    'publish_camera_info=true but camera_info_file is empty — skipping'
+                )
 
         # ── GStreamer pipeline ────────────────────────────────────────────────
         pipeline = self._gstreamer_pipeline(sensor_id)
@@ -135,6 +168,26 @@ class CameraPublisher(Node):
         self.declare_parameter('topic_raw',        '/camera/image_raw')
         self.declare_parameter('publish_compressed', True)
         self.declare_parameter('publish_raw',      False)
+        self.declare_parameter('color_cal_file',   '')
+        self.declare_parameter('publish_camera_info', False)
+        self.declare_parameter('camera_info_file', '')
+        self.declare_parameter('topic_camera_info', '/camera/camera_info')
+
+    # ── Camera info loader ────────────────────────────────────────────────────
+
+    def _load_camera_info(self, path: str) -> CameraInfo:
+        with open(path) as f:
+            d = yaml.safe_load(f)
+        msg = CameraInfo()
+        msg.header.frame_id = self._frame_id
+        msg.width  = d['image_width']
+        msg.height = d['image_height']
+        msg.distortion_model = d['distortion_model']
+        msg.d = d['distortion_coefficients']['data']
+        msg.k = d['camera_matrix']['data']
+        msg.r = d['rectification_matrix']['data']
+        msg.p = d['projection_matrix']['data']
+        return msg
 
     # ── GStreamer pipeline builder ────────────────────────────────────────────
 
@@ -170,6 +223,8 @@ class CameraPublisher(Node):
             ret, frame = self._cap.read()
             if ret:
                 self._consecutive_failures = 0
+                if self._color_gains is not None:
+                    frame = (frame.astype(np.float32) * self._color_gains).clip(0, 255).astype(np.uint8)
                 stamp = self.get_clock().now().to_msg()
                 with self._lock:
                     self._latest_frame = frame
@@ -219,6 +274,10 @@ class CameraPublisher(Node):
 
         if self._publish_raw_enabled and self._pub_raw.get_subscription_count() > 0:
             self._publish_raw(frame, stamp)
+
+        if self._pub_camera_info is not None and self._camera_info_msg is not None:
+            self._camera_info_msg.header.stamp = stamp
+            self._pub_camera_info.publish(self._camera_info_msg)
 
     def _publish_compressed(self, frame: np.ndarray, stamp) -> None:
         ok, buf = cv2.imencode('.jpg', frame, self._encode_params)
