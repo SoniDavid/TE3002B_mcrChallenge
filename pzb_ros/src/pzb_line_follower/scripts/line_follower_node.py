@@ -4,6 +4,7 @@ Line follower node for Puzzlebot.
 
 Subscribes:
   /camera/image_compressed  (sensor_msgs/CompressedImage)
+  /traffic_speed_scale      (std_msgs/Float32)   speed multiplier from traffic FSM
 
 Publishes:
   /line_follower/cx           (std_msgs/Int32)    detected center x in pixels
@@ -49,25 +50,36 @@ class LineFollowerNode(Node):
         self.declare_parameter('image_width',    320)
         self.declare_parameter('image_height',   240)
         self.declare_parameter('Kp_angular',     0.003)
-        self.declare_parameter('dead_band_px',   8)
-        self.declare_parameter('linear_speed',   0.10)
-        self.declare_parameter('max_angular',    0.8)
-        self.declare_parameter('stop_on_dashed', False)
-        self.declare_parameter('publish_debug',  True)
-        self.declare_parameter('topic_image_in', '/camera/image_compressed')
-        self.declare_parameter('topic_cmd_vel',  '/cmd_vel_desired')
+        self.declare_parameter('Kd_angular',           0.0)
+        self.declare_parameter('dead_band_px',         8)
+        self.declare_parameter('linear_speed',         0.10)
+        self.declare_parameter('max_linear_speed',     0.20)
+        self.declare_parameter('max_angular',          0.8)
+        self.declare_parameter('curve_speed_reduction', 0.5)
+        self.declare_parameter('min_linear_speed',     0.05)
+        self.declare_parameter('stop_on_dashed',       False)
+        self.declare_parameter('publish_debug',        True)
+        self.declare_parameter('topic_image_in',       '/camera/image_compressed')
+        self.declare_parameter('topic_cmd_vel',        '/cmd_vel_desired_raw')
 
-        self._img_w        = self.get_parameter('image_width').value
-        self._img_h        = self.get_parameter('image_height').value
-        self._kp           = float(self.get_parameter('Kp_angular').value)
-        self._dead_band    = int(self.get_parameter('dead_band_px').value)
-        self._linear_speed = float(self.get_parameter('linear_speed').value)
-        self._max_ang      = float(self.get_parameter('max_angular').value)
-        self._stop_dashed  = bool(self.get_parameter('stop_on_dashed').value)
-        self._pub_debug    = bool(self.get_parameter('publish_debug').value)
+        self._img_w          = self.get_parameter('image_width').value
+        self._img_h          = self.get_parameter('image_height').value
+        self._kp             = float(self.get_parameter('Kp_angular').value)
+        self._kd             = float(self.get_parameter('Kd_angular').value)
+        self._dead_band      = int(self.get_parameter('dead_band_px').value)
+        self._linear_speed   = float(self.get_parameter('linear_speed').value)
+        self._max_lin_speed  = float(self.get_parameter('max_linear_speed').value)
+        self._max_ang        = float(self.get_parameter('max_angular').value)
+        self._curve_reduction = float(self.get_parameter('curve_speed_reduction').value)
+        self._min_lin_speed  = float(self.get_parameter('min_linear_speed').value)
+        self._stop_dashed    = bool(self.get_parameter('stop_on_dashed').value)
+        self._pub_debug      = bool(self.get_parameter('publish_debug').value)
 
         topic_in  = self.get_parameter('topic_image_in').value
         topic_cmd = self.get_parameter('topic_cmd_vel').value
+
+        self._prev_error  = 0.0
+        self._speed_scale = 1.0
 
         self._detector = CenterLineDetector(debug=self._pub_debug)
 
@@ -81,10 +93,15 @@ class LineFollowerNode(Node):
         # Subscriber — BEST_EFFORT to match camera_publisher output
         self.create_subscription(CompressedImage, topic_in, self._image_cb, _BEST_EFFORT_QOS)
 
+        # Traffic speed scale (optional — defaults to 1.0 if topic never published)
+        self.create_subscription(Float32, '/traffic_speed_scale', self._cb_speed_scale, _RELIABLE_QOS)
+
         self.get_logger().info(
             f'Line follower ready  img={self._img_w}x{self._img_h}'
-            f'  Kp={self._kp}  dead_band={self._dead_band}px'
-            f'  v={self._linear_speed} m/s  debug={self._pub_debug}'
+            f'  Kp={self._kp}  Kd={self._kd}  dead_band={self._dead_band}px'
+            f'  v={self._linear_speed}/{self._max_lin_speed} m/s'
+            f'  curve_reduction={self._curve_reduction}  min_v={self._min_lin_speed}'
+            f'  debug={self._pub_debug}'
         )
 
     def _image_cb(self, msg: CompressedImage):
@@ -102,16 +119,36 @@ class LineFollowerNode(Node):
         cx, cy = self._detector.detect_center_line(img)
         line_type = self._detector.line_type
 
-        error = float(cx - self._img_w // 2)
+        error   = float(cx - self._img_w // 2)
+        d_error = error - self._prev_error
+        self._prev_error = error
 
-        # Steering control (proportional, same as test_simulator.py)
+        # PD steering — D term damps oscillation; Kd=0 reduces to pure P
         if abs(error) <= self._dead_band:
             angular_z = 0.0
         else:
-            angular_z = float(np.clip(-self._kp * error, -self._max_ang, self._max_ang))
+            angular_z = float(np.clip(
+                -self._kp * error - self._kd * d_error,
+                -self._max_ang, self._max_ang,
+            ))
 
-        # Stop linear speed when dashed line detected (intersection), if configured
-        linear_x = 0.0 if (self._stop_dashed and line_type == 'dashed') else self._linear_speed
+        # Curve-coupled speed reduction (mirrors waypoint_follower's cos(alpha) factor)
+        if self._max_ang > 0:
+            angular_fraction  = abs(angular_z) / self._max_ang
+        else:
+            angular_fraction  = 0.0
+        speed_scale_curve = 1.0 - self._curve_reduction * angular_fraction
+        min_frac  = self._min_lin_speed / self._linear_speed if self._linear_speed > 0 else 0.0
+        linear_x  = min(self._max_lin_speed,
+                        self._linear_speed * max(min_frac, speed_scale_curve))
+
+        # Dashed-line stop takes priority, then traffic scale
+        if self._stop_dashed and line_type == 'dashed':
+            linear_x = 0.0
+        elif self._speed_scale <= 0.0:
+            linear_x = 0.0
+        else:
+            linear_x *= self._speed_scale
 
         # Publish detections
         cx_msg = Int32()
@@ -146,6 +183,10 @@ class LineFollowerNode(Node):
             dbg_msg.step = dw * 3
             dbg_msg.data = dbg.tobytes()
             self._pub_debug_img.publish(dbg_msg)
+
+
+    def _cb_speed_scale(self, msg: Float32):
+        self._speed_scale = float(msg.data)
 
 
 def main(args=None):

@@ -8,14 +8,29 @@ line_follower_node:
     # Increase to react more aggressively to line offset
     Kp_angular: 0.003
 
+    # Derivative steering gain (rad/s per pixel/frame of error rate)
+    # Damps oscillation/weaving; start around Kp*0.3 and tune up
+    # Set to 0.0 to disable (pure P)
+    Kd_angular: 0.001
+
     # Pixel dead band around image center — no steering correction within this range
     dead_band_px: 8
 
-    # Forward speed in m/s
+    # Forward speed in m/s (desired; curve reduction may reduce this)
     linear_speed: 0.10
+
+    # Hard cap on linear output in m/s (also enforced by twist_slew_limiter)
+    max_linear_speed: 0.20
 
     # Maximum angular velocity output (rad/s)
     max_angular: 0.8
+
+    # Speed reduction on curves: 0.0 = constant speed, 1.0 = stop at max angular
+    # Mirrors the cos(alpha) factor in waypoint_follower — start at 0.5
+    curve_speed_reduction: 0.5
+
+    # Minimum linear speed in m/s — prevents stalling mid-curve (keep above motor deadband ~0.04)
+    min_linear_speed: 0.05
 
     # If true, sets linear_speed=0 when a dashed line (intersection) is detected
     stop_on_dashed: false
@@ -24,5 +39,6 @@ line_follower_node:
     publish_debug: true
 
     # Input and output topic names
+    # topic_cmd_vel feeds twist_slew_limiter; slew limiter outputs to /cmd_vel_desired
     topic_image_in: /camera/image_compressed
-    topic_cmd_vel:  /cmd_vel_desired
+    topic_cmd_vel:  /cmd_vel_desired_raw

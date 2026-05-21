@@ -1,20 +1,20 @@
 # TE3002B Intelligent Robotics Challenge
 
-Repository for coursework and mini-challenge deliverables in TE3002B — Optimal Control for Visual Servoing in Robotics.
+Repository for coursework and mini-challenge deliverables in TE3002B. 
 
 ## Course Information
 
 - **Course:** TE3002B — Intelligent Robotics
-- **Professor:** Nezih Nieto Gutiérrez
+- **Professor:** Mario Guilleremo Martinez Guerrero, Luis Ricardo Salgado
 
 ## Team
 
 
-| Name | Student ID | Role |
-|---|---|---|
-| David Alejandro Soni Cuevas | A01571777 | Optimal Control & MPC |
-| David Gilberto Lomelí Leal | A01571193 | Hardware Integration & Actuation |
-| Abraham de Jesús Maldonado Mata | A00838581 | Computer Vision & Perception |
+| Name | Student ID |
+|---|---|
+| David Alejandro Soni Cuevas | A01571777 |
+| David Gilberto Lomelí Leal | A01571193 |
+| Abraham de Jesús Maldonado Mata | A00838581 |
 
 
 ## Repository Layout
