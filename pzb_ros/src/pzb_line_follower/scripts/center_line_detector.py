@@ -41,10 +41,10 @@ class CenterLineDetector:
     MEDIAN_K        = 3     # median filter window (frames)
 
     # ── 3-line tracker ────────────────────────────────────────────────────────
-    LINE_MAX_JUMP  = 70     # px — max allowed movement per line per frame
+    LINE_MAX_JUMP  = 130    # px — max allowed movement per line per frame (tuned for ~12Hz camera)
     LINE_MIN_SEP   = 15     # px — post-assignment order enforcement gap
     TRACK_MIN_SEP  = 40     # px — minimum gap enforced *during* triplet/pair search
-    STALE_THRESH   = 15     # frames lost before clearing a line's anchor
+    STALE_THRESH   = 8      # frames lost before clearing a line's anchor (tuned for ~12Hz camera)
 
     # ── intersection detection ────────────────────────────────────────────────
     DASH_MIN_COUNT  = 3

@@ -45,13 +45,13 @@ def generate_launch_description():
 
     return LaunchDescription([
         # ── Tunable launch arguments ──────────────────────────────────────────
-        DeclareLaunchArgument('linear_speed',  default_value='0.10',
+        DeclareLaunchArgument('linear_speed',  default_value='0.08',
                               description='Forward speed in m/s'),
-        DeclareLaunchArgument('Kp_angular',    default_value='0.003',
+        DeclareLaunchArgument('Kp_angular',    default_value='0.007',
                               description='Proportional steering gain (rad/s per px)'),
-        DeclareLaunchArgument('Kd_angular',    default_value='0.001',
+        DeclareLaunchArgument('Kd_angular',    default_value='0.003',
                               description='Derivative steering gain (rad/s per px/frame); 0 disables'),
-        DeclareLaunchArgument('dead_band_px',  default_value='8',
+        DeclareLaunchArgument('dead_band_px',  default_value='4',
                               description='Pixel dead band for steering'),
         DeclareLaunchArgument('stop_on_dashed', default_value='false',
                               description='Stop linear motion at intersections'),
@@ -61,36 +61,36 @@ def generate_launch_description():
                               description='Launch traffic light detector and FSM'),
         DeclareLaunchArgument('curve_speed_reduction', default_value='0.5',
                               description='Speed reduction on turns: 0=off, 1=stop at max angular'),
-        DeclareLaunchArgument('min_linear_speed',  default_value='0.05',
+        DeclareLaunchArgument('min_linear_speed',  default_value='0.04',
                               description='Floor linear speed in m/s (keep above motor deadband)'),
         DeclareLaunchArgument('max_linear_accel',  default_value='0.25',
                               description='Max linear acceleration for slew limiter (m/s²)'),
-        DeclareLaunchArgument('max_angular_accel', default_value='1.20',
+        DeclareLaunchArgument('max_angular_accel', default_value='2.50',
                               description='Max angular acceleration for slew limiter (rad/s²)'),
 
-        # ── MCU bridge ────────────────────────────────────────────────────────
-        Node(
-            package='micro_ros_agent',
-            executable='micro_ros_agent',
-            name='micro_ros_agent',
-            arguments=['serial', '-D', '/dev/ttyUSB0'],
-            output='screen',
-        ),
+        # # ── MCU bridge ────────────────────────────────────────────────────────
+        # Node(
+        #     package='micro_ros_agent',
+        #     executable='micro_ros_agent',
+        #     name='micro_ros_agent',
+        #     arguments=['serial', '-D', '/dev/ttyUSB0'],
+        #     output='screen',
+        # ),
 
-        # ── Camera ───────────────────────────────────────────────────────────
-        Node(
-            package='pzb_camera',
-            executable='camera_publisher',
-            name='camera_publisher',
-            output='screen',
-            parameters=[
-                cam_params,
-                {
-                    'camera_info_file':    cam_info,
-                    'publish_camera_info': True,
-                },
-            ],
-        ),
+        # # ── Camera ───────────────────────────────────────────────────────────
+        # Node(
+        #     package='pzb_camera',
+        #     executable='camera_publisher',
+        #     name='camera_publisher',
+        #     output='screen',
+        #     parameters=[
+        #         cam_params,
+        #         {
+        #             'camera_info_file':    cam_info,
+        #             'publish_camera_info': True,
+        #         },
+        #     ],
+        # ),
 
         # ── Control stack ─────────────────────────────────────────────────────
         Node(
