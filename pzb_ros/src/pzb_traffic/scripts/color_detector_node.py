@@ -150,7 +150,8 @@ class ColorDetectorNode(Node):
 
         # Bilateral filter: reduces noise while preserving color edges (better than Gaussian for screen glare)
         blurred = cv2.bilateralFilter(frame, d=9, sigmaColor=75, sigmaSpace=75)
-        hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+       # blurred = cv2.GaussianBlur(frame, (5, 5), 0)
+ 	hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
         # CLAHE on V channel normalizes brightness variation from screen angle/glare
         h, s, v = cv2.split(hsv)
         v = self._clahe.apply(v)

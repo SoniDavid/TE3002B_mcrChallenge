@@ -15,6 +15,7 @@ Publishes:
 """
 
 import numpy as np
+from collections import deque
 import cv2
 
 import rclpy
@@ -49,23 +50,31 @@ class LineFollowerNode(Node):
 
         self.declare_parameter('image_width',    320)
         self.declare_parameter('image_height',   240)
-        self.declare_parameter('Kp_angular',     0.003)
-        self.declare_parameter('Kd_angular',           0.0)
+        self.declare_parameter('Kp_straight',          0.002)
+        self.declare_parameter('Kd_straight',          0.001)
+        self.declare_parameter('Kp_curve',             0.003) 
+        self.declare_parameter('Kd_curve',             0.002)
+        self.declare_parameter('curve_threshold_px',   90.0)
+        self.declare_parameter('error_window_frames',  5)
         self.declare_parameter('dead_band_px',         8)
         self.declare_parameter('linear_speed',         0.10)
         self.declare_parameter('max_linear_speed',     0.20)
         self.declare_parameter('max_angular',          0.8)
-        self.declare_parameter('curve_speed_reduction', 0.5)
+        self.declare_parameter('curve_speed_reduction',0.5)
         self.declare_parameter('min_linear_speed',     0.05)
-        self.declare_parameter('stop_on_dashed',       False)
-        self.declare_parameter('publish_debug',        True)
+        self.declare_parameter('stop_on_dashed',       True)
+        self.declare_parameter('publish_debug',        False)
         self.declare_parameter('topic_image_in',       '/camera/image_compressed')
         self.declare_parameter('topic_cmd_vel',        '/cmd_vel_desired_raw')
 
         self._img_w          = self.get_parameter('image_width').value
         self._img_h          = self.get_parameter('image_height').value
-        self._kp             = float(self.get_parameter('Kp_angular').value)
-        self._kd             = float(self.get_parameter('Kd_angular').value)
+        self._kp_s           = float(self.get_parameter('Kp_straight').value)
+        self._kd_s           = float(self.get_parameter('Kd_straight').value)
+        self._kp_c           = float(self.get_parameter('Kp_curve').value)
+        self._kd_c           = float(self.get_parameter('Kd_curve').value)
+        self._curve_thresh   = float(self.get_parameter('curve_threshold_px').value)
+        self._window_size = int(self.get_parameter('error_window_frames').value)
         self._dead_band      = int(self.get_parameter('dead_band_px').value)
         self._linear_speed   = float(self.get_parameter('linear_speed').value)
         self._max_lin_speed  = float(self.get_parameter('max_linear_speed').value)
@@ -80,14 +89,19 @@ class LineFollowerNode(Node):
 
         self._prev_error  = 0.0
         self._speed_scale = 1.0
+        
+        # Temporal counter
+        self.couter = 0
 
         self._detector = CenterLineDetector(debug=self._pub_debug)
+        
+        self._error_buffer = deque(maxlen=self._window_size)
 
         # Publishers
-        self._pub_cx        = self.create_publisher(Int32,   '/line_follower/cx',        _RELIABLE_QOS)
-        self._pub_error     = self.create_publisher(Float32, '/line_follower/error',      _RELIABLE_QOS)
-        self._pub_line_type = self.create_publisher(String,  '/line_follower/line_type',  _RELIABLE_QOS)
-        self._pub_cmd       = self.create_publisher(Twist,   topic_cmd,                   _RELIABLE_QOS)
+        self._pub_cx        = self.create_publisher(Int32,   '/line_follower/cx',          _RELIABLE_QOS)
+        self._pub_error     = self.create_publisher(Float32, '/line_follower/error',       _RELIABLE_QOS)
+        self._pub_line_type = self.create_publisher(String,  '/line_follower/line_type',   _RELIABLE_QOS)
+        self._pub_cmd       = self.create_publisher(Twist,   topic_cmd,                    _RELIABLE_QOS)
         self._pub_debug_img = self.create_publisher(Image,   '/line_follower/debug_image', _RELIABLE_QOS)
 
         # Subscriber — BEST_EFFORT to match camera_publisher output
@@ -98,8 +112,8 @@ class LineFollowerNode(Node):
 
         self.get_logger().info(
             f'Line follower ready  img={self._img_w}x{self._img_h}'
-            f'  Kp={self._kp}  Kd={self._kd}  dead_band={self._dead_band}px'
-            f'  v={self._linear_speed}/{self._max_lin_speed} m/s'
+            f'  Kp={self._kp_s}  Kd={self._kd_s} - Kp={self._kp_c}  Kd={self._kd_c} dead_band={self._dead_band}px'
+            f'  v={self._linear_speed}/{self._max_lin_speed} m/s Curve Thresh: {self._curve_thresh}'
             f'  curve_reduction={self._curve_reduction}  min_v={self._min_lin_speed}'
             f'  debug={self._pub_debug}'
         )
@@ -114,7 +128,7 @@ class LineFollowerNode(Node):
 
         # Resize to expected detector resolution
         if img.shape[1] != self._img_w or img.shape[0] != self._img_h:
-            img = cv2.resize(img, (self._img_w, self._img_h), interpolation=cv2.INTER_LANCZOS4)
+            img = cv2.resize(img, (self._img_w, self._img_h), interpolation=cv2.INTER_LINEAR)
 
         cx, cy = self._detector.detect_center_line(img)
         line_type = self._detector.line_type
@@ -122,13 +136,41 @@ class LineFollowerNode(Node):
         error   = float(cx - self._img_w // 2)
         d_error = error - self._prev_error
         self._prev_error = error
+        
+        self._error_buffer.append(abs(error))
+        
+        avg_error = sum(self._error_buffer) / len(self._error_buffer)
 
         # PD steering — D term damps oscillation; Kd=0 reduces to pure P
+        # --- SELECCIÓN DEL PD (Gain Scheduling) ---
+        
+        self.couter += 1
+        
+        if self.couter >= 10:
+            self.get_logger().info(f"Avg Error: {avg_error:.2f}")
+        if avg_error > self._curve_thresh:
+            # ¡El error es grande, estamos en una curva!
+            current_kp = self._kp_c
+            current_kd = self._kd_c
+            if self.couter >= 10:
+                self.get_logger().info("➔ Curve!!!!!")
+            
+        else:
+            # El error es pequeño, estamos en recta
+            current_kp = self._kp_s
+            current_kd = self._kd_s
+            if self.couter >= 10:
+                self.get_logger().info("↑ Line!!!!!!")
+            
+        if self.couter > 10:
+            self.couter = 0
+            
+        # PD steering con las ganancias seleccionadas
         if abs(error) <= self._dead_band:
             angular_z = 0.0
         else:
             angular_z = float(np.clip(
-                -self._kp * error - self._kd * d_error,
+                -current_kp * error - current_kd * d_error,
                 -self._max_ang, self._max_ang,
             ))
 
@@ -145,10 +187,13 @@ class LineFollowerNode(Node):
         # Dashed-line stop takes priority, then traffic scale
         if self._stop_dashed and line_type == 'dashed':
             linear_x = 0.0
+            angular_z = 0.0
         elif self._speed_scale <= 0.0:
             linear_x = 0.0
+            angular_z = 0.0
         else:
             linear_x *= self._speed_scale
+            angular_z *= self._speed_scale
 
         # Publish detections
         cx_msg = Int32()
@@ -182,7 +227,7 @@ class LineFollowerNode(Node):
             dbg_msg.is_bigendian = 0
             dbg_msg.step = dw * 3
             dbg_msg.data = dbg.tobytes()
-            self._pub_debug_img.publish(dbg_msg)
+            #self._pub_debug_img.publish(dbg_msg)
 
 
     def _cb_speed_scale(self, msg: Float32):
