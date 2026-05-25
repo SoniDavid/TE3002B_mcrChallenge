@@ -61,19 +61,23 @@ class LineFollowerNode(Node):
         self.declare_parameter('publish_debug',        True)
         self.declare_parameter('topic_image_in',       '/camera/image_raw')
         self.declare_parameter('topic_cmd_vel',        '/cmd_vel_desired_raw')
+        self.declare_parameter('sharp_turn_threshold_px', 80)
+        self.declare_parameter('sharp_turn_speed',        0.03)
 
-        self._img_w          = self.get_parameter('image_width').value
-        self._img_h          = self.get_parameter('image_height').value
-        self._kp             = float(self.get_parameter('Kp_angular').value)
-        self._kd             = float(self.get_parameter('Kd_angular').value)
-        self._dead_band      = int(self.get_parameter('dead_band_px').value)
-        self._linear_speed   = float(self.get_parameter('linear_speed').value)
-        self._max_lin_speed  = float(self.get_parameter('max_linear_speed').value)
-        self._max_ang        = float(self.get_parameter('max_angular').value)
-        self._curve_reduction = float(self.get_parameter('curve_speed_reduction').value)
-        self._min_lin_speed  = float(self.get_parameter('min_linear_speed').value)
-        self._stop_dashed    = bool(self.get_parameter('stop_on_dashed').value)
-        self._pub_debug      = bool(self.get_parameter('publish_debug').value)
+        self._img_w               = self.get_parameter('image_width').value
+        self._img_h               = self.get_parameter('image_height').value
+        self._kp                  = float(self.get_parameter('Kp_angular').value)
+        self._kd                  = float(self.get_parameter('Kd_angular').value)
+        self._dead_band           = int(self.get_parameter('dead_band_px').value)
+        self._linear_speed        = float(self.get_parameter('linear_speed').value)
+        self._max_lin_speed       = float(self.get_parameter('max_linear_speed').value)
+        self._max_ang             = float(self.get_parameter('max_angular').value)
+        self._curve_reduction     = float(self.get_parameter('curve_speed_reduction').value)
+        self._min_lin_speed       = float(self.get_parameter('min_linear_speed').value)
+        self._stop_dashed         = bool(self.get_parameter('stop_on_dashed').value)
+        self._pub_debug           = bool(self.get_parameter('publish_debug').value)
+        self._sharp_turn_threshold = int(self.get_parameter('sharp_turn_threshold_px').value)
+        self._sharp_turn_speed    = float(self.get_parameter('sharp_turn_speed').value)
 
         topic_in  = self.get_parameter('topic_image_in').value
         topic_cmd = self.get_parameter('topic_cmd_vel').value
@@ -121,7 +125,7 @@ class LineFollowerNode(Node):
         self._prev_error = error
 
         # PD steering — D term damps oscillation; Kd=0 reduces to pure P
-        if abs(error) <= self._dead_band:
+        if line_type == 'dashed' or abs(error) <= self._dead_band:
             angular_z = 0.0
         else:
             angular_z = float(np.clip(
@@ -138,6 +142,10 @@ class LineFollowerNode(Node):
         min_frac  = self._min_lin_speed / self._linear_speed if self._linear_speed > 0 else 0.0
         linear_x  = min(self._max_lin_speed,
                         self._linear_speed * max(min_frac, speed_scale_curve))
+
+        # Sharp-turn override: large lateral error → almost stop and spin to complete the turn
+        if abs(error) > self._sharp_turn_threshold:
+            linear_x = self._sharp_turn_speed
 
         # Dashed-line stop takes priority, then traffic scale
         if self._stop_dashed and line_type == 'dashed':
@@ -197,7 +205,7 @@ def main(args=None):
     finally:
         if node is not None:
             node.destroy_node()
-        rclpy.shutdown()
+        rclpy.try_shutdown()
 
 
 if __name__ == '__main__':

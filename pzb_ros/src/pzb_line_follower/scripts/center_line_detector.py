@@ -150,8 +150,7 @@ class CenterLineDetector:
         self.line_type = self._classify_line(valid, w)
 
         if self.line_type == "dashed":
-            cx = int(round(self.prev_cx)) if self.prev_cx is not None else w // 2
-            cy = y_start + roi_h // 2
+            cx, cy = self._fuse_dashes(valid, y_start, roi_h)
             self.exits = []
         else:
             cx, cy     = self._track_three_lines(valid, w, roi_h, y_start)

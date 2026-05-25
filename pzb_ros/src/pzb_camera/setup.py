@@ -25,6 +25,8 @@ setup(
     entry_points={
         'console_scripts': [
             'camera_publisher = pzb_camera_scripts.camera_publisher:main',
+            'camera_raw_publisher = pzb_camera_scripts.camera_raw_publisher:main',
+            'camera_compressed_publisher = pzb_camera_scripts.camera_compressed_publisher:main',
             'usb_camera_publisher = pzb_camera_scripts.usb_camera_publisher:main',
             'image_decompressor = pzb_camera_scripts.image_decompressor:main',
             'calibrate_from_rosbag = pzb_camera_scripts.calibrate_from_rosbag:main',

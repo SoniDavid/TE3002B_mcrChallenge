@@ -48,16 +48,6 @@ def generate_launch_description():
             description='nvvidconv flip-method (0:none, 2:rotate-180, 4:horizontal, 6:vertical)',
         ),
         DeclareLaunchArgument(
-            'publish_compressed',
-            default_value='true',
-            description='Publish /camera/image_compressed.',
-        ),
-        DeclareLaunchArgument(
-            'publish_raw',
-            default_value='false',
-            description='Publish /camera/image_raw (heavy bandwidth).',
-        ),
-        DeclareLaunchArgument(
             'color_cal_file',
             default_value='/home/puzzlebot/color_cal/colorCalibration.npz',
             description='Path to .npz color calibration file (arr_0 gains). Empty to disable.',
@@ -80,8 +70,8 @@ def generate_launch_description():
 
         Node(
             package='pzb_camera',
-            executable='camera_publisher',
-            name='camera_publisher',
+            executable='camera_compressed_publisher',
+            name='camera_compressed_publisher',
             output='screen',
             parameters=[
                 LaunchConfiguration('params_file'),
@@ -92,8 +82,6 @@ def generate_launch_description():
                     'framerate':           LaunchConfiguration('framerate'),
                     'jpeg_quality':        LaunchConfiguration('jpeg_quality'),
                     'flip_method':         LaunchConfiguration('flip_method'),
-                    'publish_compressed':  LaunchConfiguration('publish_compressed'),
-                    'publish_raw':         LaunchConfiguration('publish_raw'),
                     'color_cal_file':      LaunchConfiguration('color_cal_file'),
                     'publish_camera_info': LaunchConfiguration('publish_camera_info'),
                     'camera_info_file':    LaunchConfiguration('camera_info_file'),

@@ -45,9 +45,9 @@ def generate_launch_description():
 
     return LaunchDescription([
         # ── Tunable launch arguments ──────────────────────────────────────────
-        DeclareLaunchArgument('linear_speed',  default_value='0.10',
+        DeclareLaunchArgument('linear_speed',  default_value='0.08',
                               description='Forward speed in m/s'),
-        DeclareLaunchArgument('Kp_angular',    default_value='0.003',
+        DeclareLaunchArgument('Kp_angular',    default_value='0.005',
                               description='Proportional steering gain (rad/s per px)'),
         DeclareLaunchArgument('Kd_angular',    default_value='0.001',
                               description='Derivative steering gain (rad/s per px/frame); 0 disables'),
@@ -59,7 +59,7 @@ def generate_launch_description():
                               description='Publish debug image topic'),
         DeclareLaunchArgument('use_traffic',       default_value='true',
                               description='Launch traffic light detector and FSM'),
-        DeclareLaunchArgument('curve_speed_reduction', default_value='0.5',
+        DeclareLaunchArgument('curve_speed_reduction', default_value='0.75',
                               description='Speed reduction on turns: 0=off, 1=stop at max angular'),
         DeclareLaunchArgument('min_linear_speed',  default_value='0.05',
                               description='Floor linear speed in m/s (keep above motor deadband)'),
@@ -67,21 +67,25 @@ def generate_launch_description():
                               description='Max linear acceleration for slew limiter (m/s²)'),
         DeclareLaunchArgument('max_angular_accel', default_value='1.20',
                               description='Max angular acceleration for slew limiter (rad/s²)'),
+        DeclareLaunchArgument('sharp_turn_threshold_px', default_value='80',
+                              description='|error| in px above which sharp-turn slow mode activates'),
+        DeclareLaunchArgument('sharp_turn_speed',  default_value='0.03',
+                              description='Linear speed (m/s) during sharp turns — robot slows to spin'),
 
-        # ── MCU bridge ────────────────────────────────────────────────────────
-        Node(
-            package='micro_ros_agent',
-            executable='micro_ros_agent',
-            name='micro_ros_agent',
-            arguments=['serial', '-D', '/dev/ttyUSB0'],
-            output='screen',
-        ),
+        # # ── MCU bridge ────────────────────────────────────────────────────────
+        # Node(
+        #     package='micro_ros_agent',
+        #     executable='micro_ros_agent',
+        #     name='micro_ros_agent',
+        #     arguments=['serial', '-D', '/dev/ttyUSB0'],
+        #     output='screen',
+        # ),
 
         # ── Camera ───────────────────────────────────────────────────────────
         Node(
             package='pzb_camera',
-            executable='camera_publisher',
-            name='camera_publisher',
+            executable='camera_raw_publisher',
+            name='camera_raw_publisher',
             output='screen',
             parameters=[
                 cam_params,
@@ -124,9 +128,11 @@ def generate_launch_description():
                     'dead_band_px':          LaunchConfiguration('dead_band_px'),
                     'stop_on_dashed':        LaunchConfiguration('stop_on_dashed'),
                     'publish_debug':         LaunchConfiguration('publish_debug'),
-                    'curve_speed_reduction': LaunchConfiguration('curve_speed_reduction'),
-                    'min_linear_speed':      LaunchConfiguration('min_linear_speed'),
-                    'topic_cmd_vel':         '/cmd_vel_desired_raw',
+                    'curve_speed_reduction':   LaunchConfiguration('curve_speed_reduction'),
+                    'min_linear_speed':        LaunchConfiguration('min_linear_speed'),
+                    'sharp_turn_threshold_px': LaunchConfiguration('sharp_turn_threshold_px'),
+                    'sharp_turn_speed':        LaunchConfiguration('sharp_turn_speed'),
+                    'topic_cmd_vel':           '/cmd_vel_desired_raw',
                 },
             ],
         ),
