@@ -55,7 +55,7 @@ def generate_launch_description():
                               description='Pixel dead band for steering'),
         DeclareLaunchArgument('stop_on_dashed', default_value='false',
                               description='Stop linear motion at intersections'),
-        DeclareLaunchArgument('publish_debug', default_value='true',
+        DeclareLaunchArgument('publish_debug', default_value='false',
                               description='Publish debug image topic'),
         DeclareLaunchArgument('use_traffic',       default_value='true',
                               description='Launch traffic light detector and FSM'),
