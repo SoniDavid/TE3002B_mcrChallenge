@@ -36,9 +36,10 @@ line_follower_node:
     stop_on_dashed: false
 
     # Publish pipeline debug visualization on /line_follower/debug_image
-    publish_debug: true
+    # Set to true only during tuning sessions — generates 7-tile image every frame
+    publish_debug: false
 
     # Input and output topic names
     # topic_cmd_vel feeds twist_slew_limiter; slew limiter outputs to /cmd_vel_desired
-    topic_image_in: /camera/image_compressed
+    topic_image_in: /camera/image_raw
     topic_cmd_vel:  /cmd_vel_desired_raw

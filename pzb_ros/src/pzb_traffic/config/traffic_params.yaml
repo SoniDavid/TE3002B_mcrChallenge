@@ -29,7 +29,7 @@ color_detector_node:
     yellow_v_min:  160   # still bright white-ish paper
 
     # --- Detection robustness ---
-    min_blob_area:   800.0   # px² — blobs smaller than this are ignored
+    min_blob_area:   120.0   # px² — circularity filter now rejects non-round blobs, so threshold can be lower
     confirm_frames:  4       # consecutive frames of same color before updating output
     loop_hz:         30.0
 

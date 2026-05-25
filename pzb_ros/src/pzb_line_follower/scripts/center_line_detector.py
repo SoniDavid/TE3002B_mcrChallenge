@@ -1,4 +1,5 @@
 from collections import deque
+from itertools import combinations
 import numpy as np
 import cv2
 
@@ -57,6 +58,27 @@ class CenterLineDetector:
     TRACK_HSV_LO     = np.array([78,  8, 106], np.uint8)
     TRACK_HSV_HI     = np.array([168, 76, 222], np.uint8)
 
+    # ── lane-interior constraint (calibrated from puzzlebot_track_video.mp4) ────
+    # The camera auto-white-balance shifts H dramatically frame-to-frame, so
+    # H is set to the full range (0-179) — separation is by V and S only.
+    # Dark gray lines: V < 75 (consistently).  Road mat: V=76-187, S=16-103.
+    # White stop-line patches (if in ROI): V > 190, S < 15 — excluded by S >= 16.
+    LANE_HSV_LO    = np.array([  0,  16,  76], np.uint8)
+    LANE_HSV_HI    = np.array([179, 103, 187], np.uint8)
+    LANE_MIN_PIX   = 800   # px of mat before trusting the centroid (mat covers ~85% of ROI)
+    LANE_BLEND_THR = 40    # px deviation from lane_cx before blending toward it
+
+    # ── persistent adaptive threshold ─────────────────────────────────────────
+    # Carries T across frames so the threshold drifts gradually (±10/iter)
+    # instead of re-deriving from each frame's histogram like Otsu.
+    # Targets a dark-pixel % in [ADAPTIVE_DARK_MIN, ADAPTIVE_DARK_MAX].
+    # Tune DARK_MIN/MAX with test_against_video.py: all 3 lines visible → check %.
+    ADAPTIVE_T_INIT   = 185   # starting threshold
+    ADAPTIVE_T_MIN    = 100   # floor — never let T drop below this
+    ADAPTIVE_T_MAX    = 220   # ceiling — never let T rise above this
+    ADAPTIVE_DARK_MIN =  2.0  # % of ROI pixels that must be dark (≈1 partial line)
+    ADAPTIVE_DARK_MAX = 15.0  # % of ROI pixels that may be dark (≈3 lines + noise)
+
     # ─────────────────────────────────────────────────────────────────────────
 
     def __init__(self, debug=False):
@@ -81,43 +103,67 @@ class CenterLineDetector:
         self.exits      = []
         self._exit_mask = None
 
+        # Brown lane-interior constraint state
+        self.lane_cx         = None   # centroid x of lane interior, or None
+        self.lane_correction = False  # True when cx was blended toward lane_cx
+
+        # Persistent adaptive threshold state
+        self._T_state = self.ADAPTIVE_T_INIT
+
     # ── main entry point ──────────────────────────────────────────────────────
 
-    def detect_center_line(self, image):
+    def detect_center_line(self, image, pre_cropped=False):
         """
-        :param image: BGR image, expected 320×240.
-        :return: (cx, cy) of the center line in original image coordinates.
+        :param image: BGR image. If pre_cropped=False, expected 320×240 (full frame);
+                      if pre_cropped=True, the image IS the bottom ROI (e.g. 320×80).
+        :param pre_cropped: When True, skip internal ROI extraction — the caller already
+                            cropped and resized to the relevant bottom region.
+        :return: (cx, cy) of the center line.
         """
         h, w = image.shape[:2]
 
-        # S1: ROI — bottom third
-        y_start = (2 * h) // 3
-        roi     = image[y_start:h, :]
+        if pre_cropped:
+            roi     = image
+            y_start = 0
+        else:
+            # S1: ROI — bottom third
+            y_start = (2 * h) // 3
+            roi     = image[y_start:h, :]
 
         # S2-S5: standard pipeline
         gray    = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 1.4)
-        _, binary = cv2.threshold(blurred, 0, 255,
-                                  cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        kernel  = np.ones((3, 3), np.uint8)
-        cleaned = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+        binary  = self._adaptive_threshold(blurred)
+        k3      = np.ones((3, 3), np.uint8)
+        k5      = np.ones((5, 5), np.uint8)
+        opened  = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  k3)
+        cleaned = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, k5)
 
         # S6: contours
         contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL,
                                        cv2.CHAIN_APPROX_SIMPLE)
+
+        roi_h = roi.shape[0]
 
         # S7: classify → track
         valid          = self._valid_contours(contours)
         self.line_type = self._classify_line(valid, w)
 
         if self.line_type == "dashed":
-            # Detected but ignored — hold last known center position
             cx = int(round(self.prev_cx)) if self.prev_cx is not None else w // 2
-            cy = y_start + (h - y_start) // 2
+            cy = y_start + roi_h // 2
             self.exits = []
         else:
-            cx, cy     = self._track_three_lines(valid, w, h, y_start)
+            cx, cy     = self._track_three_lines(valid, w, roi_h, y_start)
             self.exits = []
+
+        # Brown lane-interior constraint: detect lane centroid and blend cx if needed
+        self.lane_correction = False
+        lane_cx, lane_valid = self._detect_lane_interior(roi)
+        self.lane_cx = lane_cx if lane_valid else None
+        if lane_valid and abs(cx - lane_cx) > self.LANE_BLEND_THR:
+            cx = int(round((cx + lane_cx) / 2.0))
+            self.lane_correction = True
 
         # Global history for classifier anchor
         self.history.append(cx)
@@ -126,10 +172,72 @@ class CenterLineDetector:
         if self.debug:
             self.debug_frame = self._build_debug(
                 image, roi, gray, blurred, binary, cleaned, contours,
-                cx, cy, y_start, w, h
+                cx, cy, y_start, w, roi_h
             )
 
         return (cx, cy)
+
+    # ── brown lane-interior helper ────────────────────────────────────────────
+
+    def _detect_lane_interior(self, roi):
+        """
+        Detect the brownish/tan lane surface in the ROI.
+
+        Computes an HSV mask for the lane interior color and returns its
+        centroid x. Used to bias the tracked center_cx toward the actual road
+        when the 3-line tracker locks onto an adjacent-track line at junctions.
+
+        Calibrate LANE_HSV_LO / LANE_HSV_HI for the specific track mat color.
+
+        :return: (lane_cx_int, valid_bool)
+        """
+        hsv  = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, self.LANE_HSV_LO, self.LANE_HSV_HI)
+        pix  = int(mask.sum()) // 255
+        if pix < self.LANE_MIN_PIX:
+            return 0, False
+        M = cv2.moments(mask)
+        if M['m00'] == 0:
+            return 0, False
+        return int(round(M['m10'] / M['m00'])), True
+
+    # ── adaptive threshold ────────────────────────────────────────────────────
+
+    def _adaptive_threshold(self, gray_roi):
+        """
+        Persistent frame-to-frame threshold targeting ADAPTIVE_DARK_MIN–MAX %.
+
+        Unlike Otsu (which re-derives from each frame's histogram), this carries
+        self._T_state across frames and adjusts by ±10 per iteration.  Direction
+        hysteresis stops adjustment immediately if the step direction reverses,
+        preventing oscillation around the target range.
+
+        Typical cost on a 320×80 ROI: 1–2 iterations (~0.2–0.4 ms on Nano).
+        Worst-case cap: 10 iterations (~2 ms).
+        """
+        T         = self._T_state
+        area      = gray_roi.size
+        direction = 0
+        for _ in range(10):
+            _, binary = cv2.threshold(gray_roi, T, 255, cv2.THRESH_BINARY_INV)
+            perc = 100.0 * cv2.countNonZero(binary) / area
+            if perc > self.ADAPTIVE_DARK_MAX:
+                # Too many dark pixels — lower T so fewer pixels qualify as dark
+                if T <= self.ADAPTIVE_T_MIN or direction == 1:
+                    break
+                T -= 10
+                direction = -1
+            elif perc < self.ADAPTIVE_DARK_MIN:
+                # Too few dark pixels — raise T so more pixels qualify as dark
+                if T >= self.ADAPTIVE_T_MAX or direction == -1:
+                    break
+                T += 10
+                direction = 1
+            else:
+                break
+        self._T_state = T
+        _, binary = cv2.threshold(gray_roi, T, 255, cv2.THRESH_BINARY_INV)
+        return binary
 
     # ── contour helpers ───────────────────────────────────────────────────────
 
@@ -221,8 +329,6 @@ class CenterLineDetector:
 
         Returns {left: float|None, center: float|None, right: float|None}.
         """
-        from itertools import combinations
-
         names = ('left', 'center', 'right')
         lp    = self.line_positions
         # When a line has no history, default to its extreme — not the image quarter.
@@ -470,8 +576,8 @@ class CenterLineDetector:
             labeled(roi,     'S1:ROI'),
             labeled(gray,    'S2:gray'),
             labeled(blurred, 'S3:blur'),
-            labeled(binary,  'S4:Otsu'),
-            labeled(cleaned, 'S5:open'),
+            labeled(binary,  f'S4:T={self._T_state}'),
+            labeled(cleaned, 'S5:op+cl'),
             cnt_vis,
             overview,
         ]

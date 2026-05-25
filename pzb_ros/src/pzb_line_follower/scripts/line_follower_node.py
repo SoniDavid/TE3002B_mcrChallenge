@@ -3,7 +3,7 @@
 Line follower node for Puzzlebot.
 
 Subscribes:
-  /camera/image_compressed  (sensor_msgs/CompressedImage)
+  /camera/image_raw         (sensor_msgs/Image)        raw 1280×720 BGR; node crops bottom 1/3
   /traffic_speed_scale      (std_msgs/Float32)   speed multiplier from traffic FSM
 
 Publishes:
@@ -21,7 +21,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 
-from sensor_msgs.msg import CompressedImage, Image
+from sensor_msgs.msg import Image
 from std_msgs.msg import Int32, Float32, String
 from geometry_msgs.msg import Twist
 
@@ -59,7 +59,7 @@ class LineFollowerNode(Node):
         self.declare_parameter('min_linear_speed',     0.05)
         self.declare_parameter('stop_on_dashed',       False)
         self.declare_parameter('publish_debug',        True)
-        self.declare_parameter('topic_image_in',       '/camera/image_compressed')
+        self.declare_parameter('topic_image_in',       '/camera/image_raw')
         self.declare_parameter('topic_cmd_vel',        '/cmd_vel_desired_raw')
 
         self._img_w          = self.get_parameter('image_width').value
@@ -90,8 +90,8 @@ class LineFollowerNode(Node):
         self._pub_cmd       = self.create_publisher(Twist,   topic_cmd,                   _RELIABLE_QOS)
         self._pub_debug_img = self.create_publisher(Image,   '/line_follower/debug_image', _RELIABLE_QOS)
 
-        # Subscriber — BEST_EFFORT to match camera_publisher output
-        self.create_subscription(CompressedImage, topic_in, self._image_cb, _BEST_EFFORT_QOS)
+        # Subscriber — raw Image; BEST_EFFORT is compatible with the RELIABLE raw publisher
+        self.create_subscription(Image, topic_in, self._image_cb, _BEST_EFFORT_QOS)
 
         # Traffic speed scale (optional — defaults to 1.0 if topic never published)
         self.create_subscription(Float32, '/traffic_speed_scale', self._cb_speed_scale, _RELIABLE_QOS)
@@ -104,19 +104,16 @@ class LineFollowerNode(Node):
             f'  debug={self._pub_debug}'
         )
 
-    def _image_cb(self, msg: CompressedImage):
-        # Decode JPEG
-        buf = np.frombuffer(msg.data, np.uint8)
-        img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
-        if img is None:
-            self.get_logger().warning('Failed to decode CompressedImage', throttle_duration_sec=2.0)
-            return
+    def _image_cb(self, msg: Image):
+        # Decode raw BGR image — zero-copy view into msg.data
+        full = np.frombuffer(msg.data, np.uint8).reshape(msg.height, msg.width, 3)
 
-        # Resize to expected detector resolution
-        if img.shape[1] != self._img_w or img.shape[0] != self._img_h:
-            img = cv2.resize(img, (self._img_w, self._img_h), interpolation=cv2.INTER_LANCZOS4)
+        # Crop bottom third (the only region the detector uses) then downscale to 320×80.
+        # INTER_AREA is optimal for integer-ratio downsampling (1280→320 = 4×, 240→80 = 3×).
+        roi_crop = full[msg.height * 2 // 3 :, :]
+        img = cv2.resize(roi_crop, (self._img_w, self._img_h // 3), interpolation=cv2.INTER_AREA)
 
-        cx, cy = self._detector.detect_center_line(img)
+        cx, cy = self._detector.detect_center_line(img, pre_cropped=True)
         line_type = self._detector.line_type
 
         error   = float(cx - self._img_w // 2)
@@ -175,7 +172,7 @@ class LineFollowerNode(Node):
             dh, dw = dbg.shape[:2]
             dbg_msg = Image()
             dbg_msg.header.stamp = msg.header.stamp
-            dbg_msg.header.frame_id = 'camera_optical_frame'
+            dbg_msg.header.frame_id = msg.header.frame_id
             dbg_msg.height = dh
             dbg_msg.width  = dw
             dbg_msg.encoding = 'bgr8'
