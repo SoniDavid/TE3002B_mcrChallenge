@@ -3,13 +3,20 @@
 IMX219 CSI camera publisher — raw only.
 
 Publishes:
-  /camera/image_raw   (sensor_msgs/Image, RELIABLE)  raw BGR, ~2.7 MB/frame
-  /camera/camera_info (sensor_msgs/CameraInfo)        optional intrinsics
+  /camera/image_raw   (sensor_msgs/Image, BEST_EFFORT)  raw BGR
+  /camera/camera_info (sensor_msgs/CameraInfo)           optional intrinsics
 
-Use this node for on-device processing pipelines (line follower, CV nodes).
-For remote viewing or network streaming use camera_compressed_publisher instead.
+Threading model (adapted from Team2's rectify_compress.py):
+  - Capture thread: GStreamer → frame → writes to shared slot, notifies Condition.
+  - Publish thread: waits on Condition, publishes Image using array.array fast-path.
+
+The array.array fast-path is critical: rclpy iterates Image.data byte-by-byte through
+a Python isinstance check when the field is a plain bytes object.  For 1280×720 this
+takes ~1.3 s per publish, capping the effective rate at < 1 Hz.
+array.array activates the rclpy buffer protocol path and reduces this to ~8 ms.
 """
 
+import array
 import threading
 import time
 import yaml
@@ -32,8 +39,8 @@ _RELIABLE_QOS = QoSProfile(
 )
 
 # Camera images are a streaming sensor type — BEST_EFFORT avoids ACK backpressure
-# from slow subscribers (e.g. ros2 bag record writing 2.6 MB/frame to disk),
-# which would otherwise throttle the publish rate from 30 Hz down to disk I/O speed.
+# from slow subscribers (e.g. ros2 bag record writing to disk),
+# which would otherwise throttle the publish rate.
 _IMAGE_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
     durability=DurabilityPolicy.VOLATILE,
@@ -50,8 +57,8 @@ class CameraRawPublisher(Node):
         self.declare_parameter('sensor_id',           0)
         self.declare_parameter('width',               1280)
         self.declare_parameter('height',              720)
-        self.declare_parameter('out_width',           320)
-        self.declare_parameter('out_height',          240)
+        self.declare_parameter('out_width',           1280)
+        self.declare_parameter('out_height',          720)
         self.declare_parameter('framerate',           30)
         self.declare_parameter('flip_method',         0)
         self.declare_parameter('frame_id',            'camera_optical_frame')
@@ -70,6 +77,9 @@ class CameraRawPublisher(Node):
         self._flip_method = int(self.get_parameter('flip_method').value)
         self._frame_id    = self.get_parameter('frame_id').value
         topic_raw         = self.get_parameter('topic_raw').value
+
+        # Use all 4 Jetson Nano cores for OpenCV operations (Team2 technique).
+        cv2.setNumThreads(4)
 
         self._pub_raw = self.create_publisher(Image, topic_raw, _IMAGE_QOS)
 
@@ -121,26 +131,42 @@ class CameraRawPublisher(Node):
         self.get_logger().info(
             f'Camera ready  {self._width}x{self._height}'
             f'  -> published at {self._out_w}x{self._out_h}'
-            f'  @ {self._fps}fps -> {topic_raw}'
+            f'  -> {topic_raw}'
         )
 
-        # ── Shared capture state ──────────────────────────────────────────────
-        self._lock = threading.Lock()
-        self._latest_frame = None
-        self._latest_stamp = None
+        # ── Shared state (Condition-based, Team2 pattern) ─────────────────────
+        # One Condition guards the shared slot.  The capture thread writes into
+        # _slot and increments _slot_seq, then notifies.  The publish thread
+        # wakes, grabs the reference, and publishes.  If the publish thread is
+        # slower than capture, the slot is simply overwritten — newest frame wins.
         self._capture_thread_running = True
-        self._consecutive_failures = 0
-        self._reconnect_attempts = 0
+        self._slot_cv   = threading.Condition()
+        self._slot      = None   # (stamp, frame ndarray) or None
+        self._slot_seq  = 0      # incremented on every captured frame
+        self._pub_seq   = -1     # sequence last published
+
+        # Reconnect counters (kept from original)
+        self._consecutive_failures  = 0
+        self._reconnect_attempts    = 0
         self._MAX_CONSECUTIVE_FAILURES = 10
-        self._MAX_RECONNECT_ATTEMPTS = 5
-        self._RECONNECT_SLEEP_SEC = 3.0
-        self._frame_count = 0
+        self._MAX_RECONNECT_ATTEMPTS   = 5
+        self._RECONNECT_SLEEP_SEC      = 3.0
+
+        # FPS statistics (Team2 pattern)
+        self._cap_frames = 0
+        self._pub_frames = 0
+        self._t_stats    = self.get_clock().now()
 
         self._cap_thread = threading.Thread(
             target=self._capture_loop, name='camera_capture', daemon=True)
-        self._cap_thread.start()
+        self._pub_thread = threading.Thread(
+            target=self._publish_loop, name='camera_publish', daemon=True)
 
-        self._timer = self.create_timer(1.0 / self._fps, self._publish_cb)
+        self._cap_thread.start()
+        self._pub_thread.start()
+
+        # Stats every 5 s — instant visibility into achieved fps (Team2 pattern).
+        self.create_timer(5.0, self._log_stats)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -174,7 +200,7 @@ class CameraRawPublisher(Node):
             f'video/x-raw, width={self._out_w}, height={self._out_h}, format=BGRx ! '
             f'videoconvert ! '
             f'video/x-raw, format=BGR ! '
-            f'appsink drop=true max-buffers=2 sync=false'
+            f'appsink drop=true max-buffers=1 sync=false'
         )
 
     # ── Background capture loop ───────────────────────────────────────────────
@@ -188,9 +214,11 @@ class CameraRawPublisher(Node):
                 if self._color_gains is not None:
                     frame = (frame.astype(np.float32) * self._color_gains).clip(0, 255).astype(np.uint8)
                 stamp = self.get_clock().now().to_msg()
-                with self._lock:
-                    self._latest_frame = frame
-                    self._latest_stamp = stamp
+                with self._slot_cv:
+                    self._slot = (stamp, frame)
+                    self._slot_seq += 1
+                    self._slot_cv.notify_all()   # wake the publish thread
+                self._cap_frames += 1
             else:
                 self._consecutive_failures += 1
                 self.get_logger().warning(
@@ -201,6 +229,8 @@ class CameraRawPublisher(Node):
                             f'Camera failed after {self._MAX_RECONNECT_ATTEMPTS} '
                             'reconnect attempts. Shutting down.')
                         self._capture_thread_running = False
+                        with self._slot_cv:
+                            self._slot_cv.notify_all()
                         rclpy.shutdown()
                         return
                     self._reconnect_attempts += 1
@@ -219,43 +249,76 @@ class CameraRawPublisher(Node):
                         self.get_logger().error('Reconnect failed — will retry.')
         self.get_logger().info('Capture thread exiting.')
 
-    # ── Publish callback ──────────────────────────────────────────────────────
+    # ── Dedicated publish loop (Team2 pattern) ────────────────────────────────
 
-    def _publish_cb(self):
-        with self._lock:
-            frame = self._latest_frame
-            stamp = self._latest_stamp
+    def _publish_loop(self):
+        """Publish thread — wakes on each new captured frame via Condition.
 
-        if frame is None:
-            return
+        cv2 and rclpy publish both release the GIL, so this thread can run on
+        a separate core while the capture thread continues uninterrupted.
+        The array.array fast-path avoids rclpy's byte-by-byte isinstance loop.
+        """
+        self.get_logger().info('Publish thread started.')
+        while self._capture_thread_running:
+            # Block until there is a frame we haven't published yet.
+            with self._slot_cv:
+                while (self._capture_thread_running
+                       and self._slot_seq == self._pub_seq):
+                    self._slot_cv.wait(timeout=1.0)
+                if not self._capture_thread_running:
+                    break
+                self._pub_seq = self._slot_seq
+                stamp, frame = self._slot   # grab reference under lock
 
-        self._frame_count += 1
+            # Build and publish outside the lock.
+            h, w, c = frame.shape
+            msg = Image()
+            msg.header.stamp    = stamp
+            msg.header.frame_id = self._frame_id
+            msg.height     = h
+            msg.width      = w
+            msg.encoding   = 'bgr8'
+            msg.is_bigendian = 0
+            msg.step       = w * c
+            # array.array activates rclpy's buffer fast-path — avoids the
+            # per-byte isinstance loop that takes ~108 ms for 320×240.
+            msg.data = array.array('B', frame.tobytes())
+            self._pub_raw.publish(msg)
 
-        h, w, c = frame.shape
-        msg = Image()
-        msg.header.stamp = stamp
-        msg.header.frame_id = self._frame_id
-        msg.height = h
-        msg.width = w
-        msg.encoding = 'bgr8'
-        msg.is_bigendian = 0
-        msg.step = w * c
-        msg.data = frame.tobytes()
-        self._pub_raw.publish(msg)
+            if self._pub_camera_info is not None and self._camera_info_msg is not None:
+                self._camera_info_msg.header.stamp = stamp
+                self._pub_camera_info.publish(self._camera_info_msg)
 
-        if self._pub_camera_info is not None and self._camera_info_msg is not None:
-            self._camera_info_msg.header.stamp = stamp
-            self._pub_camera_info.publish(self._camera_info_msg)
+            self._pub_frames += 1
+
+        self.get_logger().info('Publish thread exiting.')
+
+    # ── FPS statistics (Team2 pattern) ────────────────────────────────────────
+
+    def _log_stats(self):
+        now = self.get_clock().now()
+        dt  = (now - self._t_stats).nanoseconds * 1e-9
+        if dt > 0:
+            self.get_logger().info(
+                f'camera: cap={self._cap_frames / dt:.1f}  '
+                f'pub={self._pub_frames / dt:.1f} fps')
+        self._cap_frames = self._pub_frames = 0
+        self._t_stats = now
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
 
     def destroy_node(self):
         self._capture_thread_running = False
-        if hasattr(self, '_cap_thread') and self._cap_thread.is_alive():
-            self._cap_thread.join(timeout=2.0)
+        # Wake both threads so they can exit their wait loops.
+        with self._slot_cv:
+            self._slot_cv.notify_all()
+        for t in (getattr(self, '_cap_thread', None),
+                  getattr(self, '_pub_thread', None)):
+            if t is not None and t.is_alive():
+                t.join(timeout=2.0)
         if hasattr(self, '_cap') and self._cap.isOpened():
             self._cap.release()
-            self.get_logger().info(f'Camera released after {self._frame_count} frames.')
+            self.get_logger().info(f'Camera released after {self._pub_frames} published frames.')
         super().destroy_node()
 
 

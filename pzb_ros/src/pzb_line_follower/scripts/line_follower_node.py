@@ -3,7 +3,7 @@
 Line follower node for Puzzlebot.
 
 Subscribes:
-  /camera/image_raw         (sensor_msgs/Image)        raw 1280×720 BGR; node crops bottom 1/3
+  /camera/image_raw         (sensor_msgs/Image)        raw BGR; node crops bottom 1/3
   /traffic_speed_scale      (std_msgs/Float32)   speed multiplier from traffic FSM
 
 Publishes:
@@ -11,8 +11,11 @@ Publishes:
   /line_follower/error        (std_msgs/Float32)  error from image center (px)
   /line_follower/line_type    (std_msgs/String)   "solid" | "dashed"
   /line_follower/debug_image  (sensor_msgs/Image) pipeline debug visualization
-  /cmd_vel_desired            (geometry_msgs/Twist)
+  /cmd_vel_desired_raw        (geometry_msgs/Twist)  — published at fixed 20 Hz timer
+                                                        (Team2 pattern: decoupled from camera FPS)
 """
+
+import time
 
 import numpy as np
 import cv2
@@ -63,6 +66,8 @@ class LineFollowerNode(Node):
         self.declare_parameter('topic_cmd_vel',        '/cmd_vel_desired_raw')
         self.declare_parameter('sharp_turn_threshold_px', 80)
         self.declare_parameter('sharp_turn_speed',        0.03)
+        self.declare_parameter('lost_timeout_s',          0.25)
+        self.declare_parameter('lost_speed_scale',        0.50)
 
         self._img_w               = self.get_parameter('image_width').value
         self._img_h               = self.get_parameter('image_height').value
@@ -78,12 +83,27 @@ class LineFollowerNode(Node):
         self._pub_debug           = bool(self.get_parameter('publish_debug').value)
         self._sharp_turn_threshold = int(self.get_parameter('sharp_turn_threshold_px').value)
         self._sharp_turn_speed    = float(self.get_parameter('sharp_turn_speed').value)
+        self._lost_timeout_s      = float(self.get_parameter('lost_timeout_s').value)
+        self._lost_speed_scale    = float(self.get_parameter('lost_speed_scale').value)
 
         topic_in  = self.get_parameter('topic_image_in').value
         topic_cmd = self.get_parameter('topic_cmd_vel').value
 
-        self._prev_error  = 0.0
+        # Use all 4 Jetson Nano cores for OpenCV (Team2 technique).
+        cv2.setNumThreads(4)
+
+        # D-term state: use actual elapsed time in seconds (Team2 pattern) so the
+        # derivative is FPS-invariant instead of "change per frame".
+        self._prev_error   = 0.0
+        self._prev_error_t = None   # monotonic timestamp of last image callback
+
         self._speed_scale = 1.0
+
+        # Decoupled cmd_vel: store the latest command; a 20 Hz timer publishes it.
+        # This keeps the control loop running even if the camera briefly drops frames.
+        self._latest_cmd    = Twist()
+        self._last_valid_cmd = Twist()
+        self._last_valid_t   = None   # monotonic timestamp of last frame where cx was valid
 
         self._detector = CenterLineDetector(debug=self._pub_debug)
 
@@ -94,11 +114,14 @@ class LineFollowerNode(Node):
         self._pub_cmd       = self.create_publisher(Twist,   topic_cmd,                   _RELIABLE_QOS)
         self._pub_debug_img = self.create_publisher(Image,   '/line_follower/debug_image', _RELIABLE_QOS)
 
-        # Subscriber — raw Image; BEST_EFFORT is compatible with the RELIABLE raw publisher
+        # Subscriber — raw Image; BEST_EFFORT matches camera publisher
         self.create_subscription(Image, topic_in, self._image_cb, _BEST_EFFORT_QOS)
 
-        # Traffic speed scale (optional — defaults to 1.0 if topic never published)
+        # Traffic speed scale (optional — defaults to 1.0 if never published)
         self.create_subscription(Float32, '/traffic_speed_scale', self._cb_speed_scale, _RELIABLE_QOS)
+
+        # 20 Hz cmd_vel publish timer — decoupled from camera FPS (Team2 pattern).
+        self.create_timer(1.0 / 20.0, self._cmd_publish_cb)
 
         self.get_logger().info(
             f'Line follower ready  img={self._img_w}x{self._img_h}'
@@ -112,83 +135,128 @@ class LineFollowerNode(Node):
         # Decode raw BGR image — zero-copy view into msg.data
         full = np.frombuffer(msg.data, np.uint8).reshape(msg.height, msg.width, 3)
 
-        # Crop bottom third (the only region the detector uses) then downscale to 320×80.
-        # INTER_AREA is optimal for integer-ratio downsampling (1280→320 = 4×, 240→80 = 3×).
+        # Crop bottom third — the only region the detector uses.
+        # If the camera already publishes at 320×240 (out_w×out_h via nvvidconv),
+        # roi_crop is already 80×320 and the resize below is a no-op; skip it to
+        # avoid a wasteful 230 KB allocation on every frame.
         roi_crop = full[msg.height * 2 // 3 :, :]
-        img = cv2.resize(roi_crop, (self._img_w, self._img_h // 3), interpolation=cv2.INTER_AREA)
+        target_h = self._img_h // 3
+        target_w = self._img_w
+        if roi_crop.shape[0] != target_h or roi_crop.shape[1] != target_w:
+            img = cv2.resize(roi_crop, (target_w, target_h), interpolation=cv2.INTER_AREA)
+        else:
+            img = np.ascontiguousarray(roi_crop)
 
         cx, cy = self._detector.detect_center_line(img, pre_cropped=True)
         line_type = self._detector.line_type
 
-        error   = float(cx - self._img_w // 2)
-        d_error = error - self._prev_error
-        self._prev_error = error
+        # True loss: all three line slots have no detection this frame.
+        # The detector's line_flags dict is True per slot when a real contour was assigned.
+        line_lost = not any(self._detector.line_flags.values())
 
-        # PD steering — D term damps oscillation; Kd=0 reduces to pure P
-        if line_type == 'dashed' or abs(error) <= self._dead_band:
-            angular_z = 0.0
+        now = time.monotonic()
+
+        if line_lost:
+            # Coast: hold last valid command at reduced speed for up to lost_timeout_s.
+            if (self._last_valid_t is not None
+                    and (now - self._last_valid_t) < self._lost_timeout_s):
+                cmd = Twist()
+                cmd.linear.x  = self._last_valid_cmd.linear.x * self._lost_speed_scale
+                cmd.angular.z = self._last_valid_cmd.angular.z
+            else:
+                cmd = Twist()   # timeout — full stop
+            self._latest_cmd = cmd
+
+            # Still publish detections so monitors can see the loss
+            cx_msg = Int32();  cx_msg.data = cx
+            self._pub_cx.publish(cx_msg)
+            err_msg = Float32();  err_msg.data = float(cx - self._img_w // 2)
+            self._pub_error.publish(err_msg)
+            type_msg = String();  type_msg.data = line_type
+            self._pub_line_type.publish(type_msg)
         else:
-            angular_z = float(np.clip(
-                -self._kp * error - self._kd * d_error,
-                -self._max_ang, self._max_ang,
-            ))
+            self._last_valid_t = now
 
-        # Curve-coupled speed reduction (mirrors waypoint_follower's cos(alpha) factor)
-        if self._max_ang > 0:
-            angular_fraction  = abs(angular_z) / self._max_ang
-        else:
-            angular_fraction  = 0.0
-        speed_scale_curve = 1.0 - self._curve_reduction * angular_fraction
-        min_frac  = self._min_lin_speed / self._linear_speed if self._linear_speed > 0 else 0.0
-        linear_x  = min(self._max_lin_speed,
-                        self._linear_speed * max(min_frac, speed_scale_curve))
+            error = float(cx - self._img_w // 2)
 
-        # Sharp-turn override: large lateral error → almost stop and spin to complete the turn
-        if abs(error) > self._sharp_turn_threshold:
-            linear_x = self._sharp_turn_speed
+            # Time-based D-term (Team2 pattern): divide by actual dt in seconds so the
+            # derivative gain is FPS-invariant.  At 30 fps, dt≈33 ms; at 5 fps, dt≈200 ms.
+            if self._prev_error_t is not None and self._kd != 0.0:
+                dt = now - self._prev_error_t
+                d_error = (error - self._prev_error) / dt if dt > 0 else 0.0
+            else:
+                d_error = 0.0
+            self._prev_error   = error
+            self._prev_error_t = now
 
-        # Dashed-line stop takes priority, then traffic scale
-        if self._stop_dashed and line_type == 'dashed':
-            linear_x = 0.0
-        elif self._speed_scale <= 0.0:
-            linear_x = 0.0
-        else:
-            linear_x *= self._speed_scale
+            # PD steering
+            if line_type == 'dashed' or abs(error) <= self._dead_band:
+                angular_z = 0.0
+            else:
+                angular_z = float(np.clip(
+                    -self._kp * error - self._kd * d_error,
+                    -self._max_ang, self._max_ang,
+                ))
 
-        # Publish detections
-        cx_msg = Int32()
-        cx_msg.data = cx
-        self._pub_cx.publish(cx_msg)
+            # Curve-coupled speed reduction
+            if self._max_ang > 0:
+                angular_fraction = abs(angular_z) / self._max_ang
+            else:
+                angular_fraction = 0.0
+            speed_scale_curve = 1.0 - self._curve_reduction * angular_fraction
+            min_frac  = self._min_lin_speed / self._linear_speed if self._linear_speed > 0 else 0.0
+            linear_x  = min(self._max_lin_speed,
+                            self._linear_speed * max(min_frac, speed_scale_curve))
 
-        err_msg = Float32()
-        err_msg.data = error
-        self._pub_error.publish(err_msg)
+            # Sharp-turn override
+            if abs(error) > self._sharp_turn_threshold:
+                linear_x = self._sharp_turn_speed
 
-        type_msg = String()
-        type_msg.data = line_type
-        self._pub_line_type.publish(type_msg)
+            # Dashed-line stop takes priority, then traffic scale
+            if self._stop_dashed and line_type == 'dashed':
+                linear_x = 0.0
+            elif self._speed_scale <= 0.0:
+                linear_x = 0.0
+            else:
+                linear_x *= self._speed_scale
 
-        # Publish velocity command
-        cmd = Twist()
-        cmd.linear.x  = linear_x
-        cmd.angular.z = angular_z
-        self._pub_cmd.publish(cmd)
+            # Publish detections
+            cx_msg = Int32();  cx_msg.data = cx
+            self._pub_cx.publish(cx_msg)
+            err_msg = Float32();  err_msg.data = error
+            self._pub_error.publish(err_msg)
+            type_msg = String();  type_msg.data = line_type
+            self._pub_line_type.publish(type_msg)
 
-        # Publish debug image if available
+            # Store latest command — the 20 Hz timer actually publishes it.
+            cmd = Twist()
+            cmd.linear.x  = linear_x
+            cmd.angular.z = angular_z
+            self._last_valid_cmd = cmd
+            self._latest_cmd     = cmd
+
+        # Debug image
         if self._pub_debug and self._detector.debug_frame is not None:
             dbg = self._detector.debug_frame
             dh, dw = dbg.shape[:2]
             dbg_msg = Image()
-            dbg_msg.header.stamp = msg.header.stamp
+            dbg_msg.header.stamp    = msg.header.stamp
             dbg_msg.header.frame_id = msg.header.frame_id
-            dbg_msg.height = dh
-            dbg_msg.width  = dw
+            dbg_msg.height   = dh
+            dbg_msg.width    = dw
             dbg_msg.encoding = 'bgr8'
             dbg_msg.is_bigendian = 0
             dbg_msg.step = dw * 3
             dbg_msg.data = dbg.tobytes()
             self._pub_debug_img.publish(dbg_msg)
 
+    def _cmd_publish_cb(self):
+        """20 Hz timer — publishes the last computed command.
+
+        Decoupled from image callbacks (Team2 pattern): the wheels keep receiving
+        a steady command even when the camera briefly drops frames.
+        """
+        self._pub_cmd.publish(self._latest_cmd)
 
     def _cb_speed_scale(self, msg: Float32):
         self._speed_scale = float(msg.data)

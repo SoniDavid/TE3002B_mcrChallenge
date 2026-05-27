@@ -37,7 +37,12 @@ line_follower_node:
 
     # Publish pipeline debug visualization on /line_follower/debug_image
     # Set to true only during tuning sessions — generates 7-tile image every frame
-    publish_debug: false
+    publish_debug: true
+
+    # Loss coasting: when all 3 line slots are lost, hold last command at reduced speed
+    # for up to lost_timeout_s before stopping (Team2 pattern: lost_timeout_s=0.3)
+    lost_timeout_s:   0.25
+    lost_speed_scale: 0.50
 
     # Input and output topic names
     # topic_cmd_vel feeds twist_slew_limiter; slew limiter outputs to /cmd_vel_desired

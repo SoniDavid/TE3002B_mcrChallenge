@@ -72,6 +72,10 @@ class ColorDetectorNode(Node):
         self._candidate_count = 0        # consecutive frames of candidate
         self._confirmed_color = 'none'   # last published color
 
+        # Frame-skip counter: traffic lights change slowly — process every 3rd frame
+        # to save ~67% of this node's CPU share on the Jetson Nano.
+        self._frame_skip = 0
+
         self._morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
@@ -174,6 +178,12 @@ class ColorDetectorNode(Node):
     # ------------------------------------------------------------------ callback
 
     def _image_callback(self, msg: Image):
+        # Process every 3rd frame only — traffic lights don't change at 30 Hz.
+        # Saves ~67% of this node's CPU share while keeping ≈10 Hz detection rate.
+        self._frame_skip = (self._frame_skip + 1) % 3
+        if self._frame_skip != 0:
+            return
+
         # Decode raw BGR — zero-copy view then crop to top 2/3 (traffic lights are never on the floor)
         full  = np.frombuffer(msg.data, np.uint8).reshape(msg.height, msg.width, 3)
         frame = cv2.resize(full[:msg.height * 2 // 3, :], (320, 160), interpolation=cv2.INTER_AREA)

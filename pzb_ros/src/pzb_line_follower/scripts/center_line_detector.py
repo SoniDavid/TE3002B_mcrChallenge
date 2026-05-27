@@ -1,3 +1,4 @@
+import time
 from collections import deque
 from itertools import combinations
 import numpy as np
@@ -42,16 +43,20 @@ class CenterLineDetector:
     MEDIAN_K        = 3     # median filter window (frames)
 
     # ── 3-line tracker ────────────────────────────────────────────────────────
-    LINE_MAX_JUMP  = 70     # px — max allowed movement per line per frame
+    # Rate-invariant velocity gate: max px/s = 70 px/frame × 30 fps.
+    # At 30 fps → 70 px/frame; at 5 fps → 420 px/frame — adapts automatically.
+    LINE_MAX_JUMP_PS = 2100  # px/s  (replaces fixed LINE_MAX_JUMP = 70)
     LINE_MIN_SEP   = 15     # px — post-assignment order enforcement gap
     TRACK_MIN_SEP  = 40     # px — minimum gap enforced *during* triplet/pair search
     STALE_THRESH   = 15     # frames lost before clearing a line's anchor
 
     # ── intersection detection ────────────────────────────────────────────────
-    DASH_MIN_COUNT  = 3
-    DASH_MAX_AREA   = 2000  # px² — max area per contour for dashed classification
-    DASH_MAX_HEIGHT = 40    # px  — contours taller than this are solid lines, not dashes
-    DASH_MIN_SPAN   = 0.50  # fraction of image width
+    # Relaxed from original (3, 2000, 40, 0.50) to handle this track's dash geometry:
+    # fewer dashes visible in the bottom-80 px ROI, and some are wider than 2000 px².
+    DASH_MIN_COUNT  = 2
+    DASH_MAX_AREA   = 3500  # px² — max area per contour for dashed classification
+    DASH_MAX_HEIGHT = 50    # px  — contours taller than this are solid lines, not dashes
+    DASH_MIN_SPAN   = 0.35  # fraction of image width
 
     # ── exit scanning (HSV track surface) ────────────────────────────────────
     EXIT_TRACK_RATIO = 0.15
@@ -110,6 +115,10 @@ class CenterLineDetector:
         # Persistent adaptive threshold state
         self._T_state = self.ADAPTIVE_T_INIT
 
+        # Time-based velocity gate: tracks wall-clock time of last detect call
+        # so the max-jump limit adapts to the actual frame interval.
+        self._last_detect_t = None
+
     # ── main entry point ──────────────────────────────────────────────────────
 
     def detect_center_line(self, image, pre_cropped=False):
@@ -149,11 +158,19 @@ class CenterLineDetector:
         valid          = self._valid_contours(contours)
         self.line_type = self._classify_line(valid, w)
 
+        # Compute time-based velocity gate (Team2 pattern): pixels/s × dt_seconds.
+        # This makes the gate FPS-invariant: 2100 px/s ÷ 30 fps = 70 px/frame,
+        # 2100 px/s ÷ 5.7 fps = 368 px/frame — valid turns are no longer rejected.
+        _now = time.monotonic()
+        _dt  = (_now - self._last_detect_t) if self._last_detect_t is not None else 1.0 / 30.0
+        self._last_detect_t = _now
+        _max_jump = self.LINE_MAX_JUMP_PS * _dt
+
         if self.line_type == "dashed":
             cx, cy = self._fuse_dashes(valid, y_start, roi_h)
             self.exits = []
         else:
-            cx, cy     = self._track_three_lines(valid, w, roi_h, y_start)
+            cx, cy     = self._track_three_lines(valid, w, roi_h, y_start, _max_jump)
             self.exits = []
 
         # Brown lane-interior constraint: detect lane centroid and blend cx if needed
@@ -388,7 +405,7 @@ class CenterLineDetector:
 
         return best
 
-    def _track_three_lines(self, valid, w, h, y_start):
+    def _track_three_lines(self, valid, w, h, y_start, max_jump):
         """
         Track all three lines via minimum-cost assignment to prev anchors.
 
@@ -409,7 +426,7 @@ class CenterLineDetector:
 
             if new_cx is None:
                 self.line_flags[name] = False
-            elif prev is not None and abs(new_cx - prev) > self.LINE_MAX_JUMP:
+            elif prev is not None and abs(new_cx - prev) > max_jump:
                 self.line_flags[name] = False
             else:
                 self._line_history[name].append(new_cx)
