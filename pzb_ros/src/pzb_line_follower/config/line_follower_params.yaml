@@ -41,8 +41,19 @@ line_follower_node:
 
     # Loss coasting: when all 3 line slots are lost, hold last command at reduced speed
     # for up to lost_timeout_s before stopping (Team2 pattern: lost_timeout_s=0.3)
-    lost_timeout_s:   0.25
+    lost_timeout_s:   0.35
     lost_speed_scale: 0.50
+
+    # Sharp-turn override: when |error| exceeds threshold, clamp speed to sharp_turn_speed.
+    # Also used as the floor speed when fewer than 2 lines are visible (intersection handling).
+    sharp_turn_threshold_px: 60
+    sharp_turn_speed: 0.02
+
+    # Dashed-line tilt correction gain (rad/s per unit Δy/Δx slope).
+    # When dashes appear at a slope in the ROI the robot applies this correction to rotate
+    # until the dashes are horizontal (robot perpendicular to the crossing line).
+    # Tune on hardware: start at 0.15, increase if slow to align, decrease if oscillates.
+    kp_dash_tilt: 0.15
 
     # Input and output topic names
     # topic_cmd_vel feeds twist_slew_limiter; slew limiter outputs to /cmd_vel_desired

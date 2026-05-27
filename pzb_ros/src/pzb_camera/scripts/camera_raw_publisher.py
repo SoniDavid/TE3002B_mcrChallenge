@@ -89,8 +89,15 @@ class CameraRawPublisher(Node):
         if cal_file:
             try:
                 cal = np.load(cal_file)
-                self._color_gains = cal['arr_0'].astype(np.float32)
-                self.get_logger().info(f'Color calibration loaded: {cal_file}')
+                gains = cal['arr_0'].astype(np.float32)
+                self.get_logger().info(
+                    f'Color calibration loaded: shape={gains.shape}, file={cal_file}')
+                if gains.ndim == 3 and gains.shape != (self._out_h, self._out_w, 3):
+                    self.get_logger().warning(
+                        f'color_gains shape {gains.shape} != frame shape '
+                        f'({self._out_h},{self._out_w},3) — disabling color correction')
+                    gains = None
+                self._color_gains = gains
             except Exception as e:
                 self.get_logger().warning(f'Could not load color_cal_file "{cal_file}": {e}')
 
@@ -212,7 +219,11 @@ class CameraRawPublisher(Node):
             if ret:
                 self._consecutive_failures = 0
                 if self._color_gains is not None:
-                    frame = (frame.astype(np.float32) * self._color_gains).clip(0, 255).astype(np.uint8)
+                    try:
+                        frame = (frame.astype(np.float32) * self._color_gains).clip(0, 255).astype(np.uint8)
+                    except Exception as e:
+                        self.get_logger().warning(f'Color correction failed: {e} — disabling')
+                        self._color_gains = None
                 stamp = self.get_clock().now().to_msg()
                 with self._slot_cv:
                     self._slot = (stamp, frame)

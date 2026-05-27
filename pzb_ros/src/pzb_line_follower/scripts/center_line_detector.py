@@ -104,9 +104,10 @@ class CenterLineDetector:
         self._line_lost_frames = {'left': 0, 'center': 0, 'right': 0}
 
         # Intersection / exit state
-        self.line_type  = "solid"
-        self.exits      = []
-        self._exit_mask = None
+        self.line_type     = "solid"
+        self.exits         = []
+        self._exit_mask    = None
+        self.dash_slope_px = 0.0  # Δy/Δx of dash centroids; 0 = horizontal (aligned)
 
         # Brown lane-interior constraint state
         self.lane_cx         = None   # centroid x of lane interior, or None
@@ -295,6 +296,7 @@ class CenterLineDetector:
 
     def _fuse_dashes(self, valid, y_start, h):
         if not valid:
+            self.dash_slope_px = 0.0
             cx = int(round(self.prev_cx)) if self.prev_cx is not None \
                  else self.cameraWidth // 2
             return cx, y_start + (h - y_start) // 2
@@ -302,6 +304,23 @@ class CenterLineDetector:
         total    = sum(areas) or 1.0
         fused_cx = sum(v[0] * a for v, a in zip(valid, areas)) / total
         fused_cy = sum(v[1] * a for v, a in zip(valid, areas)) / total
+
+        # Compute slope of dash centroids: 0 = horizontal (robot perpendicular to dashes).
+        # Sort by x so slope is always left-to-right.
+        if len(valid) >= 2:
+            xs = [v[0] for v in valid]
+            ys = [v[1] for v in valid]
+            x_span = max(xs) - min(xs)
+            if x_span > 1:
+                # weighted linear regression for robustness with >2 dashes
+                y_at_xmin = ys[xs.index(min(xs))]
+                y_at_xmax = ys[xs.index(max(xs))]
+                self.dash_slope_px = float((y_at_xmax - y_at_xmin) / x_span)
+            else:
+                self.dash_slope_px = 0.0
+        else:
+            self.dash_slope_px = 0.0
+
         return int(round(fused_cx)), y_start + int(round(fused_cy))
 
     def _scan_exits(self, image, y_start):

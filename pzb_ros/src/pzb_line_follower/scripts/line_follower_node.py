@@ -15,6 +15,7 @@ Publishes:
                                                         (Team2 pattern: decoupled from camera FPS)
 """
 
+import array
 import time
 
 import numpy as np
@@ -68,6 +69,7 @@ class LineFollowerNode(Node):
         self.declare_parameter('sharp_turn_speed',        0.03)
         self.declare_parameter('lost_timeout_s',          0.25)
         self.declare_parameter('lost_speed_scale',        0.50)
+        self.declare_parameter('kp_dash_tilt',            0.15)
 
         self._img_w               = self.get_parameter('image_width').value
         self._img_h               = self.get_parameter('image_height').value
@@ -85,6 +87,7 @@ class LineFollowerNode(Node):
         self._sharp_turn_speed    = float(self.get_parameter('sharp_turn_speed').value)
         self._lost_timeout_s      = float(self.get_parameter('lost_timeout_s').value)
         self._lost_speed_scale    = float(self.get_parameter('lost_speed_scale').value)
+        self._kp_dash_tilt        = float(self.get_parameter('kp_dash_tilt').value)
 
         topic_in  = self.get_parameter('topic_image_in').value
         topic_cmd = self.get_parameter('topic_cmd_vel').value
@@ -135,11 +138,13 @@ class LineFollowerNode(Node):
         # Decode raw BGR image — zero-copy view into msg.data
         full = np.frombuffer(msg.data, np.uint8).reshape(msg.height, msg.width, 3)
 
-        # Crop bottom third — the only region the detector uses.
-        # If the camera already publishes at 320×240 (out_w×out_h via nvvidconv),
-        # roi_crop is already 80×320 and the resize below is a no-op; skip it to
-        # avoid a wasteful 230 KB allocation on every frame.
-        roi_crop = full[msg.height * 2 // 3 :, :]
+        # Adaptive ROI: use bottom half when fewer than 2 lines were visible last frame
+        # (lines may have migrated upward during a sharp turn).  Revert to bottom third
+        # once all lines are reliably tracked again.
+        n_prev_visible = sum(self._detector.line_flags.values())
+        roi_start = msg.height // 2 if n_prev_visible < 2 else msg.height * 2 // 3
+        roi_crop = full[roi_start:, :]
+
         target_h = self._img_h // 3
         target_w = self._img_w
         if roi_crop.shape[0] != target_h or roi_crop.shape[1] != target_w:
@@ -189,14 +194,22 @@ class LineFollowerNode(Node):
             self._prev_error   = error
             self._prev_error_t = now
 
-            # PD steering
-            if line_type == 'dashed' or abs(error) <= self._dead_band:
+            # PD steering — dead-band only suppresses; dashed uses PD + tilt correction
+            if abs(error) <= self._dead_band:
                 angular_z = 0.0
             else:
                 angular_z = float(np.clip(
                     -self._kp * error - self._kd * d_error,
                     -self._max_ang, self._max_ang,
                 ))
+                if line_type == 'dashed':
+                    # Also correct for rotational misalignment: dash_slope_px=0 means
+                    # dashes are horizontal (robot is perpendicular to the crossing line).
+                    tilt = getattr(self._detector, 'dash_slope_px', 0.0)
+                    angular_z = float(np.clip(
+                        angular_z - self._kp_dash_tilt * tilt,
+                        -self._max_ang, self._max_ang,
+                    ))
 
             # Curve-coupled speed reduction
             if self._max_ang > 0:
@@ -208,7 +221,14 @@ class LineFollowerNode(Node):
             linear_x  = min(self._max_lin_speed,
                             self._linear_speed * max(min_frac, speed_scale_curve))
 
-            # Sharp-turn override
+            # Visibility-based speed reduction: fewer visible lines → slower
+            n_vis = sum(self._detector.line_flags.values())
+            if n_vis == 2:
+                linear_x = min(linear_x, self._linear_speed * 0.6)
+            elif n_vis <= 1:
+                linear_x = self._sharp_turn_speed
+
+            # Sharp-turn override (error magnitude) — can only further reduce speed
             if abs(error) > self._sharp_turn_threshold:
                 linear_x = self._sharp_turn_speed
 
@@ -247,7 +267,7 @@ class LineFollowerNode(Node):
             dbg_msg.encoding = 'bgr8'
             dbg_msg.is_bigendian = 0
             dbg_msg.step = dw * 3
-            dbg_msg.data = dbg.tobytes()
+            dbg_msg.data = array.array('B', dbg.tobytes())
             self._pub_debug_img.publish(dbg_msg)
 
     def _cmd_publish_cb(self):
