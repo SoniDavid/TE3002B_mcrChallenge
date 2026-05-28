@@ -53,7 +53,7 @@ def generate_launch_description():
                               description='Derivative steering gain (rad/s per px/frame); 0 disables'),
         DeclareLaunchArgument('dead_band_px',  default_value='8',
                               description='Pixel dead band for steering'),
-        DeclareLaunchArgument('stop_on_dashed', default_value='true',
+        DeclareLaunchArgument('stop_on_dashed', default_value='false',
                               description='Stop linear motion at intersections'),
         DeclareLaunchArgument('publish_debug', default_value='false',
                               description='Publish debug image topic'),

@@ -41,6 +41,7 @@ class CenterLineDetector:
     SAMPLE_OFFSET   = 28    # px — bilateral brightness sample distance
     BRIGHT_THR      = 120   # grayscale threshold for "bright" track surface
     MEDIAN_K        = 3     # median filter window (frames)
+    BLUE_LINE_THRESH= 130   # mean blue channel above this → mat boundary tape, not a track line
 
     # ── 3-line tracker ────────────────────────────────────────────────────────
     # Rate-invariant velocity gate: max px/s = 70 px/frame × 30 fps.
@@ -144,15 +145,6 @@ class CenterLineDetector:
         gray    = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 1.4)
         binary  = self._adaptive_threshold(blurred)
-
-        # Exclude blue mat boundary so it is not mistaken for a black line.
-        # Blue tape: H∈[100,135], S>60, V>50 in HSV.
-        _hsv  = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        _blue = cv2.inRange(_hsv,
-                            np.array([100, 60, 50],  np.uint8),
-                            np.array([135, 255, 255], np.uint8))
-        binary = cv2.bitwise_and(binary, cv2.bitwise_not(_blue))
-
         k3      = np.ones((3, 3), np.uint8)
         k5      = np.ones((5, 5), np.uint8)
         opened  = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  k3)
@@ -165,7 +157,7 @@ class CenterLineDetector:
         roi_h = roi.shape[0]
 
         # S7: classify → track
-        valid = self._valid_contours(contours)
+        valid = self._valid_contours(contours, roi)
 
         # Near-ROI filter for dashed detection: only consider contours in the lower
         # 55% of the ROI (y >= roi_h * 0.45). This prevents far dashes on the
@@ -274,8 +266,14 @@ class CenterLineDetector:
 
     # ── contour helpers ───────────────────────────────────────────────────────
 
-    def _valid_contours(self, contours):
-        """Return [(cx_f, cy_f, area, cnt)] sorted by x, MIN_AREA ≤ area ≤ MAX_AREA."""
+    def _valid_contours(self, contours, roi_bgr=None):
+        """Return [(cx_f, cy_f, area, cnt)] sorted by x, MIN_AREA ≤ area ≤ MAX_AREA.
+
+        roi_bgr: original BGR ROI used for per-contour blue-channel check.
+        Contours whose bounding-box mean blue channel exceeds BLUE_LINE_THRESH are
+        rejected as mat-boundary tape (physical blue pigment → B≈255 after correction;
+        track-line ink stays B≈40–66 regardless of the ×1.65 blue-channel gain).
+        """
         valid = []
         for cnt in contours:
             area = cv2.contourArea(cnt)
@@ -284,6 +282,11 @@ class CenterLineDetector:
             M = cv2.moments(cnt)
             if M['m00'] == 0:
                 continue
+            if roi_bgr is not None:
+                x, y, bw, bh = cv2.boundingRect(cnt)
+                patch_b = roi_bgr[y:y + bh, x:x + bw, 2]   # blue channel
+                if patch_b.size > 0 and float(patch_b.mean()) > self.BLUE_LINE_THRESH:
+                    continue
             valid.append((M['m10'] / M['m00'], M['m01'] / M['m00'], area, cnt))
         valid.sort(key=lambda v: v[0])
         return valid
