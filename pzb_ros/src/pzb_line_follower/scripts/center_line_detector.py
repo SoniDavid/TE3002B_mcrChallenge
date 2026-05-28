@@ -144,6 +144,15 @@ class CenterLineDetector:
         gray    = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 1.4)
         binary  = self._adaptive_threshold(blurred)
+
+        # Exclude blue mat boundary so it is not mistaken for a black line.
+        # Blue tape: H∈[100,135], S>60, V>50 in HSV.
+        _hsv  = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        _blue = cv2.inRange(_hsv,
+                            np.array([100, 60, 50],  np.uint8),
+                            np.array([135, 255, 255], np.uint8))
+        binary = cv2.bitwise_and(binary, cv2.bitwise_not(_blue))
+
         k3      = np.ones((3, 3), np.uint8)
         k5      = np.ones((5, 5), np.uint8)
         opened  = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  k3)
@@ -156,8 +165,15 @@ class CenterLineDetector:
         roi_h = roi.shape[0]
 
         # S7: classify → track
-        valid          = self._valid_contours(contours)
-        self.line_type = self._classify_line(valid, w)
+        valid = self._valid_contours(contours)
+
+        # Near-ROI filter for dashed detection: only consider contours in the lower
+        # 55% of the ROI (y >= roi_h * 0.45). This prevents far dashes on the
+        # opposite side of a square intersection from triggering a false "dashed"
+        # classification and from skewing dash_slope_px toward the wrong row.
+        # Solid-line tracking (_track_three_lines) still uses all valid contours.
+        _near = [v for v in valid if v[1] >= roi_h * 0.45]
+        self.line_type = self._classify_line(_near, w)
 
         # Compute time-based velocity gate (Team2 pattern): pixels/s × dt_seconds.
         # This makes the gate FPS-invariant: 2100 px/s ÷ 30 fps = 70 px/frame,
@@ -168,7 +184,7 @@ class CenterLineDetector:
         _max_jump = self.LINE_MAX_JUMP_PS * _dt
 
         if self.line_type == "dashed":
-            cx, cy = self._fuse_dashes(valid, y_start, roi_h)
+            cx, cy = self._fuse_dashes(_near, y_start, roi_h)
             self.exits = []
         else:
             cx, cy     = self._track_three_lines(valid, w, roi_h, y_start, _max_jump)
