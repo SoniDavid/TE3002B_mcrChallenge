@@ -55,7 +55,7 @@ class CenterLineDetector:
     # fewer dashes visible in the bottom-80 px ROI, and some are wider than 2000 px².
     DASH_MIN_COUNT  = 2
     DASH_MAX_AREA   = 3500  # px² — max area per contour for dashed classification
-    DASH_MAX_HEIGHT = 50    # px  — contours taller than this are solid lines, not dashes
+    DASH_MAX_HEIGHT = 35    # px  — contours taller than this are solid lines, not dashes
     DASH_MIN_SPAN   = 0.35  # fraction of image width
 
     # ── exit scanning (HSV track surface) ────────────────────────────────────
@@ -280,13 +280,14 @@ class CenterLineDetector:
         areas = [v[2] for v in valid]
         if max(areas) >= self.DASH_MAX_AREA:
             return "solid"
-        # Any contour as large as a real track line → solid, not intersection dashes
-        if max(areas) >= self.SIGNIFICANT_AREA:
-            return "solid"
-        # Tall contours are solid lines — intersection dashes are small and square
+        # Shape-based filter: solid lines and their end-stubs are taller than they are wide.
+        # SIGNIFICANT_AREA (area >= 500) was removed — the height check already catches
+        # full-height lines, and an area check also rejects short stubs that slip past height.
         for v in valid:
-            _, _, _, bh = cv2.boundingRect(v[3])
-            if bh >= self.DASH_MAX_HEIGHT:
+            _, _, bw, bh = cv2.boundingRect(v[3])
+            if bh >= self.DASH_MAX_HEIGHT:      # full or near-full solid line in ROI
+                return "solid"
+            if bw > 0 and bh > bw * 1.5:        # stub: taller-than-wide → solid line end
                 return "solid"
         xs   = [v[0] for v in valid]
         span = max(xs) - min(xs)

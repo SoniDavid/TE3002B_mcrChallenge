@@ -108,6 +108,12 @@ class LineFollowerNode(Node):
         self._last_valid_cmd = Twist()
         self._last_valid_t   = None   # monotonic timestamp of last frame where cx was valid
 
+        # Dashed-state latch: once "dashed" is detected, hold that state for this many
+        # seconds so the robot has time to stop before detection briefly reverts to "solid"
+        # (e.g. while decelerating past a 1-frame solid-stub glimpse at the intersection edge).
+        self._dashed_latch_t = None
+        self._dashed_latch_s = 1.0
+
         self._detector = CenterLineDetector(debug=self._pub_debug)
 
         # Publishers
@@ -154,6 +160,16 @@ class LineFollowerNode(Node):
 
         cx, cy = self._detector.detect_center_line(img, pre_cropped=True)
         line_type = self._detector.line_type
+
+        # Dashed-state latch: hold "dashed" for _dashed_latch_s after the last genuine
+        # detection so the robot stops fully before a 1-frame solid-stub glimpse reverts
+        # control to line-following mode mid-deceleration.
+        _t_latch = time.monotonic()
+        if line_type == 'dashed':
+            self._dashed_latch_t = _t_latch
+        elif (self._dashed_latch_t is not None
+              and (_t_latch - self._dashed_latch_t) < self._dashed_latch_s):
+            line_type = 'dashed'
 
         # True loss: all three line slots have no detection this frame.
         # The detector's line_flags dict is True per slot when a real contour was assigned.
