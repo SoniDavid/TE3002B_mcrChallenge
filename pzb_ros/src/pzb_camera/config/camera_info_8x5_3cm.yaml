@@ -1,0 +1,23 @@
+# Calibration: rosbag2_2026_04_22-16_39_42 | topic: /camera/image_raw
+# Chessboard: 8x5 inner corners, 0.03 m squares
+# Detections used: 21 | RMS reprojection error: 0.577478 px
+image_width: 1280
+image_height: 720
+camera_name: camera
+camera_matrix:
+  rows: 3
+  cols: 3
+  data: [972.5872931058249, 0.0, 635.4928589069335, 0.0, 976.8162716689993, 367.1861023804187, 0.0, 0.0, 1.0]
+distortion_model: plumb_bob
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data: [-0.1835911705540347, -0.7485178836683811, -0.005457374885609224, 0.0005017030432388941, 1.4084201921302768]
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+projection_matrix:
+  rows: 3
+  cols: 4
+  data: [972.5872931058249, 0.0, 635.4928589069335, 0.0, 0.0, 976.8162716689993, 367.1861023804187, 0.0, 0.0, 0.0, 1.0, 0.0]

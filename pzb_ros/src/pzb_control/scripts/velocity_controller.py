@@ -384,7 +384,8 @@ def main(args=None):
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-    node._cmd_pub.publish(Twist())
+    if rclpy.ok():
+        node._cmd_pub.publish(Twist())
     node.destroy_node()
     rclpy.try_shutdown()
 

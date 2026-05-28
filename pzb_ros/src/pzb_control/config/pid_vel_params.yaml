@@ -20,7 +20,7 @@ velocity_controller:
     loop_hz: 50.0
     max_linear_speed: 0.40
     max_angular_speed: 1.50
-    cmd_timeout_s: 0.50
+    cmd_timeout_s: 1.00
     deadzone_comp_v: 0.0   # snap small linear commands up to this threshold (m/s); 0 = disabled
     deadzone_comp_w: 0.0   # snap small angular commands up to this threshold (rad/s); 0 = disabled
     robot_vel_stale_timeout_s: 0.25  # if /robot_vel is older than this, publish zero /cmd_vel; rosbag shows ~7 Hz (145 ms gaps)

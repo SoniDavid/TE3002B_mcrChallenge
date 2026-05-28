@@ -2,7 +2,6 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
-from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -10,6 +9,7 @@ from launch_ros.actions import Node
 def generate_launch_description():
     pkg_share = get_package_share_directory('pzb_camera')
     default_params = os.path.join(pkg_share, 'config', 'camera_params.yaml')
+    default_camera_info = os.path.join(pkg_share, 'config', 'camera_info_8x5_3cm.yaml')
 
     return LaunchDescription([
         DeclareLaunchArgument(
@@ -48,59 +48,45 @@ def generate_launch_description():
             description='nvvidconv flip-method (0:none, 2:rotate-180, 4:horizontal, 6:vertical)',
         ),
         DeclareLaunchArgument(
-            'publish_compressed',
-            default_value='true',
-            description='Publish /camera/image_compressed.',
-        ),
-        DeclareLaunchArgument(
-            'publish_raw',
-            default_value='false',
-            description='Publish /camera/image_raw (heavy bandwidth).',
+            'color_cal_file',
+            default_value='/home/puzzlebot/color_cal/colorCalibration.npz',
+            description='Path to .npz color calibration file (arr_0 gains). Empty to disable.',
         ),
         DeclareLaunchArgument(
             'publish_camera_info',
-            default_value='false',
-            description='Launch camera_info_publisher node.',
+            default_value='true',
+            description='Publish /camera/camera_info using the calibration YAML.',
         ),
         DeclareLaunchArgument(
-            'camera_info_url',
-            default_value='file:///home/puzzlebot/.ros/jetson_cam.yaml',
-            description='Calibration file URL used by camera_info_publisher.',
+            'camera_info_file',
+            default_value=default_camera_info,
+            description='Path to ROS camera_info YAML for intrinsics.',
         ),
         DeclareLaunchArgument(
-            'camera_info_frame_id',
-            default_value='camera_optical_frame',
-            description='frame_id for camera_info_publisher.',
+            'topic_camera_info',
+            default_value='/camera/camera_info',
+            description='Topic name for CameraInfo messages.',
         ),
 
         Node(
             package='pzb_camera',
-            executable='camera_publisher',
-            name='camera_publisher',
+            executable='camera_compressed_publisher',
+            name='camera_compressed_publisher',
             output='screen',
             parameters=[
                 LaunchConfiguration('params_file'),
                 {
-                    'sensor_id':    LaunchConfiguration('sensor_id'),
-                    'width':        LaunchConfiguration('width'),
-                    'height':       LaunchConfiguration('height'),
-                    'framerate':    LaunchConfiguration('framerate'),
-                    'jpeg_quality': LaunchConfiguration('jpeg_quality'),
-                    'flip_method':  LaunchConfiguration('flip_method'),
-                    'publish_compressed': LaunchConfiguration('publish_compressed'),
-                    'publish_raw':  LaunchConfiguration('publish_raw'),
+                    'sensor_id':           LaunchConfiguration('sensor_id'),
+                    'width':               LaunchConfiguration('width'),
+                    'height':              LaunchConfiguration('height'),
+                    'framerate':           LaunchConfiguration('framerate'),
+                    'jpeg_quality':        LaunchConfiguration('jpeg_quality'),
+                    'flip_method':         LaunchConfiguration('flip_method'),
+                    'color_cal_file':      LaunchConfiguration('color_cal_file'),
+                    'publish_camera_info': LaunchConfiguration('publish_camera_info'),
+                    'camera_info_file':    LaunchConfiguration('camera_info_file'),
+                    'topic_camera_info':   LaunchConfiguration('topic_camera_info'),
                 },
             ],
-        ),
-        Node(
-            package='camera_info_publisher',
-            executable='camera_info_publisher',
-            name='camera_info_publisher',
-            output='screen',
-            condition=IfCondition(LaunchConfiguration('publish_camera_info')),
-            parameters=[{
-                'camera_calibration_file': LaunchConfiguration('camera_info_url'),
-                'frame_id': LaunchConfiguration('camera_info_frame_id'),
-            }],
         ),
     ])

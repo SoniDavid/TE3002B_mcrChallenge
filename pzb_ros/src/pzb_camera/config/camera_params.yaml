@@ -22,10 +22,12 @@ camera_publisher:
     flip_method: 0
 
     # Publish /camera/image_compressed stream.
-    publish_compressed: true
+    # Disabled: subscribers use /camera/image_raw directly to avoid JPEG encode/decode overhead.
+    publish_compressed: false
 
-    # Publish heavy /camera/image_raw stream. Keep false for teleop/RViz over network.
-    publish_raw: false
+    # Publish /camera/image_raw stream (1280×720 BGR).
+    # Subscribers crop their own ROI — no full-frame resize needed at the camera level.
+    publish_raw: true
 
     # Topic names
     topic_compressed: /camera/image_compressed
@@ -33,3 +35,17 @@ camera_publisher:
 
     # Camera frame id for the header
     frame_id: camera_optical_frame
+
+    # Color calibration: path to .npz with per-pixel gain array 'arr_0'.
+    # Leave empty ('') to disable color correction.
+    color_cal_file: '/home/puzzlebot/color_cal/colorCalibration.npz'
+
+    # Publish /camera/camera_info from the calibration YAML below.
+    publish_camera_info: true
+
+    # Path to the camera intrinsics YAML (ROS camera_info format).
+    # Leave empty to disable; the launch file sets this to the installed share path.
+    camera_info_file: ''
+
+    # Topic name for CameraInfo
+    topic_camera_info: /camera/camera_info
