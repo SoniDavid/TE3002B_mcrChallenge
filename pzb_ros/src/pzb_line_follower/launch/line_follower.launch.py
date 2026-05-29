@@ -92,6 +92,8 @@ def generate_launch_description():
                 {
                     'camera_info_file':    cam_info,
                     'publish_camera_info': True,
+                    'publish_compressed':  True,
+                    'jpeg_quality':        75,
                 },
             ],
         ),

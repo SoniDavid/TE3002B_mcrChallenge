@@ -28,7 +28,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 
-from sensor_msgs.msg import Image, CameraInfo
+from sensor_msgs.msg import Image, CameraInfo, CompressedImage
 
 
 _RELIABLE_QOS = QoSProfile(
@@ -67,6 +67,9 @@ class CameraRawPublisher(Node):
         self.declare_parameter('publish_camera_info', False)
         self.declare_parameter('camera_info_file',    '')
         self.declare_parameter('topic_camera_info',   '/camera/camera_info')
+        self.declare_parameter('publish_compressed',  False)
+        self.declare_parameter('jpeg_quality',        75)
+        self.declare_parameter('topic_compressed',    '/camera/image_compressed')
 
         sensor_id         = self.get_parameter('sensor_id').value
         self._width       = self.get_parameter('width').value
@@ -120,6 +123,16 @@ class CameraRawPublisher(Node):
             else:
                 self.get_logger().warning(
                     'publish_camera_info=true but camera_info_file is empty — skipping')
+
+        # ── Optional compressed publisher ─────────────────────────────────────
+        self._pub_compressed = None
+        self._jpeg_quality   = self.get_parameter('jpeg_quality').value
+        if self.get_parameter('publish_compressed').value:
+            topic_comp = self.get_parameter('topic_compressed').value
+            self._pub_compressed = self.create_publisher(
+                CompressedImage, topic_comp, _IMAGE_QOS)
+            self.get_logger().info(
+                f'Compressed publisher ready  → {topic_comp}  (JPEG q={self._jpeg_quality})')
 
         # ── GStreamer pipeline ────────────────────────────────────────────────
         pipeline = self._gstreamer_pipeline(sensor_id)
@@ -295,6 +308,18 @@ class CameraRawPublisher(Node):
             # per-byte isinstance loop that takes ~108 ms for 320×240.
             msg.data = array.array('B', frame.tobytes())
             self._pub_raw.publish(msg)
+
+            if (self._pub_compressed is not None
+                    and self._pub_compressed.get_subscription_count() > 0):
+                ok, buf = cv2.imencode(
+                    '.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, self._jpeg_quality])
+                if ok:
+                    cmsg = CompressedImage()
+                    cmsg.header.stamp    = stamp
+                    cmsg.header.frame_id = self._frame_id
+                    cmsg.format = 'jpeg'
+                    cmsg.data   = array.array('B', buf.tobytes())
+                    self._pub_compressed.publish(cmsg)
 
             if self._pub_camera_info is not None and self._camera_info_msg is not None:
                 self._camera_info_msg.header.stamp = stamp

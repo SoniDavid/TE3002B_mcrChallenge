@@ -1,0 +1,7 @@
+yolo_detector_node:
+  ros__parameters:
+    model_path:      ''           # override at launch: model_path:=/abs/path/to/model.pt
+    conf_threshold:  0.45
+    device:          'cuda'       # use 'cpu' if no GPU available
+    input_topic:     '/camera/image_compressed'
+    output_topic:    '/yolo/debug_image'
