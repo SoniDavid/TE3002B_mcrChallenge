@@ -70,8 +70,6 @@ class CameraRawPublisher(Node):
         self.declare_parameter('publish_compressed',  False)
         self.declare_parameter('jpeg_quality',        75)
         self.declare_parameter('topic_compressed',    '/camera/image_compressed')
-        self.declare_parameter('compressed_width',    640)
-        self.declare_parameter('compressed_height',   360)
 
         sensor_id         = self.get_parameter('sensor_id').value
         self._width       = self.get_parameter('width').value
@@ -129,15 +127,12 @@ class CameraRawPublisher(Node):
         # ── Optional compressed publisher ─────────────────────────────────────
         self._pub_compressed = None
         self._jpeg_quality   = self.get_parameter('jpeg_quality').value
-        self._comp_w         = int(self.get_parameter('compressed_width').value)
-        self._comp_h         = int(self.get_parameter('compressed_height').value)
         if self.get_parameter('publish_compressed').value:
             topic_comp = self.get_parameter('topic_compressed').value
             self._pub_compressed = self.create_publisher(
                 CompressedImage, topic_comp, _IMAGE_QOS)
             self.get_logger().info(
-                f'Compressed publisher ready  → {topic_comp}  '
-                f'({self._comp_w}×{self._comp_h}  JPEG q={self._jpeg_quality})')
+                f'Compressed publisher ready  → {topic_comp}  (JPEG q={self._jpeg_quality})')
 
         # ── GStreamer pipeline ────────────────────────────────────────────────
         pipeline = self._gstreamer_pipeline(sensor_id)
@@ -316,9 +311,8 @@ class CameraRawPublisher(Node):
 
             if (self._pub_compressed is not None
                     and self._pub_compressed.get_subscription_count() > 0):
-                to_enc = cv2.resize(frame, (self._comp_w, self._comp_h))
                 ok, buf = cv2.imencode(
-                    '.jpg', to_enc, [cv2.IMWRITE_JPEG_QUALITY, self._jpeg_quality])
+                    '.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, self._jpeg_quality])
                 if ok:
                     cmsg = CompressedImage()
                     cmsg.header.stamp    = stamp
