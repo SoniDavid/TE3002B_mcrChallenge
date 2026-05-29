@@ -24,10 +24,11 @@ def generate_launch_description():
 
     return LaunchDescription([
         DeclareLaunchArgument(
-            'model_path', default_value='',
-            description='Absolute path to the YOLOv8 .pt weights file (required)'),
+            'model_path',
+            default_value='/home/soni/Documents/classes/IRS_6to/manchesterRobotics/TE3002B_mcrChallenge/best.pt',
+            description='Absolute path to the YOLOv8 .pt weights file'),
         DeclareLaunchArgument(
-            'conf_threshold', default_value='0.45',
+            'conf_threshold', default_value='0.55',
             description='Minimum detection confidence (0–1)'),
         DeclareLaunchArgument(
             'device', default_value='cuda',

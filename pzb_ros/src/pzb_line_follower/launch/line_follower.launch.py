@@ -94,6 +94,8 @@ def generate_launch_description():
                     'publish_camera_info': True,
                     'publish_compressed':  True,
                     'jpeg_quality':        75,
+                    'compressed_width':    640,
+                    'compressed_height':   360,
                 },
             ],
         ),

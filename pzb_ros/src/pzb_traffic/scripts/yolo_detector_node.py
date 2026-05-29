@@ -40,16 +40,22 @@ class YoloDetectorNode(Node):
         super().__init__('yolo_detector_node')
 
         self.declare_parameter('model_path',     '')
-        self.declare_parameter('conf_threshold', 0.45)
+        self.declare_parameter('conf_threshold', 0.55)
+        self.declare_parameter('iou_threshold',  0.45)
+        self.declare_parameter('blur_threshold', 0.0)
+        self.declare_parameter('half',           False)
         self.declare_parameter('device',         'cuda')
         self.declare_parameter('input_topic',    '/camera/image_compressed')
         self.declare_parameter('output_topic',   '/yolo/debug_image')
 
-        model_path     = self.get_parameter('model_path').value
-        self._conf_thr = float(self.get_parameter('conf_threshold').value)
-        device         = self.get_parameter('device').value
-        in_topic       = self.get_parameter('input_topic').value
-        out_topic      = self.get_parameter('output_topic').value
+        model_path       = self.get_parameter('model_path').value
+        self._conf_thr   = float(self.get_parameter('conf_threshold').value)
+        self._iou_thr    = float(self.get_parameter('iou_threshold').value)
+        self._blur_thr   = float(self.get_parameter('blur_threshold').value)
+        self._half       = bool(self.get_parameter('half').value)
+        device           = self.get_parameter('device').value
+        in_topic         = self.get_parameter('input_topic').value
+        out_topic        = self.get_parameter('output_topic').value
 
         if not model_path:
             self.get_logger().fatal(
@@ -82,7 +88,8 @@ class YoloDetectorNode(Node):
         self.create_timer(5.0, self._log_stats)
 
         self.get_logger().info(
-            f'YoloDetectorNode ready  conf≥{self._conf_thr}  '
+            f'YoloDetectorNode ready  conf≥{self._conf_thr}  iou={self._iou_thr}  '
+            f'blur_thr={self._blur_thr}  half={self._half}  '
             f'{in_topic} → {out_topic}')
 
     # ── Image callback ────────────────────────────────────────────────────────
@@ -98,7 +105,16 @@ class YoloDetectorNode(Node):
             self.get_logger().warning('cv2.imdecode returned None — skipping frame')
             return
 
-        results = self._model(frame, verbose=False, device=self._device)[0]
+        # Blur pre-filter (disabled when blur_threshold=0.0).
+        if self._blur_thr > 0.0:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if cv2.Laplacian(gray, cv2.CV_64F).var() < self._blur_thr:
+                return
+
+        results = self._model(
+            frame, verbose=False, device=self._device,
+            conf=self._conf_thr, iou=self._iou_thr, half=self._half,
+        )[0]
 
         best_box   = None
         best_area  = -1

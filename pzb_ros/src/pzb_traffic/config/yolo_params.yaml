@@ -1,7 +1,10 @@
 yolo_detector_node:
   ros__parameters:
-    model_path:      ''           # override at launch: model_path:=/abs/path/to/model.pt
-    conf_threshold:  0.45
-    device:          'cuda'       # use 'cpu' if no GPU available
+    model_path:      '/home/soni/Documents/classes/IRS_6to/manchesterRobotics/TE3002B_mcrChallenge/best.pt'
+    conf_threshold:  0.55     # minimum detection confidence
+    iou_threshold:   0.45     # NMS IoU — lower than YOLOv8 default 0.7
+    blur_threshold:  0.0      # 0 = disabled; raise (e.g. 20) to skip motion-blurred frames
+    half:            false    # FP16 inference — set true on modern GPU for ~2x throughput
+    device:          'cuda'   # use 'cpu' if no GPU available
     input_topic:     '/camera/image_compressed'
     output_topic:    '/yolo/debug_image'
