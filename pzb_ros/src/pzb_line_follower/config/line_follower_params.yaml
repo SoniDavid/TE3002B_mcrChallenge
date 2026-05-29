@@ -33,7 +33,7 @@ line_follower_node:
     min_linear_speed: 0.05
 
     # If true, sets linear_speed=0 when a dashed line (intersection) is detected
-    stop_on_dashed: true
+    stop_on_dashed: false
 
     # Publish pipeline debug visualization on /line_follower/debug_image
     # Set to true only during tuning sessions — generates 7-tile image every frame

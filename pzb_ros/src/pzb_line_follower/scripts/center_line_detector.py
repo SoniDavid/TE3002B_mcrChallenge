@@ -145,14 +145,6 @@ class CenterLineDetector:
         blurred = cv2.GaussianBlur(gray, (5, 5), 1.4)
         binary  = self._adaptive_threshold(blurred)
 
-        # Exclude blue mat boundary so it is not mistaken for a black line.
-        # Blue tape: H∈[100,135], S>60, V>50 in HSV.
-        _hsv  = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        _blue = cv2.inRange(_hsv,
-                            np.array([100, 60, 50],  np.uint8),
-                            np.array([135, 255, 255], np.uint8))
-        binary = cv2.bitwise_and(binary, cv2.bitwise_not(_blue))
-
         k3      = np.ones((3, 3), np.uint8)
         k5      = np.ones((5, 5), np.uint8)
         opened  = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  k3)
