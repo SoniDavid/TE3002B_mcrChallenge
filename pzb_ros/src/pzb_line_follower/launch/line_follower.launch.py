@@ -94,6 +94,7 @@ def generate_launch_description():
                     'publish_camera_info': True,
                     'publish_compressed':  True,
                     'jpeg_quality':        75,
+                    'color_cal_file': '/home/puzzlebot/color_cal/colorCalibration.npz',
                 },
             ],
         ),

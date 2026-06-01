@@ -6,56 +6,38 @@ line_follower_node:
 
     # Proportional steering gain (rad/s per pixel of error)
     # Increase to react more aggressively to line offset
-    Kp_angular: 0.003
+    Kp_angular: 0.004
 
     # Derivative steering gain (rad/s per pixel/frame of error rate)
     # Damps oscillation/weaving; start around Kp*0.3 and tune up
     # Set to 0.0 to disable (pure P)
-    Kd_angular: 0.001
+    Kd_angular: 0.003
 
     # Pixel dead band around image center — no steering correction within this range
     dead_band_px: 8
 
     # Forward speed in m/s (desired; curve reduction may reduce this)
-    linear_speed: 0.10
+    linear_speed: 0.08
 
     # Hard cap on linear output in m/s (also enforced by twist_slew_limiter)
     max_linear_speed: 0.20
 
     # Maximum angular velocity output (rad/s)
-    max_angular: 0.8
-
     # Speed reduction on curves: 0.0 = constant speed, 1.0 = stop at max angular
     # Mirrors the cos(alpha) factor in waypoint_follower — start at 0.5
+    max_angular: 0.8
     curve_speed_reduction: 0.5
 
     # Minimum linear speed in m/s — prevents stalling mid-curve (keep above motor deadband ~0.04)
-    min_linear_speed: 0.05
+    min_linear_speed: 0.04
 
     # If true, sets linear_speed=0 when a dashed line (intersection) is detected
-    stop_on_dashed: true
+    stop_on_dashed: false
 
     # Publish pipeline debug visualization on /line_follower/debug_image
-    # Set to true only during tuning sessions — generates 7-tile image every frame
     publish_debug: true
-
-    # Loss coasting: when all 3 line slots are lost, hold last command at reduced speed
-    # for up to lost_timeout_s before stopping (Team2 pattern: lost_timeout_s=0.3)
-    lost_timeout_s:   0.35
-    lost_speed_scale: 0.50
-
-    # Sharp-turn override: when |error| exceeds threshold, clamp speed to sharp_turn_speed.
-    # Also used as the floor speed when fewer than 2 lines are visible (intersection handling).
-    sharp_turn_threshold_px: 60
-    sharp_turn_speed: 0.02
-
-    # Dashed-line tilt correction gain (rad/s per unit Δy/Δx slope).
-    # When dashes appear at a slope in the ROI the robot applies this correction to rotate
-    # until the dashes are horizontal (robot perpendicular to the crossing line).
-    # Tune on hardware: start at 0.15, increase if slow to align, decrease if oscillates.
-    kp_dash_tilt: 0.15
 
     # Input and output topic names
     # topic_cmd_vel feeds twist_slew_limiter; slew limiter outputs to /cmd_vel_desired
-    topic_image_in: /camera/image_raw
+    topic_image_in: /camera/image_compressed
     topic_cmd_vel:  /cmd_vel_desired_raw
