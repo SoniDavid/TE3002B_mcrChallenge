@@ -57,7 +57,7 @@ class CenterLineDetector:
     DASH_MIN_COUNT  = 2
     DASH_MAX_AREA   = 3500  # px² — max area per contour for dashed classification
     DASH_MAX_HEIGHT = 35    # px  — contours taller than this are solid lines, not dashes
-    DASH_MIN_SPAN   = 0.35  # fraction of image width
+    DASH_MIN_SPAN   = 0.20  # fraction of image width
 
     # ── exit scanning (HSV track surface) ────────────────────────────────────
     EXIT_TRACK_RATIO = 0.15
@@ -72,7 +72,7 @@ class CenterLineDetector:
     LANE_HSV_LO    = np.array([  0,  16,  76], np.uint8)
     LANE_HSV_HI    = np.array([179, 103, 187], np.uint8)
     LANE_MIN_PIX   = 800   # px of mat before trusting the centroid (mat covers ~85% of ROI)
-    LANE_BLEND_THR = 40    # px deviation from lane_cx before blending toward it
+    LANE_BLEND_THR = 9999  # disabled — re-enable only after HSV re-calibration for the current track
 
     # ── persistent adaptive threshold ─────────────────────────────────────────
     # Carries T across frames so the threshold drifts gradually (±10/iter)
@@ -306,7 +306,7 @@ class CenterLineDetector:
             _, _, bw, bh = cv2.boundingRect(v[3])
             if bh >= self.DASH_MAX_HEIGHT:      # full or near-full solid line in ROI
                 return "solid"
-            if bw > 0 and bh > bw * 1.5:        # stub: taller-than-wide → solid line end
+            if bw > 0 and bh > bw * 2.0:        # stub: much taller-than-wide → solid line end
                 return "solid"
         xs   = [v[0] for v in valid]
         span = max(xs) - min(xs)
@@ -490,16 +490,19 @@ class CenterLineDetector:
                     self._line_history[name].clear()
                     self._line_lost_frames[name] = 0
 
-        # ── Enforce ordering; reset violating pair ────────────────────────────
+        # ── Enforce ordering; flag violating pair lost but keep anchors ──────
+        # Positions and history are intentionally preserved so the next frame's
+        # assignment still has a realistic reference near the true line positions.
+        # Clearing them would force fallback to extreme defaults (0 / 160 / 319)
+        # which causes wrong-slot assignment and apparent lane changes.
         lp = self.line_positions
         for a, b in (('left', 'center'), ('center', 'right')):
             if (lp[a] is not None and lp[b] is not None and
                     lp[a] >= lp[b] - self.LINE_MIN_SEP):
                 for name in (a, b):
-                    self.line_flags[name]        = False
-                    self.line_positions[name]    = None
-                    self._line_history[name].clear()
-                    self._line_lost_frames[name] = 0
+                    self.line_flags[name] = False
+                    # _line_lost_frames increments in the stale block above;
+                    # stale-reset will expire the anchor after STALE_THRESH frames.
                 break
 
         # ── Return center ─────────────────────────────────────────────────────
