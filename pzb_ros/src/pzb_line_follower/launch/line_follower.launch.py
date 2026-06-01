@@ -63,7 +63,7 @@ def generate_launch_description():
                               description='Speed reduction on turns: 0=off, 1=stop at max angular'),
         DeclareLaunchArgument('min_linear_speed',  default_value='0.05',
                               description='Floor linear speed in m/s (keep above motor deadband)'),
-        DeclareLaunchArgument('max_linear_accel',  default_value='2.0',
+        DeclareLaunchArgument('max_linear_accel',  default_value='0.5',
                               description='Max linear acceleration for slew limiter (m/s²)'),
         DeclareLaunchArgument('max_angular_accel', default_value='1.20',
                               description='Max angular acceleration for slew limiter (rad/s²)'),
