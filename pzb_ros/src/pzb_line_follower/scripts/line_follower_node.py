@@ -70,6 +70,7 @@ class LineFollowerNode(Node):
         self.declare_parameter('lost_timeout_s',          0.25)
         self.declare_parameter('lost_speed_scale',        0.50)
         self.declare_parameter('kp_dash_tilt',            0.15)
+        self.declare_parameter('dashed_confirm_frames',   3)
 
         self._img_w               = self.get_parameter('image_width').value
         self._img_h               = self.get_parameter('image_height').value
@@ -88,6 +89,7 @@ class LineFollowerNode(Node):
         self._lost_timeout_s      = float(self.get_parameter('lost_timeout_s').value)
         self._lost_speed_scale    = float(self.get_parameter('lost_speed_scale').value)
         self._kp_dash_tilt        = float(self.get_parameter('kp_dash_tilt').value)
+        self._dashed_confirm_n    = int(self.get_parameter('dashed_confirm_frames').value)
 
         topic_in  = self.get_parameter('topic_image_in').value
         topic_cmd = self.get_parameter('topic_cmd_vel').value
@@ -108,11 +110,13 @@ class LineFollowerNode(Node):
         self._last_valid_cmd = Twist()
         self._last_valid_t   = None   # monotonic timestamp of last frame where cx was valid
 
-        # Dashed-state latch: once "dashed" is detected, hold that state for this many
-        # seconds so the robot has time to stop before detection briefly reverts to "solid"
-        # (e.g. while decelerating past a 1-frame solid-stub glimpse at the intersection edge).
-        self._dashed_latch_t = None
-        self._dashed_latch_s = 1.0
+        # Dashed-state debounce + exit latch.
+        # Entry: require _dashed_confirm_n consecutive dashed frames before switching mode.
+        # Exit: once confirmed, hold "dashed" for _dashed_latch_s seconds to survive
+        #       brief solid-stub glimpses mid-deceleration.
+        self._dashed_latch_t  = None
+        self._dashed_latch_s  = 1.0
+        self._dashed_streak   = 0   # consecutive frames the detector returned "dashed"
 
         self._detector = CenterLineDetector(debug=self._pub_debug)
 
@@ -161,15 +165,26 @@ class LineFollowerNode(Node):
         cx, cy = self._detector.detect_center_line(img, pre_cropped=True)
         line_type = self._detector.line_type
 
-        # Dashed-state latch: hold "dashed" for _dashed_latch_s after the last genuine
-        # detection so the robot stops fully before a 1-frame solid-stub glimpse reverts
-        # control to line-following mode mid-deceleration.
+        # Dashed-state debounce (entry) + exit latch.
+        # Entry: only switch to dashed after _dashed_confirm_n consecutive dashed frames.
+        #        This prevents a single bad frame during a turn from triggering dashed mode.
+        # Exit:  once confirmed, hold "dashed" for _dashed_latch_s seconds so the robot
+        #        stops fully before a brief solid-stub glimpse reverts control.
         _t_latch = time.monotonic()
         if line_type == 'dashed':
+            self._dashed_streak += 1
+        else:
+            self._dashed_streak = 0
+
+        _confirmed_dashed = (self._dashed_streak >= self._dashed_confirm_n)
+        if _confirmed_dashed:
             self._dashed_latch_t = _t_latch
-        elif (self._dashed_latch_t is not None
-              and (_t_latch - self._dashed_latch_t) < self._dashed_latch_s):
+
+        if _confirmed_dashed or (self._dashed_latch_t is not None
+                and (_t_latch - self._dashed_latch_t) < self._dashed_latch_s):
             line_type = 'dashed'
+        else:
+            line_type = 'solid'
 
         # True loss: all three line slots have no detection this frame.
         # The detector's line_flags dict is True per slot when a real contour was assigned.
@@ -210,51 +225,48 @@ class LineFollowerNode(Node):
             self._prev_error   = error
             self._prev_error_t = now
 
-            # PD steering — dead-band only suppresses; dashed uses PD + tilt correction
-            if abs(error) <= self._dead_band:
-                angular_z = 0.0
-            else:
+            if line_type == 'dashed':
+                # Confirmed intersection: stop advancing and rotate only to align
+                # perpendicular to the dashes. dash_slope_px == 0 means already aligned.
+                linear_x  = 0.0
+                tilt      = getattr(self._detector, 'dash_slope_px', 0.0)
                 angular_z = float(np.clip(
-                    -self._kp * error - self._kd * d_error,
+                    -self._kp_dash_tilt * tilt,
                     -self._max_ang, self._max_ang,
                 ))
-                if line_type == 'dashed':
-                    # Also correct for rotational misalignment: dash_slope_px=0 means
-                    # dashes are horizontal (robot is perpendicular to the crossing line).
-                    tilt = getattr(self._detector, 'dash_slope_px', 0.0)
+            else:
+                # Solid-line PD steering
+                if abs(error) <= self._dead_band:
+                    angular_z = 0.0
+                else:
                     angular_z = float(np.clip(
-                        angular_z - self._kp_dash_tilt * tilt,
+                        -self._kp * error - self._kd * d_error,
                         -self._max_ang, self._max_ang,
                     ))
 
-            # Curve-coupled speed reduction
-            if self._max_ang > 0:
-                angular_fraction = abs(angular_z) / self._max_ang
-            else:
-                angular_fraction = 0.0
-            speed_scale_curve = 1.0 - self._curve_reduction * angular_fraction
-            min_frac  = self._min_lin_speed / self._linear_speed if self._linear_speed > 0 else 0.0
-            linear_x  = min(self._max_lin_speed,
-                            self._linear_speed * max(min_frac, speed_scale_curve))
+                # Curve-coupled speed reduction
+                angular_fraction  = abs(angular_z) / self._max_ang if self._max_ang > 0 else 0.0
+                speed_scale_curve = 1.0 - self._curve_reduction * angular_fraction
+                min_frac  = self._min_lin_speed / self._linear_speed if self._linear_speed > 0 else 0.0
+                linear_x  = min(self._max_lin_speed,
+                                self._linear_speed * max(min_frac, speed_scale_curve))
 
-            # Visibility-based speed reduction: fewer visible lines → slower
-            n_vis = sum(self._detector.line_flags.values())
-            if n_vis == 2:
-                linear_x = min(linear_x, self._linear_speed * 0.6)
-            elif n_vis <= 1:
-                linear_x = self._sharp_turn_speed
+                # Visibility-based speed reduction: fewer visible lines → slower
+                n_vis = sum(self._detector.line_flags.values())
+                if n_vis == 2:
+                    linear_x = min(linear_x, self._linear_speed * 0.6)
+                elif n_vis <= 1:
+                    linear_x = self._sharp_turn_speed
 
-            # Sharp-turn override (error magnitude) — can only further reduce speed
-            if abs(error) > self._sharp_turn_threshold:
-                linear_x = self._sharp_turn_speed
+                # Sharp-turn override (error magnitude) — can only further reduce speed
+                if abs(error) > self._sharp_turn_threshold:
+                    linear_x = self._sharp_turn_speed
 
-            # Dashed-line stop takes priority, then traffic scale
-            if self._stop_dashed and line_type == 'dashed':
-                linear_x = 0.0
-            elif self._speed_scale <= 0.0:
-                linear_x = 0.0
-            else:
-                linear_x *= self._speed_scale
+                # Traffic scale
+                if self._speed_scale <= 0.0:
+                    linear_x = 0.0
+                else:
+                    linear_x *= self._speed_scale
 
             # Publish detections
             cx_msg = Int32();  cx_msg.data = cx

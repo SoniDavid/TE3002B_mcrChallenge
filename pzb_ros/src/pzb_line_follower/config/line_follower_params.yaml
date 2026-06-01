@@ -31,11 +31,20 @@ line_follower_node:
     # Minimum linear speed in m/s — prevents stalling mid-curve (keep above motor deadband ~0.04)
     min_linear_speed: 0.04
 
-    # If true, sets linear_speed=0 when a dashed line (intersection) is detected
-    stop_on_dashed: false
+    # Kept for backward-compat with launch files; dashed mode now always stops.
+    stop_on_dashed: true
+
+    # Consecutive dashed frames required before entering dashed mode.
+    # Prevents a single bad frame during a turn from triggering a false intersection stop.
+    dashed_confirm_frames: 3
 
     # Publish pipeline debug visualization on /line_follower/debug_image
     publish_debug: true
+
+    # Yaw alignment gain for dashed mode: angular_z = -kp_dash_tilt * dash_slope_px
+    # dash_slope_px is dimensionless (px/px). At slope=0.27 (≈15° yaw error), 1.5 → 0.4 rad/s.
+    # Tune in range 1.0–2.5: higher = faster alignment, lower = less overshoot.
+    kp_dash_tilt: 1.5
 
     # Input and output topic names
     # topic_cmd_vel feeds twist_slew_limiter; slew limiter outputs to /cmd_vel_desired
