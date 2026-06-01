@@ -1,4 +1,4 @@
-camera_publisher:
+camera_raw_publisher:
   ros__parameters:
     # CSI camera sensor index (0 for single camera)
     sensor_id: 0
