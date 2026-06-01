@@ -58,6 +58,7 @@ class CenterLineDetector:
     DASH_MAX_AREA   = 3500  # px² — max area per contour for dashed classification
     DASH_MAX_HEIGHT = 35    # px  — contours taller than this are solid lines, not dashes
     DASH_MIN_SPAN   = 0.20  # fraction of image width
+    DASH_CENTER_ZONE = 0.25 # at least one dash must be in the central 50% of the image
 
     # ── exit scanning (HSV track surface) ────────────────────────────────────
     EXIT_TRACK_RATIO = 0.15
@@ -310,7 +311,16 @@ class CenterLineDetector:
                 return "solid"
         xs   = [v[0] for v in valid]
         span = max(xs) - min(xs)
-        return "dashed" if span >= self.DASH_MIN_SPAN * w else "solid"
+        if span < self.DASH_MIN_SPAN * w:
+            return "solid"
+        # Reject corner markers that appear only at the extreme edges of the image
+        # (e.g. intersection corner decorations visible when robot is inside the square).
+        # Genuine crossing dashes always have at least one blob in the central zone.
+        center_lo = w * self.DASH_CENTER_ZONE
+        center_hi = w * (1.0 - self.DASH_CENTER_ZONE)
+        if not any(center_lo <= v[0] <= center_hi for v in valid):
+            return "solid"
+        return "dashed"
 
     # ── dashed-line handling ──────────────────────────────────────────────────
 
