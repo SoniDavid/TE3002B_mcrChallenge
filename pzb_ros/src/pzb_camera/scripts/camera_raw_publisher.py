@@ -163,7 +163,7 @@ class CameraRawPublisher(Node):
         self._slot_cv   = threading.Condition()
         self._slot      = None   # (stamp, frame ndarray) or None
         self._slot_seq  = 0      # incremented on every captured frame
-        self._pub_seq   = -1     # sequence last published
+        self._pub_seq   = 0     # sequence last published
 
         # Reconnect counters (kept from original)
         self._consecutive_failures  = 0
