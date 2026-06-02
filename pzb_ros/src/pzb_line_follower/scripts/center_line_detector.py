@@ -56,7 +56,8 @@ class CenterLineDetector:
     DASH_MIN_COUNT  = 2
     DASH_MAX_AREA   = 3500  # px² — max area per contour for dashed classification
     DASH_MAX_HEIGHT = 35    # px  — contours taller than this are solid lines, not dashes
-    DASH_MIN_SPAN   = 0.35  # fraction of image width
+    DASH_MIN_SPAN   = 0.20  # fraction of image width
+    DASH_CENTER_ZONE = 0.25 # at least one dash must be in the central 50% of the image
 
     # ── exit scanning (HSV track surface) ────────────────────────────────────
     EXIT_TRACK_RATIO = 0.15
@@ -71,7 +72,7 @@ class CenterLineDetector:
     LANE_HSV_LO    = np.array([  0,  16,  76], np.uint8)
     LANE_HSV_HI    = np.array([179, 103, 187], np.uint8)
     LANE_MIN_PIX   = 800   # px of mat before trusting the centroid (mat covers ~85% of ROI)
-    LANE_BLEND_THR = 40    # px deviation from lane_cx before blending toward it
+    LANE_BLEND_THR = 9999  # disabled — re-enable only after HSV re-calibration for the current track
 
     # ── persistent adaptive threshold ─────────────────────────────────────────
     # Carries T across frames so the threshold drifts gradually (±10/iter)
@@ -157,15 +158,12 @@ class CenterLineDetector:
         roi_h = roi.shape[0]
 
         # S7: classify → track
-        valid = self._valid_contours(contours)
+        # Far-field filter: reject contours in the top 15% of the ROI — these are
+        # distant objects (blue boundary tape, far track features) that are never
+        # near-field lines the robot should react to.
+        valid = [v for v in self._valid_contours(contours) if v[1] >= roi_h * 0.15]
 
-        # Near-ROI filter for dashed detection: only consider contours in the lower
-        # 55% of the ROI (y >= roi_h * 0.45). This prevents far dashes on the
-        # opposite side of a square intersection from triggering a false "dashed"
-        # classification and from skewing dash_slope_px toward the wrong row.
-        # Solid-line tracking (_track_three_lines) still uses all valid contours.
-        _near = [v for v in valid if v[1] >= roi_h * 0.45]
-        self.line_type = self._classify_line(_near, w)
+        self.line_type = self._classify_line(valid, w)
 
         # Compute time-based velocity gate (Team2 pattern): pixels/s × dt_seconds.
         # This makes the gate FPS-invariant: 2100 px/s ÷ 30 fps = 70 px/frame,
@@ -176,7 +174,7 @@ class CenterLineDetector:
         _max_jump = self.LINE_MAX_JUMP_PS * _dt
 
         if self.line_type == "dashed":
-            cx, cy = self._fuse_dashes(_near, y_start, roi_h)
+            cx, cy = self._fuse_dashes(valid, y_start, roi_h)
             self.exits = []
         else:
             cx, cy     = self._track_three_lines(valid, w, roi_h, y_start, _max_jump)
@@ -285,21 +283,44 @@ class CenterLineDetector:
     def _classify_line(self, valid, w):
         if len(valid) < self.DASH_MIN_COUNT:
             return "solid"
-        areas = [v[2] for v in valid]
-        if max(areas) >= self.DASH_MAX_AREA:
-            return "solid"
-        # Shape-based filter: solid lines and their end-stubs are taller than they are wide.
-        # SIGNIFICANT_AREA (area >= 500) was removed — the height check already catches
-        # full-height lines, and an area check also rejects short stubs that slip past height.
+
+        # Separate contours into:
+        #   dash_candidates — small, flat blobs (the actual dashes)
+        #   solid_veto      — tall contours that prove a solid line is present
+        # With an oblique forward camera, solid lines appear as tall narrow stubs
+        # mixed in with dashes at an intersection. We only veto "solid" if a
+        # contour is taller than DASH_MAX_HEIGHT AND its area exceeds DASH_MAX_AREA
+        # (i.e. it is a real solid line segment, not just a perspective stub).
+        dash_candidates = []
         for v in valid:
             _, _, bw, bh = cv2.boundingRect(v[3])
-            if bh >= self.DASH_MAX_HEIGHT:      # full or near-full solid line in ROI
+            area = v[2]
+            is_tall   = bh >= self.DASH_MAX_HEIGHT
+            is_stub   = bw > 0 and bh >= bw   # not flat → parallel lane marker or stub
+            is_large  = area >= self.DASH_MAX_AREA
+            # A true solid-line segment is both tall AND large.
+            # Perspective stubs at intersections are tall but small in area.
+            if is_tall and is_large:
                 return "solid"
-            if bw > 0 and bh > bw * 1.5:        # stub: taller-than-wide → solid line end
-                return "solid"
-        xs   = [v[0] for v in valid]
+            if not is_tall and not is_stub:
+                dash_candidates.append(v)
+
+        if len(dash_candidates) < self.DASH_MIN_COUNT:
+            return "solid"
+
+        xs   = [v[0] for v in dash_candidates]
         span = max(xs) - min(xs)
-        return "dashed" if span >= self.DASH_MIN_SPAN * w else "solid"
+        if span < self.DASH_MIN_SPAN * w:
+            return "solid"
+
+        # Reject corner markers visible only at the extreme image edges.
+        # Genuine crossing dashes always have at least one blob in the central zone.
+        center_lo = w * self.DASH_CENTER_ZONE
+        center_hi = w * (1.0 - self.DASH_CENTER_ZONE)
+        if not any(center_lo <= v[0] <= center_hi for v in dash_candidates):
+            return "solid"
+
+        return "dashed"
 
     # ── dashed-line handling ──────────────────────────────────────────────────
 
@@ -479,16 +500,18 @@ class CenterLineDetector:
                     self._line_history[name].clear()
                     self._line_lost_frames[name] = 0
 
-        # ── Enforce ordering; reset violating pair ────────────────────────────
+        # ── Enforce ordering; flag violating pair lost but keep anchors ──────
+        # Positions and history are preserved so the next frame's assignment
+        # still has a realistic reference. Clearing them forces fallback to
+        # extreme defaults (0 / 160 / 319) causing wrong-slot assignments.
         lp = self.line_positions
         for a, b in (('left', 'center'), ('center', 'right')):
             if (lp[a] is not None and lp[b] is not None and
                     lp[a] >= lp[b] - self.LINE_MIN_SEP):
                 for name in (a, b):
-                    self.line_flags[name]        = False
-                    self.line_positions[name]    = None
-                    self._line_history[name].clear()
-                    self._line_lost_frames[name] = 0
+                    self.line_flags[name] = False
+                    # _line_lost_frames increments in the stale block above;
+                    # stale-reset will expire the anchor after STALE_THRESH frames.
                 break
 
         # ── Return center ─────────────────────────────────────────────────────

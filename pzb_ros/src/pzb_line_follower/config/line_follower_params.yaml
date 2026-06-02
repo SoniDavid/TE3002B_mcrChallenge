@@ -32,8 +32,14 @@ line_follower_node:
     # Minimum linear speed in m/s — prevents stalling mid-curve (keep above motor deadband ~0.04)
     min_linear_speed: 0.05
 
-    # If true, sets linear_speed=0 when a dashed line (intersection) is detected
-    stop_on_dashed: false
+    # Consecutive dashed frames required before confirming dashed line type.
+    # Prevents a single bad frame during a turn from triggering a false dashed detection.
+    dashed_confirm_frames: 3
+
+    # Seconds to delay full angular output after a sharp turn first appears in the image.
+    # The camera looks ~15 cm ahead of the wheel axle; this gives the body time to arrive
+    # at the turn before committing to max steering. Tune: 0.1–0.25 s on hardware.
+    turn_approach_delay_s: 0.15
 
     # Publish pipeline debug visualization on /line_follower/debug_image
     # Set to true only during tuning sessions — generates 7-tile image every frame
@@ -48,12 +54,6 @@ line_follower_node:
     # Also used as the floor speed when fewer than 2 lines are visible (intersection handling).
     sharp_turn_threshold_px: 60
     sharp_turn_speed: 0.02
-
-    # Dashed-line tilt correction gain (rad/s per unit Δy/Δx slope).
-    # When dashes appear at a slope in the ROI the robot applies this correction to rotate
-    # until the dashes are horizontal (robot perpendicular to the crossing line).
-    # Tune on hardware: start at 0.15, increase if slow to align, decrease if oscillates.
-    kp_dash_tilt: 0.15
 
     # Input and output topic names
     # topic_cmd_vel feeds twist_slew_limiter; slew limiter outputs to /cmd_vel_desired

@@ -17,6 +17,7 @@ array.array activates the rclpy buffer protocol path and reduces this to ~8 ms.
 """
 
 import array
+import json
 import threading
 import time
 import yaml
@@ -64,6 +65,7 @@ class CameraRawPublisher(Node):
         self.declare_parameter('frame_id',            'camera_optical_frame')
         self.declare_parameter('topic_raw',           '/camera/image_raw')
         self.declare_parameter('color_cal_file',      '')
+        self.declare_parameter('undistort_file',      '')
         self.declare_parameter('publish_camera_info', False)
         self.declare_parameter('camera_info_file',    '')
         self.declare_parameter('topic_camera_info',   '/camera/camera_info')
@@ -82,6 +84,23 @@ class CameraRawPublisher(Node):
         cv2.setNumThreads(4)
 
         self._pub_raw = self.create_publisher(Image, topic_raw, _IMAGE_QOS)
+
+        # ── Lens undistortion ─────────────────────────────────────────────────
+        self._map1 = self._map2 = None
+        undistort_file = self.get_parameter('undistort_file').value
+        if undistort_file:
+            try:
+                with open(undistort_file) as f:
+                    cal = json.load(f)
+                K    = np.array(cal['K'],    dtype=np.float64)
+                dist = np.array(cal['dist'], dtype=np.float64)
+                self._map1, self._map2 = cv2.initUndistortRectifyMap(
+                    K, dist, None, K, (self._out_w, self._out_h), cv2.CV_16SC2)
+                self.get_logger().info(
+                    f'Undistortion loaded: {undistort_file}  '
+                    f'(RMSE={cal.get("rmse", "?")} px)')
+            except Exception as e:
+                self.get_logger().warning(f'Could not load undistort_file "{undistort_file}": {e}')
 
         # ── Color calibration ─────────────────────────────────────────────────
         self._color_gains = None
@@ -218,6 +237,8 @@ class CameraRawPublisher(Node):
             ret, frame = self._cap.read()
             if ret:
                 self._consecutive_failures = 0
+                if self._map1 is not None:
+                    frame = cv2.remap(frame, self._map1, self._map2, cv2.INTER_LINEAR)
                 if self._color_gains is not None:
                     try:
                         frame = (frame.astype(np.float32) * self._color_gains).clip(0, 255).astype(np.uint8)

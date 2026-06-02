@@ -61,7 +61,6 @@ class LineFollowerNode(Node):
         self.declare_parameter('max_angular',          0.8)
         self.declare_parameter('curve_speed_reduction', 0.5)
         self.declare_parameter('min_linear_speed',     0.05)
-        self.declare_parameter('stop_on_dashed',       False)
         self.declare_parameter('publish_debug',        True)
         self.declare_parameter('topic_image_in',       '/camera/image_raw')
         self.declare_parameter('topic_cmd_vel',        '/cmd_vel_desired_raw')
@@ -69,7 +68,8 @@ class LineFollowerNode(Node):
         self.declare_parameter('sharp_turn_speed',        0.03)
         self.declare_parameter('lost_timeout_s',          0.25)
         self.declare_parameter('lost_speed_scale',        0.50)
-        self.declare_parameter('kp_dash_tilt',            0.15)
+        self.declare_parameter('dashed_confirm_frames',   3)
+        self.declare_parameter('turn_approach_delay_s',   0.15)
 
         self._img_w               = self.get_parameter('image_width').value
         self._img_h               = self.get_parameter('image_height').value
@@ -81,13 +81,13 @@ class LineFollowerNode(Node):
         self._max_ang             = float(self.get_parameter('max_angular').value)
         self._curve_reduction     = float(self.get_parameter('curve_speed_reduction').value)
         self._min_lin_speed       = float(self.get_parameter('min_linear_speed').value)
-        self._stop_dashed         = bool(self.get_parameter('stop_on_dashed').value)
         self._pub_debug           = bool(self.get_parameter('publish_debug').value)
         self._sharp_turn_threshold = int(self.get_parameter('sharp_turn_threshold_px').value)
         self._sharp_turn_speed    = float(self.get_parameter('sharp_turn_speed').value)
         self._lost_timeout_s      = float(self.get_parameter('lost_timeout_s').value)
         self._lost_speed_scale    = float(self.get_parameter('lost_speed_scale').value)
-        self._kp_dash_tilt        = float(self.get_parameter('kp_dash_tilt').value)
+        self._dashed_confirm_n    = int(self.get_parameter('dashed_confirm_frames').value)
+        self._turn_approach_delay = float(self.get_parameter('turn_approach_delay_s').value)
 
         topic_in  = self.get_parameter('topic_image_in').value
         topic_cmd = self.get_parameter('topic_cmd_vel').value
@@ -108,11 +108,18 @@ class LineFollowerNode(Node):
         self._last_valid_cmd = Twist()
         self._last_valid_t   = None   # monotonic timestamp of last frame where cx was valid
 
-        # Dashed-state latch: once "dashed" is detected, hold that state for this many
-        # seconds so the robot has time to stop before detection briefly reverts to "solid"
-        # (e.g. while decelerating past a 1-frame solid-stub glimpse at the intersection edge).
-        self._dashed_latch_t = None
-        self._dashed_latch_s = 1.0
+        # Dashed-state debounce + exit latch.
+        # Entry: require _dashed_confirm_n consecutive dashed frames before switching mode.
+        # Exit: once confirmed, hold "dashed" for _dashed_latch_s seconds to survive
+        #       brief solid-stub glimpses mid-deceleration.
+        self._dashed_latch_t  = None
+        self._dashed_latch_s  = 1.0
+        self._dashed_streak   = 0   # consecutive frames the detector returned "dashed"
+
+        # Turn approach delay: when the camera first sees a sharp turn, coast at reduced
+        # speed for _turn_approach_delay seconds before applying full angular correction.
+        # This compensates for the camera looking ahead of the robot body.
+        self._turn_first_seen_t = None   # monotonic time when large error first appeared
 
         self._detector = CenterLineDetector(debug=self._pub_debug)
 
@@ -161,15 +168,26 @@ class LineFollowerNode(Node):
         cx, cy = self._detector.detect_center_line(img, pre_cropped=True)
         line_type = self._detector.line_type
 
-        # Dashed-state latch: hold "dashed" for _dashed_latch_s after the last genuine
-        # detection so the robot stops fully before a 1-frame solid-stub glimpse reverts
-        # control to line-following mode mid-deceleration.
+        # Dashed debounce (entry) + exit latch.
+        # Entry: only confirm dashed after _dashed_confirm_n consecutive frames —
+        #        prevents a single bad frame during a turn from triggering a stop.
+        # Exit:  once confirmed, hold "dashed" for _dashed_latch_s so the robot
+        #        stops fully before a brief solid-stub glimpse reverts control.
         _t_latch = time.monotonic()
         if line_type == 'dashed':
+            self._dashed_streak += 1
+        else:
+            self._dashed_streak = 0
+
+        _confirmed_dashed = (self._dashed_streak >= self._dashed_confirm_n)
+        if _confirmed_dashed:
             self._dashed_latch_t = _t_latch
-        elif (self._dashed_latch_t is not None
-              and (_t_latch - self._dashed_latch_t) < self._dashed_latch_s):
+
+        if _confirmed_dashed or (self._dashed_latch_t is not None
+                and (_t_latch - self._dashed_latch_t) < self._dashed_latch_s):
             line_type = 'dashed'
+        else:
+            line_type = 'solid'
 
         # True loss: all three line slots have no detection this frame.
         # The detector's line_flags dict is True per slot when a real contour was assigned.
@@ -177,7 +195,19 @@ class LineFollowerNode(Node):
 
         now = time.monotonic()
 
-        if line_lost:
+        if line_type == 'dashed':
+            # Hard stop at intersection: kill motors completely.
+            # No steering, no forward motion — wait for the dashed zone to end.
+            cmd = Twist()
+            self._last_valid_cmd = cmd
+            self._latest_cmd = cmd
+            cx_msg = Int32();  cx_msg.data = cx
+            self._pub_cx.publish(cx_msg)
+            err_msg = Float32();  err_msg.data = float(cx - self._img_w // 2)
+            self._pub_error.publish(err_msg)
+            type_msg = String();  type_msg.data = line_type
+            self._pub_line_type.publish(type_msg)
+        elif line_lost:
             # Coast: hold last valid command at reduced speed for up to lost_timeout_s.
             if (self._last_valid_t is not None
                     and (now - self._last_valid_t) < self._lost_timeout_s):
@@ -210,7 +240,20 @@ class LineFollowerNode(Node):
             self._prev_error   = error
             self._prev_error_t = now
 
-            # PD steering — dead-band only suppresses; dashed uses PD + tilt correction
+            # Turn approach delay: camera looks ahead of the robot body.
+            # When |error| crosses the sharp-turn threshold, start a timer.
+            # During the delay window, cap angular output so the body has time
+            # to reach the turn before full steering is applied.
+            _sharp = abs(error) > self._sharp_turn_threshold
+            if _sharp:
+                if self._turn_first_seen_t is None:
+                    self._turn_first_seen_t = now
+                _in_approach = (now - self._turn_first_seen_t) < self._turn_approach_delay
+            else:
+                self._turn_first_seen_t = None
+                _in_approach = False
+
+            # PD steering
             if abs(error) <= self._dead_band:
                 angular_z = 0.0
             else:
@@ -218,14 +261,9 @@ class LineFollowerNode(Node):
                     -self._kp * error - self._kd * d_error,
                     -self._max_ang, self._max_ang,
                 ))
-                if line_type == 'dashed':
-                    # Also correct for rotational misalignment: dash_slope_px=0 means
-                    # dashes are horizontal (robot is perpendicular to the crossing line).
-                    tilt = getattr(self._detector, 'dash_slope_px', 0.0)
-                    angular_z = float(np.clip(
-                        angular_z - self._kp_dash_tilt * tilt,
-                        -self._max_ang, self._max_ang,
-                    ))
+                if _in_approach:
+                    approach_cap = self._max_ang * 0.3
+                    angular_z = float(np.clip(angular_z, -approach_cap, approach_cap))
 
             # Curve-coupled speed reduction
             if self._max_ang > 0:
@@ -248,10 +286,7 @@ class LineFollowerNode(Node):
             if abs(error) > self._sharp_turn_threshold:
                 linear_x = self._sharp_turn_speed
 
-            # Dashed-line stop takes priority, then traffic scale
-            if self._stop_dashed and line_type == 'dashed':
-                linear_x = 0.0
-            elif self._speed_scale <= 0.0:
+            if self._speed_scale <= 0.0:
                 linear_x = 0.0
             else:
                 linear_x *= self._speed_scale
