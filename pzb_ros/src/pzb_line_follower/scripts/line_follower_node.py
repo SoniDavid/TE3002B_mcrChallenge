@@ -17,6 +17,7 @@ Publishes:
 
 import array
 import time
+from collections import deque
 
 import numpy as np
 import cv2
@@ -69,7 +70,16 @@ class LineFollowerNode(Node):
         self.declare_parameter('lost_timeout_s',          0.25)
         self.declare_parameter('lost_speed_scale',        0.50)
         self.declare_parameter('dashed_confirm_frames',   3)
+        self.declare_parameter('dashed_coast_s',          0.3)
+        self.declare_parameter('openloop_speed_mps',      0.15)
+        self.declare_parameter('openloop_dist_m',         0.50)
+        self.declare_parameter('recovery_angular_z',      0.30)
         self.declare_parameter('turn_approach_delay_s',   0.15)
+        # Post-intersection acquisition + stuck-lock watchdog (bag8 fix)
+        self.declare_parameter('acquire_guard_s',         0.4)
+        self.declare_parameter('stuck_lock_s',            1.0)
+        self.declare_parameter('stuck_lock_band_px',      16)
+        self.declare_parameter('stuck_lock_var_px',       6)
 
         self._img_w               = self.get_parameter('image_width').value
         self._img_h               = self.get_parameter('image_height').value
@@ -87,7 +97,15 @@ class LineFollowerNode(Node):
         self._lost_timeout_s      = float(self.get_parameter('lost_timeout_s').value)
         self._lost_speed_scale    = float(self.get_parameter('lost_speed_scale').value)
         self._dashed_confirm_n    = int(self.get_parameter('dashed_confirm_frames').value)
+        self._dashed_coast_s      = float(self.get_parameter('dashed_coast_s').value)
+        self._openloop_speed      = float(self.get_parameter('openloop_speed_mps').value)
+        self._openloop_dist_m     = float(self.get_parameter('openloop_dist_m').value)
+        self._recovery_angular    = float(self.get_parameter('recovery_angular_z').value)
         self._turn_approach_delay = float(self.get_parameter('turn_approach_delay_s').value)
+        self._acquire_guard_s     = float(self.get_parameter('acquire_guard_s').value)
+        self._stuck_lock_s        = float(self.get_parameter('stuck_lock_s').value)
+        self._stuck_lock_band     = float(self.get_parameter('stuck_lock_band_px').value)
+        self._stuck_lock_var      = float(self.get_parameter('stuck_lock_var_px').value)
 
         topic_in  = self.get_parameter('topic_image_in').value
         topic_cmd = self.get_parameter('topic_cmd_vel').value
@@ -115,11 +133,23 @@ class LineFollowerNode(Node):
         self._dashed_latch_t  = None
         self._dashed_latch_s  = 1.0
         self._dashed_streak   = 0   # consecutive frames the detector returned "dashed"
+        self._dashed_first_t  = None  # monotonic time when dashed was first confirmed
+        self._recovery_side   = None  # 'left'|'right'|None — for open-loop boundary recovery
 
         # Turn approach delay: when the camera first sees a sharp turn, coast at reduced
         # speed for _turn_approach_delay seconds before applying full angular correction.
         # This compensates for the camera looking ahead of the robot body.
         self._turn_first_seen_t = None   # monotonic time when large error first appeared
+
+        # Post-intersection acquisition guard + stuck-lock watchdog (bag8 fix).
+        # _was_dashed tracks the latched line_type so we can detect the dashed→solid
+        # edge and (a) re-seed the detector's anchors, (b) arm a steering cap.
+        # _acq_until caps angular output until this monotonic time after the exit.
+        # _err_hist holds recent (t, error) samples so the watchdog can detect a
+        # frozen, non-converging off-center lock (robot chasing a wall/seam).
+        self._was_dashed = False
+        self._acq_until  = None
+        self._err_hist   = deque()
 
         self._detector = CenterLineDetector(debug=self._pub_debug)
 
@@ -182,12 +212,15 @@ class LineFollowerNode(Node):
         _confirmed_dashed = (self._dashed_streak >= self._dashed_confirm_n)
         if _confirmed_dashed:
             self._dashed_latch_t = _t_latch
+            if self._dashed_first_t is None:
+                self._dashed_first_t = _t_latch
 
         if _confirmed_dashed or (self._dashed_latch_t is not None
                 and (_t_latch - self._dashed_latch_t) < self._dashed_latch_s):
             line_type = 'dashed'
         else:
             line_type = 'solid'
+            self._dashed_first_t = None  # reset so next encounter starts fresh
 
         # True loss: all three line slots have no detection this frame.
         # The detector's line_flags dict is True per slot when a real contour was assigned.
@@ -195,11 +228,54 @@ class LineFollowerNode(Node):
 
         now = time.monotonic()
 
+        # Dashed→solid edge (intersection exit): re-seed the tracker so the next
+        # assignment is anchored at image center, and arm a steering cap so the
+        # first large-error frame can't pivot ~90° onto a leftover crossing dash
+        # (bag8 Section 1). _was_dashed tracks the previous resolved line_type.
+        if self._was_dashed and line_type == 'solid':
+            self._detector.reset_tracker_anchors()
+            self._acq_until = now + self._acquire_guard_s
+            self._err_hist.clear()   # drop the pre-exit error history
+        self._was_dashed = (line_type == 'dashed')
+
         if line_type == 'dashed':
-            # Hard stop at intersection: kill motors completely.
-            # No steering, no forward motion — wait for the dashed zone to end.
-            cmd = Twist()
-            self._last_valid_cmd = cmd
+            # Three-phase intersection handling:
+            #   Phase A — Coast  (0 → dashed_coast_s): hold last PD cmd to close camera look-ahead gap.
+            #   Phase B — Open-loop advance (dashed_coast_s → coast + dist/speed): drive straight at
+            #             openloop_speed, ignoring the detector. Side-aware boundary recovery steers
+            #             angular_z if only one line remains visible.
+            #   Phase C — Stop: motors off; latch expires → normal PD resumes.
+            elapsed = (now - self._dashed_first_t) if self._dashed_first_t is not None else 0.0
+            openloop_dur = self._openloop_dist_m / max(self._openloop_speed, 0.01)
+
+            if elapsed < self._dashed_coast_s:
+                # Phase A
+                cmd = self._last_valid_cmd
+            elif elapsed < self._dashed_coast_s + openloop_dur:
+                # Phase B — open-loop straight with boundary recovery
+                cmd = Twist()
+                cmd.linear.x = self._openloop_speed * max(self._speed_scale, 1.0)
+                lf = self._detector.line_flags
+                only_right = lf['right'] and not lf['left'] and not lf['center']
+                only_left  = lf['left']  and not lf['right'] and not lf['center']
+                if only_right:
+                    cmd.angular.z = self._recovery_angular   # steer CCW (back left)
+                    self._recovery_side = 'right'
+                elif only_left:
+                    cmd.angular.z = -self._recovery_angular  # steer CW (back right)
+                    self._recovery_side = 'left'
+                elif line_lost and self._recovery_side == 'right':
+                    cmd.angular.z = self._recovery_angular
+                elif line_lost and self._recovery_side == 'left':
+                    cmd.angular.z = -self._recovery_angular
+                else:
+                    cmd.angular.z = 0.0
+                    self._recovery_side = None
+            else:
+                # Phase C — full stop
+                cmd = Twist()
+                self._last_valid_cmd = cmd
+
             self._latest_cmd = cmd
             cx_msg = Int32();  cx_msg.data = cx
             self._pub_cx.publish(cx_msg)
@@ -219,6 +295,27 @@ class LineFollowerNode(Node):
             self._latest_cmd = cmd
 
             # Still publish detections so monitors can see the loss
+            cx_msg = Int32();  cx_msg.data = cx
+            self._pub_cx.publish(cx_msg)
+            err_msg = Float32();  err_msg.data = float(cx - self._img_w // 2)
+            self._pub_error.publish(err_msg)
+            type_msg = String();  type_msg.data = line_type
+            self._pub_line_type.publish(type_msg)
+        elif self._is_stuck_lock(now, float(cx - self._img_w // 2)):
+            # Stuck-lock watchdog: the detector is reporting a real contour, but
+            # the error has been frozen far off-center and is not converging — the
+            # robot is "following" a stationary non-line (wall / floor-panel seam,
+            # bag8 Section 2). Treat it as a loss: coast briefly, then stop, instead
+            # of rotating into the obstacle forever.
+            if (self._last_valid_t is not None
+                    and (now - self._last_valid_t) < self._lost_timeout_s):
+                cmd = Twist()
+                cmd.linear.x  = self._last_valid_cmd.linear.x * self._lost_speed_scale
+                cmd.angular.z = self._last_valid_cmd.angular.z
+            else:
+                cmd = Twist()   # timeout — full stop
+            self._latest_cmd = cmd
+
             cx_msg = Int32();  cx_msg.data = cx
             self._pub_cx.publish(cx_msg)
             err_msg = Float32();  err_msg.data = float(cx - self._img_w // 2)
@@ -252,6 +349,13 @@ class LineFollowerNode(Node):
             else:
                 self._turn_first_seen_t = None
                 _in_approach = False
+
+            # Acquisition guard (bag8 Section 1): for a short window after the
+            # dashed→solid intersection exit, cap angular output the same way the
+            # turn-approach delay does, so the tracker has time to settle on the
+            # real center line before full steering is applied.
+            if self._acq_until is not None and now < self._acq_until:
+                _in_approach = True
 
             # PD steering
             if abs(error) <= self._dead_band:
@@ -320,6 +424,34 @@ class LineFollowerNode(Node):
             dbg_msg.step = dw * 3
             dbg_msg.data = array.array('B', dbg.tobytes())
             self._pub_debug_img.publish(dbg_msg)
+
+    def _is_stuck_lock(self, now, error):
+        """True when the tracked error is frozen far off-center (non-converging).
+
+        Records (t, error) into a rolling ~stuck_lock_s window. Returns True only
+        once the window is full of samples that are ALL off-center
+        (|error| > stuck_lock_band_px) AND span a tiny range
+        (max−min < stuck_lock_var_px) — i.e. the robot is chasing a stationary
+        non-line it can never center (bag8 Section 2). During the post-intersection
+        acquisition guard the watchdog is suppressed so a settling tracker is not
+        mistaken for a stuck lock.
+        """
+        self._err_hist.append((now, error))
+        while self._err_hist and (now - self._err_hist[0][0]) > self._stuck_lock_s:
+            self._err_hist.popleft()
+
+        if self._acq_until is not None and now < self._acq_until:
+            return False
+        # Need a full window of samples before judging.
+        if len(self._err_hist) < 3 or (now - self._err_hist[0][0]) < self._stuck_lock_s:
+            return False
+
+        errs = [e for _, e in self._err_hist]
+        if min(abs(e) for e in errs) <= self._stuck_lock_band:
+            return False
+        if (max(errs) - min(errs)) >= self._stuck_lock_var:
+            return False
+        return True
 
     def _cmd_publish_cb(self):
         """20 Hz timer — publishes the last computed command.

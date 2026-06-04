@@ -36,10 +36,44 @@ line_follower_node:
     # Prevents a single bad frame during a turn from triggering a false dashed detection.
     dashed_confirm_frames: 3
 
+    # Seconds to coast using last PD command after dashed is first confirmed.
+    # Closes the camera look-ahead gap before open-loop advance begins.
+    dashed_coast_s: 1.5
+
+    # Open-loop advance after dashed: drive openloop_speed_mps for openloop_dist_m / openloop_speed_mps seconds.
+    # Pure dead-reckoning — detector is ignored for steering during this phase.
+    openloop_speed_mps: 0.15
+    openloop_dist_m:    0.50
+
+    # Angular rate (rad/s) applied during open-loop if only one boundary line is visible.
+    # Steers back toward track center: only-right → CCW, only-left → CW.
+    recovery_angular_z: 0.30
+
     # Seconds to delay full angular output after a sharp turn first appears in the image.
     # The camera looks ~15 cm ahead of the wheel axle; this gives the body time to arrive
     # at the turn before committing to max steering. Tune: 0.1–0.25 s on hardware.
     turn_approach_delay_s: 0.15
+
+    # Post-intersection acquisition guard (bag8 Section-1 fix): for this many
+    # seconds after a dashed→solid exit, the tracker anchors are re-seeded to
+    # image center and angular output is capped (like turn_approach_delay) so the
+    # robot can't pivot ~90° onto a leftover crossing dash before settling.
+    acquire_guard_s: 0.4
+
+    # Stuck-lock watchdog (bag8 Section-2 fix): if the tracked error stays frozen
+    # far off-center for stuck_lock_s, the robot is "following" a stationary
+    # non-line (wall / floor-panel seam) — declare the line lost so it coasts then
+    # stops instead of rotating into the obstacle.
+    #   band: |error| above this (px) counts as off-center
+    #   var:  error spread (max-min, px) below this counts as frozen
+    # Conservative defaults: a real curve's error changes as the robot rotates
+    # and resolves within ~1 s, so a TRULY frozen error for 2.5 s with <4 px of
+    # movement is a stationary lock (wall/seam), not a curve. Tighten from real
+    # bag data: if a genuine curve ever trips it, raise stuck_lock_s; if a wall is
+    # chased too long before stopping, lower it.
+    stuck_lock_s:       2.5
+    stuck_lock_band_px: 20
+    stuck_lock_var_px:  4
 
     # Publish pipeline debug visualization on /line_follower/debug_image
     # Set to true only during tuning sessions — generates 7-tile image every frame

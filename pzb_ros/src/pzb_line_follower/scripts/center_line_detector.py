@@ -74,6 +74,19 @@ class CenterLineDetector:
     LANE_MIN_PIX   = 800   # px of mat before trusting the centroid (mat covers ~85% of ROI)
     LANE_BLEND_THR = 9999  # disabled — re-enable only after HSV re-calibration for the current track
 
+    # ── white boundary column mask ────────────────────────────────────────────
+    # Columns where >= WHITE_BOUNDARY_THRESH rows are white (V>190, S<40) are
+    # treated as boundary paper and zeroed in the binary image.
+    # Calibrated from bag5: boundary paper = 40-80 rows/col, mat reflections < 20.
+    # bag6 showed the mat itself reaches 8-30 rows under strong lighting, which
+    # caused the old threshold of 8 to false-positive and erase real line columns.
+    WHITE_BOUNDARY_THRESH = 20   # rows; boundary paper: 40-80, mat noise: <20
+    # The mask may only eat the outer WHITE_MASK_EDGE_FRAC of each side of the ROI.
+    # Boundary paper sits at the ROI edges; a real track line near center must never
+    # be erased. Without this bound, opposing left/right masks can march inward and
+    # meet at center, wiping the whole line (observed in wide_angle_bag7).
+    WHITE_MASK_EDGE_FRAC = 0.30  # never mask past 30% in from either edge
+
     # ── persistent adaptive threshold ─────────────────────────────────────────
     # Carries T across frames so the threshold drifts gradually (±10/iter)
     # instead of re-deriving from each frame's histogram like Otsu.
@@ -121,6 +134,27 @@ class CenterLineDetector:
         # so the max-jump limit adapts to the actual frame interval.
         self._last_detect_t = None
 
+    # ── tracker reset ───────────────────────────────────────────────────────
+
+    def reset_tracker_anchors(self):
+        """Clear all three-line tracker state and re-seed the center anchor.
+
+        Called by the node on the dashed→solid transition (intersection exit) so
+        the next solid-frame assignment is seeded from image center rather than
+        from stale pre-intersection positions. Without this, the minimum-cost
+        assignment in `_track_three_lines` can snap the center slot onto a
+        crossing-dash / boundary-seam left over from the junction, producing a
+        large spurious error (observed in wide_angle_bag8: cx→41, err→−119 px,
+        causing a ~90° pivot on exit).
+        """
+        for k in ('left', 'center', 'right'):
+            self.line_positions[k]    = None
+            self._line_history[k].clear()
+            self._line_lost_frames[k] = 0
+            self.line_flags[k]        = False
+        self.history.clear()
+        self.prev_cx = float(self.cameraWidth // 2)
+
     # ── main entry point ──────────────────────────────────────────────────────
 
     def detect_center_line(self, image, pre_cropped=False):
@@ -146,6 +180,45 @@ class CenterLineDetector:
         blurred = cv2.GaussianBlur(gray, (5, 5), 1.4)
         binary  = self._adaptive_threshold(blurred)
 
+        roi_h = roi.shape[0]
+
+        # White-gap mask: detect bright-white boundary paper columns and zero them out.
+        # Track lines never appear behind the white boundary sheet, so any binary pixel
+        # in those columns is noise from the paper surface, not a real line.
+        # Threshold: WHITE_BOUNDARY_THRESH rows white in a column → boundary.
+        #
+        # Two safeguards prevent the mask from erasing a real line (wide_angle_bag7):
+        #   1. Edge bound — each side may only eat the outer WHITE_MASK_EDGE_FRAC of the
+        #      ROI, so opposing masks can never meet and wipe a centered line.
+        #   2. Survivor guard — the masked binary is only committed if at least one
+        #      valid track contour survives it; otherwise the unmasked binary is kept.
+        #      A real dark line is always preferable to a full stop.
+        roi_hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        _white_mask = cv2.inRange(roi_hsv,
+                                  np.array([0, 0, 190], np.uint8),
+                                  np.array([179, 40, 255], np.uint8))
+        _white_col_counts = _white_mask.sum(axis=0) // 255
+        _boundary_cols = np.where(_white_col_counts >= self.WHITE_BOUNDARY_THRESH)[0]
+        if len(_boundary_cols) > 0:
+            _w     = roi.shape[1]
+            _mid   = _w // 2
+            _l_lim = int(_w * self.WHITE_MASK_EDGE_FRAC)            # left mask stops here
+            _r_lim = int(_w * (1.0 - self.WHITE_MASK_EDGE_FRAC))   # right mask starts here
+            _right = _boundary_cols[_boundary_cols >= _mid]
+            _left  = _boundary_cols[_boundary_cols < _mid]
+
+            _masked = binary.copy()
+            if len(_right) > 0:
+                _r0 = max(_right[0], _r_lim)
+                _masked[:, _r0:] = 0
+            if len(_left) > 0:
+                _l1 = min(_left[-1] + 1, _l_lim)
+                _masked[:, :_l1] = 0
+
+            # Survivor guard: commit the mask only if a real line remains.
+            if self._count_track_contours(_masked, roi_h) > 0:
+                binary = _masked
+
         k3      = np.ones((3, 3), np.uint8)
         k5      = np.ones((5, 5), np.uint8)
         opened  = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  k3)
@@ -154,8 +227,6 @@ class CenterLineDetector:
         # S6: contours
         contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL,
                                        cv2.CHAIN_APPROX_SIMPLE)
-
-        roi_h = roi.shape[0]
 
         # S7: classify → track
         # Far-field filter: reject contours in the top 15% of the ROI — these are
@@ -248,13 +319,13 @@ class CenterLineDetector:
                 # Too many dark pixels — lower T so fewer pixels qualify as dark
                 if T <= self.ADAPTIVE_T_MIN or direction == 1:
                     break
-                T -= 10
+                T = max(self.ADAPTIVE_T_MIN, T - 10)
                 direction = -1
             elif perc < self.ADAPTIVE_DARK_MIN:
                 # Too few dark pixels — raise T so more pixels qualify as dark
                 if T >= self.ADAPTIVE_T_MAX or direction == -1:
                     break
-                T += 10
+                T = min(self.ADAPTIVE_T_MAX, T + 10)
                 direction = 1
             else:
                 break
@@ -263,6 +334,22 @@ class CenterLineDetector:
         return binary
 
     # ── contour helpers ───────────────────────────────────────────────────────
+
+    def _count_track_contours(self, binary, roi_h):
+        """Count valid near-field track contours a binary would yield.
+
+        Runs the same morphology → contour → size → far-field filter the main
+        pipeline uses, so the white-mask survivor guard judges a mask candidate
+        by exactly what the detector would later see. Returns an int count.
+        """
+        k3      = np.ones((3, 3), np.uint8)
+        k5      = np.ones((5, 5), np.uint8)
+        opened  = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  k3)
+        cleaned = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, k5)
+        contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        return sum(1 for v in self._valid_contours(contours)
+                   if v[1] >= roi_h * 0.15)
 
     def _valid_contours(self, contours):
         """Return [(cx_f, cy_f, area, cnt)] sorted by x, MIN_AREA ≤ area ≤ MAX_AREA."""
