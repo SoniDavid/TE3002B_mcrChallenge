@@ -98,6 +98,50 @@ class LineFollowerNode(Node):
         self.declare_parameter('search_timeout_s',        1.2)
         self.declare_parameter('search_speed_mps',        0.04)
         self.declare_parameter('search_angular_z',        0.25)
+        # Curve handling (new-bags curve-understeer fix): on a sharp curve the detector
+        # sees only ONE line (the other boundary leaves frame) — that is NORMAL, not a
+        # near-loss. The old code floored speed to sharp_turn_speed there, so the robot
+        # crawled and fell behind the curve. curve_min_speed keeps it advancing so the
+        # line stays in frame while it steers around.
+        self.declare_parameter('curve_min_speed',         0.06)
+        # Steering slew-rate limit (replaces the pure output EMA): bounds the change in
+        # commanded angular.z per detector frame. Caps single-frame reversals (anti-
+        # stutter) WITHOUT lagging a sustained same-sign ramp on a real curve (which the
+        # EMA did). rad/s of az change allowed per frame. 0 disables (no limit).
+        self.declare_parameter('angular_slew_max',        0.12)
+        # Sharp-turn slew bypass (newnew-bags fix): the gentle angular_slew_max needed
+        # ~5 frames at ~7 fps to ramp steering, so the robot drove PAST tight curves
+        # before steering built up. On a genuine sharp turn (|error| ≥ slew_bypass_error_px
+        # AND consistent sign — NOT the small-error jitter the slew damps) use the larger
+        # angular_slew_max_sharp so steering reaches the PD value in 1-2 frames.
+        self.declare_parameter('slew_bypass_error_px',    80)
+        self.declare_parameter('angular_slew_max_sharp',  0.45)
+        # Curve dashed-suppression (newnew-bags fix): suppress a "dashed" classification
+        # while the steering error is past this — a real crossing is approached head-on
+        # (small error); a sharp curve (large error) breaks the line into co-linear blobs
+        # that falsely read as a dash row and zero steering mid-curve. Measured: real
+        # crossings sit at |err| 10-33 px, false-on-curve at 48-129 px → 45 separates them.
+        self.declare_parameter('dashed_suppress_error_px', 45)
+        # Tight-turn speed drop (adaptive-bags fix): above this |error| the curve is too
+        # tight to take at curve speed (the line hit the ROI edge before the robot rounded
+        # it), so drop to sharp_turn_speed for turn-radius headroom. Above the normal
+        # sharp_turn_threshold (80) so ordinary bends keep curve_min_speed (no crawl).
+        self.declare_parameter('tight_turn_error_px',     110)
+        # Stale-frame safety (adaptive_new fix): the camera stalls 0.4-1.4 s; if no new
+        # frame for frame_stale_s the 20 Hz publisher scales linear speed by
+        # stale_speed_scale so the robot doesn't drive blind off a curve. 0 disables.
+        self.declare_parameter('frame_stale_s',           0.4)
+        self.declare_parameter('stale_speed_scale',       0.0)
+        # Direction hysteresis: once steering commits to a side, the error must exceed
+        # this opposite-side threshold (px) before the command may reverse — kills the
+        # ±jitter around center from the few-px cx wobble that the dead-band alone misses.
+        self.declare_parameter('steer_hysteresis_px',     6)
+        # Error-saturation junction guard: if |error| stays at/above this for
+        # error_sat_frames consecutive frames the detector has lost the real line at a
+        # junction (cx pinned at an edge) — route to search-then-stop instead of crawling
+        # into the wall. Conservative so a genuine curve (converges < ~1 s) never trips it.
+        self.declare_parameter('error_sat_px',            150)
+        self.declare_parameter('error_sat_frames',        6)
         # Fork branch selection (pzb_not_workingcorrectly4). Default OFF: it steers the
         # bag4 fork LEFT correctly, but per-frame geometry cannot yet separate a true
         # fork from a sharp single-lane curve (regresses bad_ignment5/bad_alginment2),
@@ -146,6 +190,17 @@ class LineFollowerNode(Node):
         self._search_timeout_s    = float(self.get_parameter('search_timeout_s').value)
         self._search_speed        = float(self.get_parameter('search_speed_mps').value)
         self._search_angular      = float(self.get_parameter('search_angular_z').value)
+        self._curve_min_speed     = float(self.get_parameter('curve_min_speed').value)
+        self._angular_slew_max    = float(self.get_parameter('angular_slew_max').value)
+        self._slew_bypass_error_px = float(self.get_parameter('slew_bypass_error_px').value)
+        self._angular_slew_max_sharp = float(self.get_parameter('angular_slew_max_sharp').value)
+        self._dashed_suppress_error_px = float(self.get_parameter('dashed_suppress_error_px').value)
+        self._tight_turn_error_px = float(self.get_parameter('tight_turn_error_px').value)
+        self._frame_stale_s       = float(self.get_parameter('frame_stale_s').value)
+        self._stale_speed_scale   = float(self.get_parameter('stale_speed_scale').value)
+        self._steer_hyst_px       = float(self.get_parameter('steer_hysteresis_px').value)
+        self._error_sat_px        = float(self.get_parameter('error_sat_px').value)
+        self._error_sat_frames    = int(self.get_parameter('error_sat_frames').value)
         self._fork_select_enabled = bool(self.get_parameter('fork_select_enabled').value)
         self._align_enabled       = bool(self.get_parameter('dashed_align_enabled').value)
         self._align_deadband_deg  = float(self.get_parameter('align_deadband_deg').value)
@@ -179,19 +234,23 @@ class LineFollowerNode(Node):
         # search direction (toward the last-seen line side) on line loss.
         self._last_good_error = 0.0
 
-        # Anti-stutter state (10-attempt fix):
+        # Anti-stutter state:
         #   _error_hist  — recent raw steering errors, median-filtered before the PD so a
         #                  single cx-teleport frame can't swing the command.
-        #   _smoothed_az — EMA of the OUTPUT angular.z, so the command can't reverse
-        #                  instantly on one bad frame (the cause of the 4-8/s sign-flips).
+        #   _prev_az     — last commanded angular.z; the slew-rate limit bounds the change
+        #                  from it per frame (caps reversals without lagging a real ramp).
+        #   _steer_side  — sign of the current committed steering direction, for hysteresis.
         self._error_hist  = deque(maxlen=max(1, self._error_median_n))
-        self._smoothed_az = 0.0
+        self._prev_az     = 0.0
+        self._steer_side  = 0.0
 
         # Search-then-stop loss recovery state:
         #   _search_until — monotonic deadline of the active search window (None=idle).
         #   _search_dir   — +1/-1 steer direction (toward the last-seen line side).
+        #   _error_sat_count — consecutive frames |error| has been saturated (junction loss).
         self._search_until = None
         self._search_dir   = 0.0
+        self._error_sat_count = 0
 
         self._speed_scale = 1.0
 
@@ -200,6 +259,7 @@ class LineFollowerNode(Node):
         self._latest_cmd    = Twist()
         self._last_valid_cmd = Twist()
         self._last_valid_t   = None   # monotonic timestamp of last frame where cx was valid
+        self._last_frame_t   = None   # monotonic timestamp of the last processed camera frame
 
         # Dashed-state debounce + exit latch.
         # Entry: require _dashed_confirm_n consecutive dashed frames before switching mode.
@@ -260,6 +320,12 @@ class LineFollowerNode(Node):
         )
 
     def _image_cb(self, msg: Image):
+        # Stamp every processed camera frame (stale-frame safety): the camera runs at a
+        # poor, variable 4.7-9.5 fps with stalls up to 1.4 s, during which the robot would
+        # otherwise drive blind off a curve. The 20 Hz publish timer scales speed down if
+        # this stamp goes stale (see _cmd_publish_cb).
+        self._last_frame_t = time.monotonic()
+
         # Decode raw BGR image — zero-copy view into msg.data
         full = np.frombuffer(msg.data, np.uint8).reshape(msg.height, msg.width, 3)
 
@@ -288,6 +354,22 @@ class LineFollowerNode(Node):
 
         cx, cy = self._detector.detect_center_line(img, pre_cropped=True)
         line_type = self._detector.line_type
+
+        # Curve dashed-suppression (newnew-bags fix): a real dashed crossing is
+        # approached head-on (the robot is going straight, |error| small); a SHARP CURVE
+        # produces a large sustained steering error. On a curve the single line breaks
+        # into several short, roughly co-linear blobs that mimic a dash row and the
+        # classifier falsely returns "dashed" — which then zeroes steering (straight
+        # crossing) mid-curve and the robot drives off the bend. Measured separation is
+        # clean: real crossings here sit at |error| 10-33 px, false-on-curve ones at
+        # 48-129 px. So if the (median-filtered) steering error magnitude is past
+        # dashed_suppress_error_px, force solid and keep following the curve. Uses the
+        # last accepted error from the previous frame (this frame's PD error is computed
+        # later); a curve persists across frames so one-frame lag is harmless.
+        if (line_type == 'dashed'
+                and abs(self._last_good_error) > self._dashed_suppress_error_px):
+            line_type = 'solid'
+            self._detector.line_type = 'solid'
 
         # Dashed debounce (entry) + exit latch.
         # Entry: only confirm dashed after _dashed_confirm_n consecutive frames —
@@ -338,6 +420,22 @@ class LineFollowerNode(Node):
         # True loss: all three line slots have no detection this frame.
         # The detector's line_flags dict is True per slot when a real contour was assigned.
         line_lost = not any(self._detector.line_flags.values())
+
+        # Error-saturation junction guard (new-bags fix): at a hard junction the detector
+        # can pin cx at an image edge (cx≈0 or |error|≈half-width) for several frames —
+        # the robot then crawls into the wall chasing an error it can never null
+        # (complex_new1 t=17.4: error stuck at −160 for ~2 s). Count consecutive saturated
+        # frames; once it exceeds error_sat_frames, treat it as a near-loss (handled like
+        # line_lost → search-then-stop). Only counts in solid mode (dashed owns its own
+        # path) and resets the moment the error comes back in range, so a genuine sharp
+        # curve (which converges within ~1 s, well under the threshold) never trips it.
+        _sat_now = (line_type == 'solid'
+                    and abs(float(cx - self._img_w // 2)) >= self._error_sat_px)
+        if _sat_now:
+            self._error_sat_count += 1
+        else:
+            self._error_sat_count = 0
+        error_saturated = self._error_sat_count >= self._error_sat_frames
 
         now = time.monotonic()
 
@@ -430,9 +528,9 @@ class LineFollowerNode(Node):
                 self._last_valid_cmd = cmd
 
             self._latest_cmd = cmd
-            # Keep the anti-stutter smoothers in sync so PD resumes cleanly after the
-            # crossing (EMA continues from the issued angular; median buffer not stale).
-            self._smoothed_az = cmd.angular.z
+            # Keep the anti-stutter state in sync so PD resumes cleanly after the crossing
+            # (slew limiter continues from the issued angular; median buffer not stale).
+            self._prev_az = cmd.angular.z
             self._error_hist.clear()
             cx_msg = Int32();  cx_msg.data = cx
             self._pub_cx.publish(cx_msg)
@@ -440,14 +538,16 @@ class LineFollowerNode(Node):
             self._pub_error.publish(err_msg)
             type_msg = String();  type_msg.data = line_type
             self._pub_line_type.publish(type_msg)
-        elif line_lost:
-            # Search-then-stop loss recovery (10-attempt fix). The old behavior held the
-            # last command for lost_timeout_s (~2 frames at 7 fps) then full-stopped and
-            # never re-acquired → attempts 4 & 8 went stale forever. Now: on loss, steer
-            # toward the LAST-SEEN line side at a low forward speed for up to
-            # search_timeout_s to bring the line back into view, then STOP. Never reverse
-            # (linear stays ≥ 0), and the search angular is capped so it can't whip the
-            # robot out of bounds (attempt 3).
+        elif line_lost or error_saturated:
+            # Search-then-stop loss recovery (10-attempt fix), also entered when the error
+            # has been SATURATED for several frames at a junction (error_saturated) — the
+            # detector has effectively lost the real line, so searching beats crawling into
+            # the wall. The old behavior held the last command for lost_timeout_s (~2 frames
+            # at 7 fps) then full-stopped and never re-acquired → attempts 4 & 8 went stale
+            # forever. Now: steer toward the LAST-SEEN line side at a low forward speed for
+            # up to search_timeout_s to bring the line back into view, then STOP. Never
+            # reverse (linear stays ≥ 0), and the search angular is capped so it can't whip
+            # the robot out of bounds (attempt 3).
             if self._search_until is None:
                 # Entering search: pick the direction from the last accepted error sign.
                 # error > 0 ⇒ line was to the RIGHT of center ⇒ steer right (negative az);
@@ -472,8 +572,8 @@ class LineFollowerNode(Node):
             else:
                 cmd = Twist()   # search window expired — safe full stop, hold
             self._latest_cmd = cmd
-            # Keep the EMA in sync so PD resumes from the issued angular if the line returns.
-            self._smoothed_az = cmd.angular.z
+            # Keep the slew limiter in sync so PD resumes from the issued angular if the line returns.
+            self._prev_az = cmd.angular.z
 
             # Still publish detections so monitors can see the loss
             cx_msg = Int32();  cx_msg.data = cx
@@ -504,7 +604,7 @@ class LineFollowerNode(Node):
             else:
                 cmd = Twist()   # search window expired — safe full stop, hold
             self._latest_cmd = cmd
-            self._smoothed_az = cmd.angular.z
+            self._prev_az = cmd.angular.z
 
             cx_msg = Int32();  cx_msg.data = cx
             self._pub_cx.publish(cx_msg)
@@ -527,11 +627,30 @@ class LineFollowerNode(Node):
             # supersedes the old one-shot >max_error_jump clamp, which only caught a single
             # frame and missed the sustained swinging. Disabled when error_median_n <= 1.
             self._error_hist.append(raw_error)
+            # Steer on the MEDIAN of the last _error_median_n raw errors — on this
+            # multi-line/jigsaw track at ~7 fps the detector cx (hence error) is NOISY,
+            # bouncing frame to frame (measured at a sharp curve: 84,28,99,113,28,100,92),
+            # and the raw PD reversed steering each time (the original 4-8/s stutter). The
+            # median rejects the single-frame dips/teleports while a sustained turn (error
+            # large for ≥ ceil(n/2) frames) still passes through.
             if self._error_median_n > 1 and len(self._error_hist) > 0:
                 error = float(np.median(self._error_hist))
             else:
                 error = raw_error
             self._last_good_error = error
+
+            # Sharp-turn detection (newnew-bags fix). A real sharp turn is a LARGE,
+            # consistent-sign error — distinct from the small-error sign-flipping jitter
+            # the slew limit damps. Detect it from the MEDIAN magnitude (noise-robust, so
+            # the per-frame dips above don't drop us out of sharp mode) plus a same-sign
+            # check. In sharp mode the steering slew limit below is raised so the command
+            # reaches the PD value in 1-2 frames instead of ~5 — the robot was driving
+            # PAST tight curves because the gentle slew couldn't build steering in time.
+            # We keep steering on the MEDIAN (not raw) even in sharp mode, so the curve's
+            # detector noise is still rejected while the ramp is fast.
+            _same_sign = all((e > 0) == (error > 0)
+                             for e in self._error_hist if abs(e) > self._dead_band)
+            sharp_turn = (abs(error) >= self._slew_bypass_error_px and _same_sign)
 
             # Time-based D-term (Team2 pattern): divide by actual dt in seconds so the
             # derivative gain is FPS-invariant.  At 30 fps, dt≈33 ms; at 5 fps, dt≈200 ms.
@@ -571,22 +690,52 @@ class LineFollowerNode(Node):
                     -self._kp * error - self._kd * d_error,
                     -self._max_ang, self._max_ang,
                 ))
-                if _in_approach:
+                # The approach/acquisition cap throttles angular to 0.3*max_ang while the
+                # body catches up to a just-seen turn or settles after an intersection.
+                # But it must NOT fight a CONFIRMED sharp turn (large, consistent-sign
+                # error) — that is exactly when full steering is needed NOW or the line
+                # leaves the ROI (adaptive bags: this cap alternated node_az 0.24/0.48 on a
+                # 159 px curve, halving the steering every other frame). Skip the cap when
+                # sharp_turn is active.
+                if _in_approach and not sharp_turn:
                     approach_cap = self._max_ang * 0.3
                     angular_z = float(np.clip(angular_z, -approach_cap, approach_cap))
 
-            # Output angular EMA (10-attempt anti-stutter fix): low-pass the COMMANDED
-            # angular.z so a single bad cx frame can't reverse steering instantly — the
-            # direct cause of the 4-8/s sign-flips and the ±0.8 slams. alpha=1 disables
-            # smoothing; alpha≈0.4 keeps responsiveness while damping the jitter. The
-            # dead-band still forces an exact 0 (no creeping bias when truly centered).
+            # Direction hysteresis + steering slew-rate limit (curve-understeer fix,
+            # replaces the prior output EMA). The EMA killed single-frame jitter but it
+            # ALSO lagged a legitimate sustained curve ramp (the robot under-steered and
+            # fell behind). A slew-rate limit caps the per-frame CHANGE in angular.z —
+            # so a one-frame reversal is bounded (anti-stutter) while a steady same-sign
+            # ramp passes through at full rate (good curve tracking). Hysteresis stops the
+            # command flipping sign on the few-px cx wobble around center.
             if abs(error) <= self._dead_band:
-                self._smoothed_az = 0.0
                 angular_z = 0.0
+                self._steer_side = 0.0
             else:
-                a = self._angular_smooth_a
-                self._smoothed_az = (1.0 - a) * self._smoothed_az + a * angular_z
-                angular_z = self._smoothed_az
+                # Hysteresis: to reverse to the opposite side, the error must first exceed
+                # steer_hysteresis_px on that side; otherwise hold the committed side at 0+.
+                want_side = -1.0 if angular_z < 0 else 1.0   # az sign = steer direction
+                if (self._steer_side != 0.0 and want_side != self._steer_side
+                        and abs(error) <= self._steer_hyst_px):
+                    angular_z = 0.0
+                else:
+                    self._steer_side = want_side
+            # Node-side steering slew-rate limit. On a genuine sharp turn (large,
+            # consistent-sign error) the node slew is BYPASSED entirely so the full PD
+            # value is emitted at once — the downstream twist_slew_limiter (now at
+            # max_angular_accel=4.0 rad/s²) does the smoothing fast enough (~1 frame), so a
+            # second node-side limit only re-adds the lag that made the robot drive PAST
+            # tight curves (adaptive bags: full steering reached the motors ~0.4 s late).
+            # Bypassing here can't reintroduce stutter: stutter is small-error sign-FLIPPING,
+            # which the same-sign sharp_turn gate excludes. Small errors keep the gentle
+            # angular_slew_max for anti-stutter (the downstream node smooths those too).
+            if sharp_turn:
+                pass                                   # emit full PD value; downstream node ramps it
+            elif self._angular_slew_max > 0:
+                delta = float(np.clip(angular_z - self._prev_az,
+                                      -self._angular_slew_max, self._angular_slew_max))
+                angular_z = self._prev_az + delta
+            self._prev_az = angular_z
 
             # Curve-coupled speed reduction
             if self._max_ang > 0:
@@ -598,15 +747,30 @@ class LineFollowerNode(Node):
             linear_x  = min(self._max_lin_speed,
                             self._linear_speed * max(min_frac, speed_scale_curve))
 
-            # Visibility-based speed reduction: fewer visible lines → slower
+            # Visibility-based speed reduction: fewer visible lines → slower.
+            # CURVE-UNDERSTEER FIX: seeing only ONE line is NORMAL on a sharp curve (the
+            # other boundary leaves frame); the old code floored to sharp_turn_speed here
+            # so the robot crawled and fell behind. Use curve_min_speed instead — fast
+            # enough to keep advancing around the bend so the line stays in frame.
             n_vis = sum(self._detector.line_flags.values())
             if n_vis == 2:
                 linear_x = min(linear_x, self._linear_speed * 0.6)
             elif n_vis <= 1:
-                linear_x = self._sharp_turn_speed
+                linear_x = max(self._sharp_turn_speed, self._curve_min_speed)
 
-            # Sharp-turn override (error magnitude) — can only further reduce speed
+            # Sharp-turn override (error magnitude): a large error means a real bend — slow
+            # but DON'T crawl, or the robot can't advance through it (curve-understeer fix).
+            # Floor at curve_min_speed for a moderate bend.
             if abs(error) > self._sharp_turn_threshold:
+                linear_x = max(self._sharp_turn_speed, self._curve_min_speed)
+            # TIGHT-turn override (adaptive-bags fix): on the very tightest curves
+            # (|error| past tight_turn_error_px) even fast full steering couldn't hold the
+            # line at curve speed — the turn radius was too large and the line hit the ROI
+            # edge. Drop to the genuine slowest sharp_turn_speed there to shrink the radius
+            # (turn-radius headroom). Only the tightest regime, so normal curves keep
+            # curve_min_speed and don't crawl. Paired with the now-fast steering ramp so
+            # the robot turns hard AND slow exactly when a curve is too tight to take fast.
+            if abs(error) > self._tight_turn_error_px:
                 linear_x = self._sharp_turn_speed
 
             if self._speed_scale <= 0.0:
@@ -712,8 +876,23 @@ class LineFollowerNode(Node):
 
         Decoupled from image callbacks (Team2 pattern): the wheels keep receiving
         a steady command even when the camera briefly drops frames.
+
+        Stale-frame safety (adaptive_new fix): the camera stalls 0.4-1.4 s; driving the
+        last command forward at full speed through a blind gap runs the robot off a curve.
+        If no new frame has arrived for frame_stale_s, scale the published LINEAR speed by
+        stale_speed_scale (steering is held — turning in place toward the last-seen line is
+        safer than translating blind). Resumes full speed the moment a fresh frame lands.
+        This is a mitigation; the real fix for the low fps is on the camera/compute side.
         """
-        self._pub_cmd.publish(self._latest_cmd)
+        cmd = self._latest_cmd
+        if (self._frame_stale_s > 0 and self._last_frame_t is not None
+                and (time.monotonic() - self._last_frame_t) > self._frame_stale_s):
+            stale = Twist()
+            stale.linear.x  = cmd.linear.x * self._stale_speed_scale
+            stale.angular.z = cmd.angular.z
+            self._pub_cmd.publish(stale)
+        else:
+            self._pub_cmd.publish(cmd)
 
     def _cb_speed_scale(self, msg: Float32):
         self._speed_scale = float(msg.data)

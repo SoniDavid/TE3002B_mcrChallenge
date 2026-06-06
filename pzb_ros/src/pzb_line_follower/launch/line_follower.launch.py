@@ -49,7 +49,7 @@ def generate_launch_description():
 
     # ── Launch arguments ──────────────────────────────────────────────────────
     arg_linear_speed            = DeclareLaunchArgument('linear_speed',            default_value='0.08',  description='Forward speed (m/s)')
-    arg_Kp_angular              = DeclareLaunchArgument('Kp_angular',              default_value='0.0035', description='Proportional steering gain (rad/s per px)')
+    arg_Kp_angular              = DeclareLaunchArgument('Kp_angular',              default_value='0.0045', description='Proportional steering gain (rad/s per px). Raised 0.0035->0.0045: medium curves (40-80px) were under-steered and the line drifted off.')
     arg_Kd_angular              = DeclareLaunchArgument('Kd_angular',              default_value='0.0',    description='Derivative steering gain (rad/s per px/frame); DISABLED (anti-stutter) — output EMA + error median do the damping')
     arg_dead_band_px            = DeclareLaunchArgument('dead_band_px',            default_value='12',    description='Pixel dead band for steering (widened for anti-stutter)')
     arg_publish_debug           = DeclareLaunchArgument('publish_debug',           default_value='false', description='Publish /camera/image_debug topic')
@@ -57,7 +57,7 @@ def generate_launch_description():
     arg_curve_speed_reduction   = DeclareLaunchArgument('curve_speed_reduction',   default_value='0.75',  description='Speed reduction on turns: 0=off, 1=stop at max angular')
     arg_min_linear_speed        = DeclareLaunchArgument('min_linear_speed',        default_value='0.05',  description='Floor linear speed (m/s) — keep above motor deadband')
     arg_max_linear_accel        = DeclareLaunchArgument('max_linear_accel',        default_value='5.0',   description='Max linear acceleration for slew limiter (m/s²)')
-    arg_max_angular_accel       = DeclareLaunchArgument('max_angular_accel',       default_value='1.20',  description='Max angular acceleration for slew limiter (rad/s²)')
+    arg_max_angular_accel       = DeclareLaunchArgument('max_angular_accel',       default_value='4.0',   description='Max angular acceleration for slew limiter (rad/s²). Raised 1.20->4.0: at 1.20 the downstream slew node needed ~0.47s (~3 cam frames @7fps) to ramp steering to 0.56 rad/s, so the robot left the mat before full steering reached the motors on sharp turns. 4.0 ramps in ~0.15s (~1 frame). Linear accel is left untouched (the brown-out concern is linear steps, not angular).')
     arg_sharp_turn_threshold_px = DeclareLaunchArgument('sharp_turn_threshold_px', default_value='80',    description='|error| px above which sharp-turn slow mode activates')
     arg_sharp_turn_speed        = DeclareLaunchArgument('sharp_turn_speed',        default_value='0.03',  description='Linear speed (m/s) during sharp turns')
 

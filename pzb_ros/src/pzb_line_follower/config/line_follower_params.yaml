@@ -5,8 +5,11 @@ line_follower_node:
     image_height: 240
 
     # Proportional steering gain (rad/s per pixel of error)
-    # Increase to react more aggressively to line offset
-    Kp_angular: 0.0035
+    # Raised 0.0035->0.0045 (adaptive_new fix): medium curves were under-steered
+    # (50 px x 0.0035 = 0.175, too weak — the line drifted off). 0.0045 gives ~0.23 at
+    # 50 px / ~0.36 at 80 px, a real correction. Small errors stay gentle (dead_band +
+    # the output slew still damp the <20 px jitter, so this doesn't reintroduce stutter).
+    Kp_angular: 0.0045
 
     # Derivative steering gain (rad/s per pixel/frame of error rate)
     # DISABLED (10-attempt anti-stutter fix): at ~7 fps the cx target jumps frame to
@@ -21,18 +24,76 @@ line_follower_node:
     # produces constant micro-corrections.
     dead_band_px: 12
 
-    # ── Anti-stutter steering smoothing (10-attempt fix) ──────────────────────────
-    # angular_smooth_alpha: EMA weight on the COMMANDED angular.z (0=frozen, 1=no
-    #   smoothing). ~0.4 keeps responsiveness while killing single-frame reversals.
+    # ── Anti-stutter steering smoothing ───────────────────────────────────────────
     # error_median_n: median-filter the steering error over N detector frames so one
     #   cx-teleport frame can't swing the command; a sustained turn still gets through.
-    angular_smooth_alpha: 0.4
+    # angular_smooth_alpha: LEGACY (output EMA) — superseded by angular_slew_max below.
+    #   The EMA lagged a sustained curve ramp (caused understeer); the slew-rate limit
+    #   bounds reversals without that lag. Kept declared for backward-compat; unused.
     error_median_n: 3
+    angular_smooth_alpha: 0.4
 
-    # ── Search-then-stop loss recovery (10-attempt fix) ───────────────────────────
-    # On line loss, steer toward the last-seen side at search_speed_mps for up to
-    # search_timeout_s to bring the line back into view, then STOP. Never reverse,
-    # and search_angular_z is capped so the robot can't whip out of bounds.
+    # ── Curve handling + steering rate-limit (new-bags curve-understeer fix) ──────
+    # curve_min_speed: speed floor when only ONE line is visible or |error| is large —
+    #   a sharp curve looks like that and is NORMAL; flooring to sharp_turn_speed made
+    #   the robot crawl and fall behind. Keep it advancing so the line stays in frame.
+    # angular_slew_max: max change in commanded angular.z per detector frame (rad/s).
+    #   Caps single-frame reversals (anti-stutter) WITHOUT lagging a steady same-sign
+    #   ramp on a real curve. Lower = smoother but slower to commit; 0 disables.
+    # steer_hysteresis_px: once steering commits to a side, the error must exceed this
+    #   on the opposite side before the command may reverse — kills center jitter.
+    curve_min_speed: 0.06
+    angular_slew_max: 0.12
+    steer_hysteresis_px: 6
+    # Sharp-turn slew bypass: on a genuine sharp turn (|error| >= slew_bypass_error_px
+    # AND consistent sign — not small-error jitter) steering ramps at the larger
+    # angular_slew_max_sharp so it reaches the PD value in 1-2 frames instead of ~5.
+    # Fixes the robot driving PAST tight curves; cannot reintroduce stutter (which is
+    # small-error sign-flipping, excluded by the same-sign gate). The median error filter
+    # is also bypassed on a sharp turn so it doesn't lag the fast error rise.
+    # Lowered 80->50 (adaptive_new fix): a DEAD-ZONE existed for medium curves (|err|
+    # 40-80 px) — below the old 80 threshold they got the gentle slew (az throttled to
+    # ~0.18) and under-steered, so the line slowly drifted off (adaptive_new6 held err
+    # -50 for ~4s then lost the line). Error distribution: ~55-68% of frames <20px
+    # (straights), only ~10-15% >50px (curves), so 50 cleanly separates curves from the
+    # small-error jitter the slew damps. At >=50px + consistent sign the node now passes
+    # full PD to the downstream slew node (which ramps fast at max_angular_accel=4.0).
+    slew_bypass_error_px: 50
+    angular_slew_max_sharp: 0.45
+    # Curve dashed-suppression: ignore a "dashed" classification while |steering error|
+    # exceeds this — a real crossing is approached head-on (small error) while a sharp
+    # curve (large error) breaks the line into co-linear blobs that falsely read as a
+    # dash row and zero steering mid-curve (robot drives off the bend). Measured: real
+    # crossings at |err| 10-33 px, false-on-curve at 48-129 px → 45 cleanly separates.
+    dashed_suppress_error_px: 45
+    # Tight-turn speed drop: above this |error| (px) the curve is too tight to take at
+    # curve speed (line hit the ROI edge before the robot rounded it) — drop to
+    # sharp_turn_speed for turn-radius headroom. Above sharp_turn_threshold (80) so
+    # ordinary bends keep curve_min_speed and don't crawl. Paired with the fast steering
+    # ramp (downstream max_angular_accel raised to 4.0) so the robot turns hard AND slow
+    # only on the tightest curves.
+    tight_turn_error_px: 110
+    # Stale-frame safety: the camera runs at a poor, variable 4.7-9.5 fps with stalls up
+    # to 1.4 s. If no new frame arrives for frame_stale_s the 20 Hz publisher scales the
+    # linear speed by stale_speed_scale (steering held) so the robot doesn't drive blind
+    # off a curve, resuming when a fresh frame lands. stale_speed_scale=0 = pause-while-
+    # blind; raise toward 0.3 to keep creeping. 0 frame_stale_s disables. NOTE: this is a
+    # mitigation — the real fix for the low fps is on the camera/undistort/compute side.
+    frame_stale_s: 0.4
+    stale_speed_scale: 0.0
+
+    # ── Error-saturation junction guard ───────────────────────────────────────────
+    # If |error| stays ≥ error_sat_px for error_sat_frames consecutive solid frames the
+    # detector has pinned cx at an edge (lost the real line at a junction) — route to
+    # search-then-stop instead of crawling into the wall. Conservative: a genuine sharp
+    # curve converges within ~1 s (< error_sat_frames at ~7 fps) so it never trips this.
+    error_sat_px: 150
+    error_sat_frames: 6
+
+    # ── Search-then-stop loss recovery ────────────────────────────────────────────
+    # On line loss (or sustained error-saturation), steer toward the last-seen side at
+    # search_speed_mps for up to search_timeout_s to bring the line back into view, then
+    # STOP. Never reverse, and search_angular_z is capped so it can't whip out of bounds.
     search_timeout_s: 1.2
     search_speed_mps: 0.04
     search_angular_z: 0.25
@@ -162,10 +223,13 @@ line_follower_node:
     lost_timeout_s:   0.35
     lost_speed_scale: 0.50
 
-    # Sharp-turn override: when |error| exceeds threshold, clamp speed to sharp_turn_speed.
-    # Also used as the floor speed when fewer than 2 lines are visible (intersection handling).
-    sharp_turn_threshold_px: 60
-    sharp_turn_speed: 0.02
+    # Sharp-turn override: when |error| exceeds threshold the speed is floored — but at
+    # curve_min_speed (above), NOT the much slower sharp_turn_speed, so the robot keeps
+    # advancing through a real bend instead of crawling and falling behind (curve fix).
+    # sharp_turn_speed is now only the absolute floor; curve_min_speed dominates on curves.
+    # Threshold raised 60→80 so a moderate curve error doesn't trip the slowest regime.
+    sharp_turn_threshold_px: 80
+    sharp_turn_speed: 0.03
 
     # Input and output topic names
     # topic_cmd_vel feeds twist_slew_limiter; slew limiter outputs to /cmd_vel_desired
