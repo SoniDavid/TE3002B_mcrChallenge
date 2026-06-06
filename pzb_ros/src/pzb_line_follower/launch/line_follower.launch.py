@@ -49,9 +49,9 @@ def generate_launch_description():
 
     # ── Launch arguments ──────────────────────────────────────────────────────
     arg_linear_speed            = DeclareLaunchArgument('linear_speed',            default_value='0.08',  description='Forward speed (m/s)')
-    arg_Kp_angular              = DeclareLaunchArgument('Kp_angular',              default_value='0.005', description='Proportional steering gain (rad/s per px)')
-    arg_Kd_angular              = DeclareLaunchArgument('Kd_angular',              default_value='0.001', description='Derivative steering gain (rad/s per px/frame); 0 disables')
-    arg_dead_band_px            = DeclareLaunchArgument('dead_band_px',            default_value='8',     description='Pixel dead band for steering')
+    arg_Kp_angular              = DeclareLaunchArgument('Kp_angular',              default_value='0.0035', description='Proportional steering gain (rad/s per px)')
+    arg_Kd_angular              = DeclareLaunchArgument('Kd_angular',              default_value='0.0',    description='Derivative steering gain (rad/s per px/frame); DISABLED (anti-stutter) — output EMA + error median do the damping')
+    arg_dead_band_px            = DeclareLaunchArgument('dead_band_px',            default_value='12',    description='Pixel dead band for steering (widened for anti-stutter)')
     arg_publish_debug           = DeclareLaunchArgument('publish_debug',           default_value='false', description='Publish /camera/image_debug topic')
     arg_use_traffic             = DeclareLaunchArgument('use_traffic',             default_value='true',  description='Launch traffic light detector and FSM')
     arg_curve_speed_reduction   = DeclareLaunchArgument('curve_speed_reduction',   default_value='0.75',  description='Speed reduction on turns: 0=off, 1=stop at max angular')

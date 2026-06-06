@@ -6,15 +6,36 @@ line_follower_node:
 
     # Proportional steering gain (rad/s per pixel of error)
     # Increase to react more aggressively to line offset
-    Kp_angular: 0.003
+    Kp_angular: 0.0035
 
     # Derivative steering gain (rad/s per pixel/frame of error rate)
-    # Damps oscillation/weaving; start around Kp*0.3 and tune up
-    # Set to 0.0 to disable (pure P)
-    Kd_angular: 0.001
+    # DISABLED (10-attempt anti-stutter fix): at ~7 fps the cx target jumps frame to
+    # frame on this multi-line/jigsaw-seam track; the D-term amplified each jump into a
+    # steering slam (a -58 px one-frame error → +0.64 rad/s, observed az=+0.8 at only
+    # 58 px error) and drove the 4-8/s sign-flips. Smoothing is now done by the output
+    # angular EMA + error median filter below instead.
+    Kd_angular: 0.0
 
-    # Pixel dead band around image center — no steering correction within this range
-    dead_band_px: 8
+    # Pixel dead band around image center — no steering correction within this range.
+    # Widened 8→12 (anti-stutter): small centering noise around the line no longer
+    # produces constant micro-corrections.
+    dead_band_px: 12
+
+    # ── Anti-stutter steering smoothing (10-attempt fix) ──────────────────────────
+    # angular_smooth_alpha: EMA weight on the COMMANDED angular.z (0=frozen, 1=no
+    #   smoothing). ~0.4 keeps responsiveness while killing single-frame reversals.
+    # error_median_n: median-filter the steering error over N detector frames so one
+    #   cx-teleport frame can't swing the command; a sustained turn still gets through.
+    angular_smooth_alpha: 0.4
+    error_median_n: 3
+
+    # ── Search-then-stop loss recovery (10-attempt fix) ───────────────────────────
+    # On line loss, steer toward the last-seen side at search_speed_mps for up to
+    # search_timeout_s to bring the line back into view, then STOP. Never reverse,
+    # and search_angular_z is capped so the robot can't whip out of bounds.
+    search_timeout_s: 1.2
+    search_speed_mps: 0.04
+    search_angular_z: 0.25
 
     # Forward speed in m/s (desired; curve reduction may reduce this)
     linear_speed: 0.10
@@ -40,14 +61,71 @@ line_follower_node:
     # Closes the camera look-ahead gap before open-loop advance begins.
     dashed_coast_s: 1.5
 
-    # Open-loop advance after dashed: drive openloop_speed_mps for openloop_dist_m / openloop_speed_mps seconds.
-    # Pure dead-reckoning — detector is ignored for steering during this phase.
-    openloop_speed_mps: 0.15
+    # Open-loop advance after dashed: drive STRAIGHT across the intersection for
+    # openloop_dist_m of track, then stop. The crossing speed now MATCHES the
+    # robot's approach (cruise) speed so there is no velocity jump (bad_alginment
+    # fix) — openloop_speed_mps is only a FALLBACK if the approach speed is invalid.
+    openloop_speed_mps: 0.15    # fallback crossing speed only
     openloop_dist_m:    0.50
 
-    # Angular rate (rad/s) applied during open-loop if only one boundary line is visible.
-    # Steers back toward track center: only-right → CCW, only-left → CW.
-    recovery_angular_z: 0.30
+    # During the dashed crossing the robot drives straight (angular.z=0) and
+    # re-acquires the 3 lines on the far side. The legacy side-aware boundary
+    # recovery (which produced visible mid-crossing turns) is OFF by default;
+    # set true to re-enable it (uses recovery_angular_z below).
+    dashed_recovery_enabled: false
+    recovery_angular_z: 0.30    # only used if dashed_recovery_enabled: true
+
+    # Single-frame error-jump clamp (bad_alginment fix): if the steering error
+    # jumps more than this many px in ONE frame (a cx teleport onto a crossing
+    # dash / outermost line near an intersection), reject it for one frame so the
+    # PD doesn't slam the steering. A real sharp turn persists and is accepted on
+    # the next frame. Set 0 to disable.
+    max_error_jump_px: 60
+
+    # Fork branch selection (pzb_not_workingcorrectly4). At a Y-fork the lane-center
+    # (L+R)/2 averages the two diverging branches into a straight target and the
+    # robot misses the turn; this steers toward the branch that continues the line it
+    # is already on (base-proximity continuity). VERIFIED to steer the bag4 fork LEFT
+    # offline. Default FALSE: per-frame geometry cannot yet separate a real fork from
+    # a sharp single-lane curve (it regresses bad_ignment5 / bad_alginment2), so it is
+    # gated until a temporal/exits-based discriminator is added. Set true to A/B test
+    # the fork path on the bag4 route only.
+    fork_select_enabled: false
+
+    # Perpendicular dashed-alignment (bad_alginment2 fix): before crossing, rotate
+    # the robot to be perpendicular to the dashes using the median dash-slope (the
+    # detector fits it from dash candidates only, so it's a clean signal). This is
+    # essential for future intersection actions beyond going straight.
+    #   enabled        — master switch
+    #   deadband_deg   — within this tilt the robot is "perpendicular enough" (no steer)
+    #   k_align_z      — rad/s per degree of tilt (P gain; raise for faster squaring)
+    #   align_max_z    — cap on alignment angular.z
+    #   align_sign     — +1/-1 rotation direction; FLIP if it aligns the wrong way
+    #   median_n       — number of valid slope samples to median-filter (noise reject)
+    #   align_timeout_s— (legacy) max time spent aligning before crossing anyway
+    # Strong safeguards (bad_ignment4 fix) — alignment was firing on an already-
+    # straight robot from a degraded end-of-crossing slope reading (+32° when the
+    # truth was +1–2°), rotating it off the straight lines it should have followed:
+    #   align_window_s    — only correct in this early window after dashed entry;
+    #                       after it, cross straight (the dash row degrades as the
+    #                       robot overlaps it). An in-deadband reading latches
+    #                       "aligned" immediately and never re-steers.
+    #   align_max_tilt_deg— reject slope frames implying a larger tilt than this as
+    #                       physically implausible garbage (don't feed the median).
+    # DISABLED (10-attempt fix): the only required action at a dashed crossing right now
+    # is to cross STRAIGHT (signs/YOLO will choose the direction later). With alignment
+    # off the node latches "aligned" immediately on dashed entry and goes straight to the
+    # straight-crossing phase (angular.z=0) — removing the unverified align_sign rotation
+    # as a variable (attempts 5/6/7/9 went the wrong way at the junction).
+    dashed_align_enabled: false
+    align_deadband_deg:   6.0
+    k_align_z:            0.015
+    align_max_z:          0.30
+    align_sign:           1
+    align_slope_median_n: 5
+    align_timeout_s:      1.2
+    align_window_s:       2.0
+    align_max_tilt_deg:   35.0
 
     # Seconds to delay full angular output after a sharp turn first appears in the image.
     # The camera looks ~15 cm ahead of the wheel axle; this gives the body time to arrive
