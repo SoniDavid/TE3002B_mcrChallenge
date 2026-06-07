@@ -11,10 +11,10 @@ color_detector_node:
     # Red wraps around H=0/180, so two sub-ranges are needed.
     red_h_low1:  0       # lower sub-range [0, 10]
     red_h_high1: 10
-    red_h_low2:  165     # upper sub-range [165, 180]
+    red_h_low2:  170     # upper sub-range [170, 180]
     red_h_high2: 180
-    red_s_min:   100     # rosbag analysis: actual red light S_avg=87-162; 175 missed everything
-    red_v_min:   80      # rosbag analysis: V_avg as low as 95 in real red frames
+    red_s_min:   175     # raised from 140 — skin S is ~50-140, iPad red S is ~200-255
+    red_v_min:   140     # raised from 120 — screen red is bright
 
     # Yellow: #FFF200 → OpenCV H≈28; paper reflects so S is lower than a screen
     green_h_low:  42
@@ -29,7 +29,7 @@ color_detector_node:
     yellow_v_min:  160   # still bright white-ish paper
 
     # --- Detection robustness ---
-    min_blob_area:   120.0   # px² — circularity filter handles false-positive rejection
+    min_blob_area:   120.0   # px² — circularity filter now rejects non-round blobs, so threshold can be lower
     confirm_frames:  4       # consecutive frames of same color before updating output
     loop_hz:         30.0
 
