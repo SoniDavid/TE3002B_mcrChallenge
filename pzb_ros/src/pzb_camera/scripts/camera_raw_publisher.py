@@ -44,7 +44,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 
-from sensor_msgs.msg import Image, CameraInfo
+from sensor_msgs.msg import Image, CameraInfo, CompressedImage
 
 
 _RELIABLE_QOS = QoSProfile(
@@ -87,6 +87,14 @@ class CameraRawPublisher(Node):
         self.declare_parameter('publish_camera_info', False)
         self.declare_parameter('camera_info_file',    '')
         self.declare_parameter('topic_camera_info',   '/camera/camera_info')
+        # Optional JPEG-compressed stream off the FULL frame (for off-board YOLO on the
+        # laptop GPU). Default OFF so the on-device line follower pays nothing; enable with
+        # publish_compressed:=true. Built from the same GStreamer 'full' appsink frame —
+        # no extra camera handle — so it coexists with the raw/small streams (unlike the
+        # standalone camera_compressed_publisher, which re-opens the CSI camera).
+        self.declare_parameter('publish_compressed',  False)
+        self.declare_parameter('jpeg_quality',        75)
+        self.declare_parameter('topic_compressed',    '/camera/image_compressed')
 
         sensor_id          = int(self.get_parameter('sensor_id').value)
         self._width        = int(self.get_parameter('width').value)
@@ -107,6 +115,16 @@ class CameraRawPublisher(Node):
 
         self._pub_raw   = self.create_publisher(Image, topic_raw,   _IMAGE_QOS)
         self._pub_small = self.create_publisher(Image, topic_small, _IMAGE_QOS)
+
+        # ── Optional compressed publisher (off the full frame) ────────────────
+        self._pub_compressed = None
+        self._jpeg_quality   = int(self.get_parameter('jpeg_quality').value)
+        if bool(self.get_parameter('publish_compressed').value):
+            topic_comp = self.get_parameter('topic_compressed').value
+            self._pub_compressed = self.create_publisher(
+                CompressedImage, topic_comp, _IMAGE_QOS)
+            self.get_logger().info(
+                f'Compressed publisher ENABLED → {topic_comp} (JPEG q={self._jpeg_quality})')
 
         # ── Undistort map for the SMALL stream (scaled K) ─────────────────────
         # The full stream is published RAW (YOLO undistorts off-board), so the costly
@@ -253,6 +271,19 @@ class CameraRawPublisher(Node):
         else:
             self._publish(self._pub_raw, frame, stamp)
             self._n_full += 1
+            # JPEG-compress the full frame for off-board YOLO — only when enabled AND
+            # someone is subscribed, so it costs nothing otherwise.
+            if (self._pub_compressed is not None
+                    and self._pub_compressed.get_subscription_count() > 0):
+                ok, buf = cv2.imencode(
+                    '.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, self._jpeg_quality])
+                if ok:
+                    cmsg = CompressedImage()
+                    cmsg.header.stamp    = stamp
+                    cmsg.header.frame_id = self._frame_id
+                    cmsg.format = 'jpeg'
+                    cmsg.data   = array.array('B', buf.tobytes())
+                    self._pub_compressed.publish(cmsg)
             if self._pub_camera_info is not None and self._camera_info_msg is not None:
                 self._camera_info_msg.header.stamp = stamp
                 self._pub_camera_info.publish(self._camera_info_msg)

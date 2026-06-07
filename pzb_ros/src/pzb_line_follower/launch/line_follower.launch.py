@@ -63,6 +63,8 @@ def generate_launch_description():
     arg_max_angular_accel       = DeclareLaunchArgument('max_angular_accel',       default_value='4.0',   description='Max angular acceleration for slew limiter (rad/s²). Raised 1.20->4.0: at 1.20 the downstream slew node needed ~0.47s (~3 cam frames @7fps) to ramp steering to 0.56 rad/s, so the robot left the mat before full steering reached the motors on sharp turns. 4.0 ramps in ~0.15s (~1 frame). Linear accel is left untouched (the brown-out concern is linear steps, not angular).')
     arg_sharp_turn_threshold_px = DeclareLaunchArgument('sharp_turn_threshold_px', default_value='60',    description='|error| px above which sharp-turn slow mode activates. Lowered 80->60 (opt-bags turn fix) so the hard curve-speed floor engages earlier, paired with the new error-driven early braking (curve_brake_error_px).')
     arg_sharp_turn_speed        = DeclareLaunchArgument('sharp_turn_speed',        default_value='0.03',  description='Linear speed (m/s) during sharp turns')
+    arg_publish_compressed      = DeclareLaunchArgument('publish_compressed',      default_value='false', description='Also publish a JPEG /camera/image_compressed off the full frame (for off-board YOLO on the laptop GPU). Built from the same GStreamer full appsink — no extra camera handle — so it coexists with the line follower. Only encodes when a subscriber is present.')
+    arg_jpeg_quality            = DeclareLaunchArgument('jpeg_quality',            default_value='75',    description='JPEG quality (1-100) for /camera/image_compressed')
 
     # ── 1. MCU bridge ─────────────────────────────────────────────────────────
     # Bridges the STM32 over UART to ROS 2 — publishes /wheel_speeds, subscribes /cmd_vel.
@@ -93,6 +95,8 @@ def generate_launch_description():
             'small_height':        LaunchConfiguration('small_height'),
             'camera_info_file':    cam_info,
             'publish_camera_info': True,
+            'publish_compressed':  LaunchConfiguration('publish_compressed'),
+            'jpeg_quality':        LaunchConfiguration('jpeg_quality'),
         }],
     )
 
@@ -210,6 +214,8 @@ def generate_launch_description():
         arg_max_angular_accel,
         arg_sharp_turn_threshold_px,
         arg_sharp_turn_speed,
+        arg_publish_compressed,
+        arg_jpeg_quality,
 
         # node_mcu_bridge,          # 1 — MCU serial bridge (commented: start separately)
         node_camera,                # 2 — CSI camera + lens undistortion → /camera/image_raw
