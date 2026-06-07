@@ -98,6 +98,20 @@ class LineFollowerNode(Node):
         self.declare_parameter('search_timeout_s',        1.2)
         self.declare_parameter('search_speed_mps',        0.04)
         self.declare_parameter('search_angular_z',        0.25)
+        # Non-terminal rotate-until-found recovery (opt-bags stale fix). The old
+        # search-then-STOP latched a permanent (0,0) once the search window expired and
+        # never re-acquired (opt6/7/8 sat stale forever). Now, after the Phase-1 forward
+        # creep, the robot does an IN-PLACE rotation sweep (linear=0, never drive into a
+        # wall) toward the last-seen side, reversing every search_sweep_s so it scans both
+        # sides instead of spinning past the line — and keeps doing it until a line is
+        # re-acquired. search_rotate_z = capped in-place yaw during the sweep.
+        self.declare_parameter('search_rotate_z',         0.30)
+        self.declare_parameter('search_sweep_s',          2.0)
+        # Blind-stall full stop: frame_stale_s holds steering through a brief drop, but a
+        # multi-second camera FREEZE (both streams hang 3-9 s, opt6-9) would let the
+        # recovery rotation spin the robot blind. Past frame_blind_s with no fresh frame,
+        # publish a full (0,0) stop; the sweep resumes the instant frames return.
+        self.declare_parameter('frame_blind_s',           1.0)
         # Curve handling (new-bags curve-understeer fix): on a sharp curve the detector
         # sees only ONE line (the other boundary leaves frame) — that is NORMAL, not a
         # near-loss. The old code floored speed to sharp_turn_speed there, so the robot
@@ -127,6 +141,15 @@ class LineFollowerNode(Node):
         # it), so drop to sharp_turn_speed for turn-radius headroom. Above the normal
         # sharp_turn_threshold (80) so ordinary bends keep curve_min_speed (no crawl).
         self.declare_parameter('tight_turn_error_px',     110)
+        # Error-driven early braking (opt-bags turn-overshoot fix): the prior curve
+        # slowdown coupled speed to the SLEW-LIMITED angular.z, which lags the turn —
+        # at turn entry |error| is already large but angular.z is still ramping, so the
+        # robot stayed near full speed exactly when it should brake and the line swept
+        # off the squashed ROI before it could round the bend (opt5 t≈15: error 4→159,
+        # cx pinned at 319 in ~0.1 s). This brakes off the IMMEDIATE |error| instead, so
+        # the robot slows the instant a turn is SEEN. curve_brake_error_px = the |error|
+        # at which the full curve_speed_reduction applies.
+        self.declare_parameter('curve_brake_error_px',    90)
         # Stale-frame safety (adaptive_new fix): the camera stalls 0.4-1.4 s; if no new
         # frame for frame_stale_s the 20 Hz publisher scales linear speed by
         # stale_speed_scale so the robot doesn't drive blind off a curve. 0 disables.
@@ -190,12 +213,16 @@ class LineFollowerNode(Node):
         self._search_timeout_s    = float(self.get_parameter('search_timeout_s').value)
         self._search_speed        = float(self.get_parameter('search_speed_mps').value)
         self._search_angular      = float(self.get_parameter('search_angular_z').value)
+        self._search_rotate_z     = float(self.get_parameter('search_rotate_z').value)
+        self._search_sweep_s      = float(self.get_parameter('search_sweep_s').value)
+        self._frame_blind_s       = float(self.get_parameter('frame_blind_s').value)
         self._curve_min_speed     = float(self.get_parameter('curve_min_speed').value)
         self._angular_slew_max    = float(self.get_parameter('angular_slew_max').value)
         self._slew_bypass_error_px = float(self.get_parameter('slew_bypass_error_px').value)
         self._angular_slew_max_sharp = float(self.get_parameter('angular_slew_max_sharp').value)
         self._dashed_suppress_error_px = float(self.get_parameter('dashed_suppress_error_px').value)
         self._tight_turn_error_px = float(self.get_parameter('tight_turn_error_px').value)
+        self._curve_brake_error_px = float(self.get_parameter('curve_brake_error_px').value)
         self._frame_stale_s       = float(self.get_parameter('frame_stale_s').value)
         self._stale_speed_scale   = float(self.get_parameter('stale_speed_scale').value)
         self._steer_hyst_px       = float(self.get_parameter('steer_hysteresis_px').value)
@@ -250,6 +277,11 @@ class LineFollowerNode(Node):
         #   _error_sat_count — consecutive frames |error| has been saturated (junction loss).
         self._search_until = None
         self._search_dir   = 0.0
+        #   _search_sweep_dir/_until — Phase-2 in-place rotation sweep state (rotate one
+        #   way until _search_sweep_until, then reverse) so the robot scans both sides and
+        #   never latches a permanent stop.
+        self._search_sweep_dir   = 1.0
+        self._search_sweep_until = None
         self._error_sat_count = 0
 
         self._speed_scale = 1.0
@@ -270,6 +302,10 @@ class LineFollowerNode(Node):
         self._dashed_streak   = 0   # consecutive frames the detector returned "dashed"
         self._dashed_first_t  = None  # monotonic time when dashed was first confirmed
         self._recovery_side   = None  # 'left'|'right'|None — for open-loop boundary recovery
+        # Live-error abort of a false dashed-on-curve (opt-bags drive-off fix):
+        # consecutive same-sign frames whose LIVE cx error exceeds the suppress threshold.
+        self._dashed_live_break_count = 0
+        self._dashed_live_break_sign  = 0
 
         # Perpendicular dashed-alignment (bad_alginment2 fix): rolling buffer of
         # recent VALID dash-slope samples (median-filtered to reject the noisy
@@ -405,6 +441,44 @@ class LineFollowerNode(Node):
             line_type = 'solid'
             self._dashed_first_t = None  # reset so next encounter starts fresh
 
+        # Live-error abort of a false dashed-on-curve (opt-bags drive-off fix). The
+        # suppress guard above checks _last_good_error, which is FROZEN during a latched
+        # crossing (only updated in the solid branch) — so a curve whose line broke into
+        # co-linear blobs while still near center latches dashed at small error, then
+        # crosses STRAIGHT (angular.z=0) while the TRUE error balloons off-track (opt4
+        # t≈104.2-105.8: entered dashed at err≈11, then cx 250→287 / err→127 driving off
+        # the bend). Re-check the LIVE error here: if it exceeds dashed_suppress_error_px
+        # for ≥2 consecutive same-sign frames the "dashes" are a curve, not a crossing —
+        # break the latch and resume solid PD this frame. A real head-on crossing keeps a
+        # small live error and is unaffected.
+        if line_type == 'dashed':
+            _live_err = float(cx - self._img_w // 2)
+            _same = (self._dashed_live_break_sign == 0
+                     or (_live_err > 0) == (self._dashed_live_break_sign > 0))
+            if abs(_live_err) > self._dashed_suppress_error_px and _same:
+                self._dashed_live_break_count += 1
+                self._dashed_live_break_sign = 1 if _live_err > 0 else -1
+            else:
+                self._dashed_live_break_count = 0
+                self._dashed_live_break_sign  = 0
+            if self._dashed_live_break_count >= 2:
+                line_type = 'solid'
+                self._detector.line_type = 'solid'
+                # Break the dashed latch entirely so PD steering resumes.
+                self._dashed_latch_t = None
+                self._dashed_streak  = 0
+                self._dashed_first_t = None
+                self._aligned_latch  = False
+                self._dashed_live_break_count = 0
+                self._dashed_live_break_sign  = 0
+                # We are following a continuous (curving) line, NOT exiting an
+                # intersection — suppress the dashed→solid anchor reset below so the
+                # tracker isn't re-centered off the curve's offset line.
+                self._was_dashed = False
+        else:
+            self._dashed_live_break_count = 0
+            self._dashed_live_break_sign  = 0
+
         # Feed the dash-slope median buffer ONLY from clean, plausible dash-row
         # readings (bad_ignment4 fix). The raw slope degrades to garbage at the END
         # of a crossing (robot overlaps the dashes / sees the straight lines ahead),
@@ -539,41 +613,13 @@ class LineFollowerNode(Node):
             type_msg = String();  type_msg.data = line_type
             self._pub_line_type.publish(type_msg)
         elif line_lost or error_saturated:
-            # Search-then-stop loss recovery (10-attempt fix), also entered when the error
-            # has been SATURATED for several frames at a junction (error_saturated) — the
-            # detector has effectively lost the real line, so searching beats crawling into
-            # the wall. The old behavior held the last command for lost_timeout_s (~2 frames
-            # at 7 fps) then full-stopped and never re-acquired → attempts 4 & 8 went stale
-            # forever. Now: steer toward the LAST-SEEN line side at a low forward speed for
-            # up to search_timeout_s to bring the line back into view, then STOP. Never
-            # reverse (linear stays ≥ 0), and the search angular is capped so it can't whip
-            # the robot out of bounds (attempt 3).
-            if self._search_until is None:
-                # Entering search: pick the direction from the last accepted error sign.
-                # error > 0 ⇒ line was to the RIGHT of center ⇒ steer right (negative az);
-                # error < 0 ⇒ line was to the LEFT ⇒ steer left (positive az). Fall back
-                # to the recovery side, else don't rotate (just creep straight).
-                if self._last_good_error > self._dead_band:
-                    self._search_dir = -1.0
-                elif self._last_good_error < -self._dead_band:
-                    self._search_dir = +1.0
-                elif self._recovery_side == 'right':
-                    self._search_dir = -1.0
-                elif self._recovery_side == 'left':
-                    self._search_dir = +1.0
-                else:
-                    self._search_dir = 0.0
-                self._search_until = now + self._search_timeout_s
-
-            if now < self._search_until:
-                cmd = Twist()
-                cmd.linear.x  = max(0.0, self._search_speed)   # forward only, never reverse
-                cmd.angular.z = self._search_dir * self._search_angular
-            else:
-                cmd = Twist()   # search window expired — safe full stop, hold
-            self._latest_cmd = cmd
-            # Keep the slew limiter in sync so PD resumes from the issued angular if the line returns.
-            self._prev_az = cmd.angular.z
+            # Non-terminal rotate-until-found recovery (opt-bags stale fix), also entered
+            # when |error| has been SATURATED for several frames at a junction
+            # (error_saturated). Phase 1 creeps forward toward the last-seen side, Phase 2
+            # rotates in place sweeping both sides until the line returns — it never
+            # latches a permanent (0,0) stop (the old search-then-STOP sat opt6/7/8 stale
+            # forever). See _search_recovery_cmd.
+            self._search_recovery_cmd(now)
 
             # Still publish detections so monitors can see the loss
             cx_msg = Int32();  cx_msg.data = cx
@@ -586,25 +632,9 @@ class LineFollowerNode(Node):
             # Stuck-lock watchdog: the detector is reporting a real contour, but the
             # error has been frozen far off-center and is not converging — the robot is
             # "following" a stationary non-line (wall / floor-panel seam, bag8 Section 2).
-            # Route it into the SAME search-then-stop recovery as a true loss: steer
-            # toward the last-seen side briefly to re-find the real line, then stop.
-            if self._search_until is None:
-                if self._last_good_error > self._dead_band:
-                    self._search_dir = -1.0
-                elif self._last_good_error < -self._dead_band:
-                    self._search_dir = +1.0
-                else:
-                    self._search_dir = 0.0
-                self._search_until = now + self._search_timeout_s
-
-            if now < self._search_until:
-                cmd = Twist()
-                cmd.linear.x  = max(0.0, self._search_speed)
-                cmd.angular.z = self._search_dir * self._search_angular
-            else:
-                cmd = Twist()   # search window expired — safe full stop, hold
-            self._latest_cmd = cmd
-            self._prev_az = cmd.angular.z
+            # Route it into the SAME non-terminal rotate-until-found recovery as a true
+            # loss: creep toward the last-seen side, then sweep in place until re-acquired.
+            self._search_recovery_cmd(now)
 
             cx_msg = Int32();  cx_msg.data = cx
             self._pub_cx.publish(cx_msg)
@@ -743,9 +773,19 @@ class LineFollowerNode(Node):
             else:
                 angular_fraction = 0.0
             speed_scale_curve = 1.0 - self._curve_reduction * angular_fraction
+            # Error-driven early braking (opt-bags turn-overshoot fix): brake off the
+            # IMMEDIATE |error| (the look-ahead signal) instead of waiting for the
+            # slew-limited angular.z to ramp. error_frac ramps 0→1 as |error| grows from
+            # the dead band to curve_brake_error_px, so the robot is already slowing the
+            # instant a turn appears in the ROI — before the line can sweep off the edge.
+            # Take whichever of the two scales brakes more so neither under-slows a turn.
+            _brake_span = max(1.0, self._curve_brake_error_px - self._dead_band)
+            error_frac  = float(np.clip((abs(error) - self._dead_band) / _brake_span, 0.0, 1.0))
+            speed_scale_error = 1.0 - self._curve_reduction * error_frac
+            speed_scale = min(speed_scale_curve, speed_scale_error)
             min_frac  = self._min_lin_speed / self._linear_speed if self._linear_speed > 0 else 0.0
             linear_x  = min(self._max_lin_speed,
-                            self._linear_speed * max(min_frac, speed_scale_curve))
+                            self._linear_speed * max(min_frac, speed_scale))
 
             # Visibility-based speed reduction: fewer visible lines → slower.
             # CURVE-UNDERSTEER FIX: seeing only ONE line is NORMAL on a sharp curve (the
@@ -824,6 +864,55 @@ class LineFollowerNode(Node):
         aligning = (line_type == 'dashed') and (not self._aligned_latch)
         self._detector.branch_select_enabled = self._fork_select_enabled and (not aligning)
 
+    def _search_recovery_cmd(self, now):
+        """Non-terminal loss recovery (opt-bags stale fix): rotate until found.
+
+        Phase 1 (search_timeout_s): creep FORWARD toward the last-seen side at
+        search_speed to bring the line back with minimal motion. Phase 2 (until a line
+        is re-acquired): IN-PLACE rotation sweep — linear=0 (never drive blind into a
+        wall), rotating search_rotate_z toward the last-seen side and reversing every
+        search_sweep_s so it scans both sides instead of spinning past the line. Never
+        latches a permanent stop. The normal branch clears _search_until on re-acquire,
+        which re-seeds this FSM next loss.
+        """
+        if self._search_until is None:
+            # Entering search: initial direction from the last accepted error sign.
+            # error > 0 ⇒ line was RIGHT of center ⇒ steer/rotate right (negative az);
+            # error < 0 ⇒ line was LEFT ⇒ positive az. Fall back to the recovery side.
+            if self._last_good_error > self._dead_band:
+                self._search_dir = -1.0
+            elif self._last_good_error < -self._dead_band:
+                self._search_dir = +1.0
+            elif self._recovery_side == 'right':
+                self._search_dir = -1.0
+            elif self._recovery_side == 'left':
+                self._search_dir = +1.0
+            else:
+                self._search_dir = 0.0
+            self._search_until = now + self._search_timeout_s
+            # Phase-2 sweep starts toward the same side (default right if unknown).
+            self._search_sweep_dir   = self._search_dir if self._search_dir != 0.0 else 1.0
+            self._search_sweep_until = self._search_until + self._search_sweep_s
+
+        cmd = Twist()
+        if now < self._search_until:
+            # Phase 1 — forward creep toward the last-seen side (capped angular).
+            cmd.linear.x  = max(0.0, self._search_speed)
+            cmd.angular.z = self._search_dir * self._search_angular
+        else:
+            # Phase 2 — in-place rotation sweep, reversing every search_sweep_s. The
+            # first half-segment scans the entry side; subsequent segments are doubled so
+            # the sweep covers symmetric ±search_sweep_s arc around the entry heading.
+            if now >= self._search_sweep_until:
+                self._search_sweep_dir   = -self._search_sweep_dir
+                self._search_sweep_until = now + 2.0 * self._search_sweep_s
+            cmd.linear.x  = 0.0
+            cmd.angular.z = self._search_sweep_dir * self._search_rotate_z
+        self._latest_cmd = cmd
+        # Keep the slew limiter in sync so PD resumes from the issued angular on re-acquire.
+        self._prev_az = cmd.angular.z
+        return cmd
+
     def _is_stuck_lock(self, now, error):
         """True when the tracked error is frozen far off-center (non-converging).
 
@@ -885,8 +974,15 @@ class LineFollowerNode(Node):
         This is a mitigation; the real fix for the low fps is on the camera/compute side.
         """
         cmd = self._latest_cmd
-        if (self._frame_stale_s > 0 and self._last_frame_t is not None
-                and (time.monotonic() - self._last_frame_t) > self._frame_stale_s):
+        blind_for = (time.monotonic() - self._last_frame_t) if self._last_frame_t is not None else 0.0
+        if (self._frame_blind_s > 0 and self._last_frame_t is not None
+                and blind_for > self._frame_blind_s):
+            # Multi-second camera FREEZE (opt6-9: both streams hang 3-9 s): fully stop so
+            # the recovery rotation can't spin the robot blind. Resumes the instant a
+            # fresh frame lands (_last_frame_t updates in the image callback).
+            self._pub_cmd.publish(Twist())
+        elif (self._frame_stale_s > 0 and self._last_frame_t is not None
+                and blind_for > self._frame_stale_s):
             stale = Twist()
             stale.linear.x  = cmd.linear.x * self._stale_speed_scale
             stale.angular.z = cmd.angular.z

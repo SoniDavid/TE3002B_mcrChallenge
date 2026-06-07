@@ -48,17 +48,20 @@ def generate_launch_description():
     undistort_file = '/home/puzzlebot/streaming/camera_params.json'
 
     # ── Launch arguments ──────────────────────────────────────────────────────
-    arg_linear_speed            = DeclareLaunchArgument('linear_speed',            default_value='0.08',  description='Forward speed (m/s)')
+    arg_linear_speed            = DeclareLaunchArgument('linear_speed',            default_value='0.06',  description='Forward speed (m/s). Lowered 0.08->0.06 (opt-bags turn fix): at 0.08 sharp turns outran the squashed-ROI look-ahead — the line swept off the edge before the robot rounded the bend (opt5/opt4 went out of bounds). Slower entry buys reaction frames and tightens the achievable radius (R=v/w, w capped). Following all 3 lines > speed.')
     arg_Kp_angular              = DeclareLaunchArgument('Kp_angular',              default_value='0.0045', description='Proportional steering gain (rad/s per px). Raised 0.0035->0.0045: medium curves (40-80px) were under-steered and the line drifted off.')
     arg_Kd_angular              = DeclareLaunchArgument('Kd_angular',              default_value='0.0',    description='Derivative steering gain (rad/s per px/frame); DISABLED (anti-stutter) — output EMA + error median do the damping')
     arg_dead_band_px            = DeclareLaunchArgument('dead_band_px',            default_value='12',    description='Pixel dead band for steering (widened for anti-stutter)')
     arg_publish_debug           = DeclareLaunchArgument('publish_debug',           default_value='false', description='Publish /camera/image_debug topic')
-    arg_use_traffic             = DeclareLaunchArgument('use_traffic',             default_value='true',  description='Launch traffic light detector and FSM')
+    arg_use_traffic             = DeclareLaunchArgument('use_traffic',             default_value='true',  description='Launch traffic light detector and FSM. It subscribes to the FULL-res /camera/image_raw (now raw/undistorted-off). It frame-skips (every 3rd frame) to limit CPU; if the Jetson is still tight, it can be repointed to /camera/image_small (it downscales its crop to 320x160 either way) or undistort re-enabled for it.')
+    arg_undistort_enabled       = DeclareLaunchArgument('undistort_enabled',       default_value='true',  description='Apply lens undistortion to the small (line-follower) stream. Set false to A/B test the CPU saving (the follower is closed-loop and tolerates mild distortion).')
+    arg_small_width             = DeclareLaunchArgument('small_width',             default_value='480',   description='Hardware-downscaled width for the line-follower stream (/camera/image_small)')
+    arg_small_height            = DeclareLaunchArgument('small_height',            default_value='270',   description='Hardware-downscaled height for the line-follower stream (/camera/image_small)')
     arg_curve_speed_reduction   = DeclareLaunchArgument('curve_speed_reduction',   default_value='0.75',  description='Speed reduction on turns: 0=off, 1=stop at max angular')
     arg_min_linear_speed        = DeclareLaunchArgument('min_linear_speed',        default_value='0.05',  description='Floor linear speed (m/s) — keep above motor deadband')
     arg_max_linear_accel        = DeclareLaunchArgument('max_linear_accel',        default_value='5.0',   description='Max linear acceleration for slew limiter (m/s²)')
     arg_max_angular_accel       = DeclareLaunchArgument('max_angular_accel',       default_value='4.0',   description='Max angular acceleration for slew limiter (rad/s²). Raised 1.20->4.0: at 1.20 the downstream slew node needed ~0.47s (~3 cam frames @7fps) to ramp steering to 0.56 rad/s, so the robot left the mat before full steering reached the motors on sharp turns. 4.0 ramps in ~0.15s (~1 frame). Linear accel is left untouched (the brown-out concern is linear steps, not angular).')
-    arg_sharp_turn_threshold_px = DeclareLaunchArgument('sharp_turn_threshold_px', default_value='80',    description='|error| px above which sharp-turn slow mode activates')
+    arg_sharp_turn_threshold_px = DeclareLaunchArgument('sharp_turn_threshold_px', default_value='60',    description='|error| px above which sharp-turn slow mode activates. Lowered 80->60 (opt-bags turn fix) so the hard curve-speed floor engages earlier, paired with the new error-driven early braking (curve_brake_error_px).')
     arg_sharp_turn_speed        = DeclareLaunchArgument('sharp_turn_speed',        default_value='0.03',  description='Linear speed (m/s) during sharp turns')
 
     # ── 1. MCU bridge ─────────────────────────────────────────────────────────
@@ -73,8 +76,10 @@ def generate_launch_description():
     # )
 
     # ── 2. Camera ─────────────────────────────────────────────────────────────
-    # Opens the IMX219 CSI camera, applies lens undistortion (camera_params.json),
-    # and publishes /camera/image_raw + /camera/camera_info.
+    # Opens the IMX219 CSI camera and publishes DUAL hardware-scaled streams (CPU fix):
+    #   /camera/image_raw   — FULL 1280x720, raw (for off-board YOLO / recording)
+    #   /camera/image_small — 480x270 hardware-downscaled (for the line follower)
+    # Undistortion is applied only to the small stream (toggle: undistort_enabled).
     # Comment out when replaying a bag or using an external camera node.
     node_camera = Node(
         package='pzb_camera',
@@ -83,6 +88,9 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'undistort_file':      undistort_file,
+            'undistort_enabled':   LaunchConfiguration('undistort_enabled'),
+            'small_width':         LaunchConfiguration('small_width'),
+            'small_height':        LaunchConfiguration('small_height'),
             'camera_info_file':    cam_info,
             'publish_camera_info': True,
         }],
@@ -151,6 +159,10 @@ def generate_launch_description():
                 'sharp_turn_threshold_px': LaunchConfiguration('sharp_turn_threshold_px'),
                 'sharp_turn_speed':        LaunchConfiguration('sharp_turn_speed'),
                 'topic_cmd_vel':           '/cmd_vel_desired_raw',
+                # Consume the hardware-downscaled stream (CPU fix) — the follower resizes
+                # any input to its 320x80 ROI, and the uniform downscale preserves the
+                # ROI anisotropy ratio (0.889), so no detector change is needed.
+                'topic_image_in':          '/camera/image_small',
             },
         ],
     )
@@ -189,6 +201,9 @@ def generate_launch_description():
         arg_dead_band_px,
         arg_publish_debug,
         arg_use_traffic,
+        arg_undistort_enabled,
+        arg_small_width,
+        arg_small_height,
         arg_curve_speed_reduction,
         arg_min_linear_speed,
         arg_max_linear_accel,

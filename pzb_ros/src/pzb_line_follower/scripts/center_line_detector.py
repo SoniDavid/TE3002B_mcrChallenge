@@ -39,6 +39,19 @@ class CenterLineDetector:
     MIN_AREA        = 50    # px² — ignore blobs smaller than this
     MAX_AREA        = 4000  # px² — ignore merged blobs (from v3)
     SIGNIFICANT_AREA= 500   # px² — real track lines are >= this (from v3)
+
+    # ── jigsaw puzzle-seam rejection (opt-bags center-loss fix) ────────────────
+    # The white puzzle-piece cutout seams on the mat appear as thin, wiggly, closed
+    # loops in the binary and were being assigned to L/C/R line slots — on a sharp
+    # curve they competed with the real boundary and made the 'center' flicker
+    # (opt9 cx 113↔160). A real track line / crossing dash is an elongated, well-
+    # FILLED stripe (high extent AND high solidity); a seam squiggle doubles back so
+    # BOTH are low. Reject only SMALL contours (real boundaries are larger and never
+    # touched) and only when BOTH metrics are low — conservative, so real curved line
+    # fragments and solid dashes survive. Tuned from opt9 t40-41 seam contours.
+    SEAM_MAX_AREA     = 500   # px² — only test sub-significant blobs
+    SEAM_MAX_EXTENT   = 0.32  # area/(bbox area) below this = thin & wiggly, not a stripe
+    SEAM_MAX_SOLIDITY = 0.45  # area/(hull area) below this = doubles back, not a line
     SAMPLE_OFFSET   = 28    # px — bilateral brightness sample distance
     BRIGHT_THR      = 120   # grayscale threshold for "bright" track surface
     MEDIAN_K        = 3     # median filter window (frames)
@@ -57,8 +70,13 @@ class CenterLineDetector:
     # swap identity on a curve and teleport the target. A half-width memory lets us
     # infer the lane center when only one boundary is visible, and a rate-based jump
     # guard rejects a teleport (hold the previous lane center instead).
-    LANE_CENTER_JUMP_PS    = 1500  # px/s — max plausible lane-center motion on a curve
+    LANE_CENTER_JUMP_PS    = 1000  # px/s — max plausible lane-center motion on a curve
+                                   # (lowered 1500→1000, opt-bags center-loss fix: at
+                                   # 17 fps the old bound was ≈88 px/frame so the ~45 px
+                                   # opt9 slot-swap flicker passed undamped)
     LANE_HALFWIDTH_MEDIAN_N = 7    # frames of (R−L)/2 to median for half-width memory
+    LANE_CENTER_MEDIAN_N    = 3    # frames of lane-center to median (kills a 1-frame swap
+                                   # that slips under the jump guard, opt-bags fix)
 
     # ── fork branch selection (pzb_not_workingcorrectly4) ─────────────────────
     # At a Y-fork the lane-center (L+R)/2 averages the two diverging branches into a
@@ -173,6 +191,7 @@ class CenterLineDetector:
         # Lane-center tracking state (bad_ignment5 curve fix)
         self._lane_center      = None                          # last lane-center cx
         self._halfwidth_hist   = deque(maxlen=self.LANE_HALFWIDTH_MEDIAN_N)
+        self._lane_center_hist = deque(maxlen=self.LANE_CENTER_MEDIAN_N)
 
         # Fork branch-selection state (pzb_not_workingcorrectly4)
         self._approach_slope       = 0.0    # EMA of the followed line's heading slope (Δx/Δy)
@@ -223,6 +242,7 @@ class CenterLineDetector:
         # Reset lane-center state so a post-intersection curve starts fresh.
         self._lane_center = None
         self._halfwidth_hist.clear()
+        self._lane_center_hist.clear()
         # Reset fork/approach state — a post-intersection branch starts fresh.
         self._approach_slope = 0.0
         self.fork_active     = False
@@ -432,6 +452,18 @@ class CenterLineDetector:
             area = cv2.contourArea(cnt)
             if area < self.MIN_AREA or area > self.MAX_AREA:
                 continue
+            # Jigsaw puzzle-seam rejection (opt-bags center-loss fix): drop small, thin,
+            # wiggly closed loops that are mat seams, not track lines. Only small blobs
+            # are tested (real boundaries are larger and pass straight through), and BOTH
+            # fill-extent AND solidity must be low, so elongated line fragments and solid
+            # crossing dashes (both high-extent) are never rejected.
+            if area < self.SEAM_MAX_AREA:
+                _x, _y, bw, bh = cv2.boundingRect(cnt)
+                extent   = area / float(bw * bh) if bw * bh > 0 else 1.0
+                hull_a   = cv2.contourArea(cv2.convexHull(cnt))
+                solidity = area / hull_a if hull_a > 0 else 1.0
+                if extent < self.SEAM_MAX_EXTENT and solidity < self.SEAM_MAX_SOLIDITY:
+                    continue
             M = cv2.moments(cnt)
             if M['m00'] == 0:
                 continue
@@ -846,21 +878,37 @@ class CenterLineDetector:
                 self.fork_choice    = choice
                 self._fork_branches = branches
 
+        # Continuity reference: where the lane-center was last frame (which side of the
+        # lane the robot is in). Used to lock the single-boundary offset SIGN below.
+        prev_center = self._lane_center if self._lane_center is not None else (
+            self.prev_cx if self.prev_cx is not None else w / 2.0)
+
         if fork_cx is not None:
             # Steer toward the chosen branch's base; do NOT learn half-width here
             # (the branches are diverging, not a parallel lane pair).
             cx_center = float(fork_cx)
         elif L_ok and R_ok:
-            # Both boundaries: lane-center = midpoint; learn the lane half-width.
+            # Both boundaries: lane-center = midpoint; learn the lane half-width. This
+            # track's lane is WIDE (boundaries ~270 px apart in the 320 ROI), so the
+            # half-width is legitimately large — do NOT reject it.
             cx_center = (L + R) / 2.0
             self._halfwidth_hist.append((R - L) / 2.0)
         elif (L_ok or R_ok) and len(self._halfwidth_hist) > 0:
-            # One boundary: infer the lane-center from the learned half-width so we
-            # don't snap to a slot when the other boundary drops out on a curve.
+            # One boundary visible (the other left the frame on a curve): infer the
+            # lane-center from the learned half-width. OPT-BAGS WRONG-SIDE FIX — the offset
+            # SIGN is locked by CONTINUITY (offset from the visible line TOWARD the prior
+            # lane-center), NOT the per-frame L/R slot label. The old `(L+hw)/(R−hw)` used
+            # the slot label, which flips on a curve and threw the center to the EMPTY far
+            # side of the only line (opt12: the right boundary at 286 got labeled R →
+            # R−hw=152 when labeled right but +hw=420/off-screen when mislabeled; the
+            # continuity sign gives 286−hw=152 regardless of the label). This keeps the
+            # center on the lane side of the line and is continuous with the (L+R)/2 pair.
             hw = float(np.median(self._halfwidth_hist))
-            cx_center = (L + hw) if L_ok else (R - hw)
+            X = float(L if L_ok else R)
+            side = 1.0 if X < prev_center else -1.0   # +1 ⇒ center is right of the line
+            cx_center = X + side * hw
         elif C is not None and self.line_flags['center']:
-            # No usable boundary pair — fall back to the center slot if it is real.
+            # No usable boundary — fall back to the center slot if it is real.
             cx_center = float(C)
         elif self._lane_center is not None:
             cx_center = self._lane_center
@@ -879,6 +927,15 @@ class CenterLineDetector:
             # Move at most lane_bound toward the new estimate (damp the teleport).
             step = lane_bound if cx_center > self._lane_center else -lane_bound
             cx_center = self._lane_center + step
+
+        # Lane-center median smoothing (opt-bags center-loss fix): a ~45 px slot-swap
+        # slips UNDER the jump guard above at low fps, so the 'center' still flickered
+        # frame-to-frame (opt9 cx 113↔160). Median the last LANE_CENTER_MEDIAN_N values
+        # so a single-frame swap is outvoted while a sustained curve (consistent move ≥
+        # ceil(n/2) frames) tracks through with ≤1 frame lag.
+        self._lane_center_hist.append(cx_center)
+        if len(self._lane_center_hist) >= 2:
+            cx_center = float(np.median(self._lane_center_hist))
 
         self._lane_center = float(cx_center)
         # Keep the center slot anchored at the lane-center so next-frame assignment

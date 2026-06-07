@@ -1,29 +1,44 @@
 #!/usr/bin/env python3
 """
-IMX219 CSI camera publisher — raw only.
+IMX219 CSI camera publisher — DUAL hardware-scaled streams.
 
 Publishes:
-  /camera/image_raw   (sensor_msgs/Image, BEST_EFFORT)  raw BGR
-  /camera/camera_info (sensor_msgs/CameraInfo)           optional intrinsics
+  /camera/image_raw    (sensor_msgs/Image, BEST_EFFORT)  FULL-res BGR (1280x720) — for
+                       off-board YOLO / recording. NOT undistorted (undistort off-board).
+  /camera/image_small  (sensor_msgs/Image, BEST_EFFORT)  hardware-downscaled BGR
+                       (default 480x270) — for the on-board line follower. Optionally
+                       lens-undistorted (undistort_enabled).
+  /camera/camera_info  (sensor_msgs/CameraInfo)          optional intrinsics (full-res K).
 
-Threading model (adapted from Team2's rectify_compress.py):
-  - Capture thread: GStreamer → frame → writes to shared slot, notifies Condition.
-  - Publish thread: waits on Condition, publishes Image using array.array fast-path.
+Why two streams (CPU-starvation fix):
+  The Jetson Nano was CPU-bound (4 cores ~95%, GPU idle) because the node undistorted and
+  published a full 1280x720 frame every tick, yet the line follower only uses a 320x80
+  ROI. nvvidconv downscales on the VIC HARDWARE (~0 CPU), so a `tee` feeds two
+  hardware-scaled appsinks: a full stream for YOLO and a small cheap stream for the
+  follower. The expensive full-res cv2.remap (undistort) is removed from the full path
+  entirely; the small path's undistort (if enabled) is cheap at low res.
 
-The array.array fast-path is critical: rclpy iterates Image.data byte-by-byte through
-a Python isinstance check when the field is a plain bytes object.  For 1280×720 this
-takes ~1.3 s per publish, capping the effective rate at < 1 Hz.
-array.array activates the rclpy buffer protocol path and reduces this to ~8 ms.
+Threading:
+  Native GStreamer (gi) pipeline with a tee + two appsinks. Each appsink fires a
+  `new-sample` callback on a GStreamer streaming thread; the callback maps the buffer,
+  (optionally undistorts the small one), and publishes via the rclpy buffer fast-path.
+  A GLib.MainLoop in a daemon thread services the pipeline bus. rclpy.spin runs the node.
+
+The array.array fast-path is critical: rclpy iterates Image.data byte-by-byte through a
+Python isinstance check when the field is plain bytes (~1.3 s per 1280x720 publish).
+array.array activates the buffer protocol and drops that to ~8 ms.
 """
 
 import array
 import json
 import threading
-import time
-import yaml
 
-import cv2
 import numpy as np
+import cv2
+
+import gi
+gi.require_version('Gst', '1.0')
+from gi.repository import Gst, GLib
 
 import rclpy
 from rclpy.node import Node
@@ -40,8 +55,7 @@ _RELIABLE_QOS = QoSProfile(
 )
 
 # Camera images are a streaming sensor type — BEST_EFFORT avoids ACK backpressure
-# from slow subscribers (e.g. ros2 bag record writing to disk),
-# which would otherwise throttle the publish rate.
+# from slow subscribers (e.g. ros2 bag record writing to disk).
 _IMAGE_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
     durability=DurabilityPolicy.VOLATILE,
@@ -55,72 +69,78 @@ class CameraRawPublisher(Node):
     def __init__(self):
         super().__init__('camera_raw_publisher')
 
+        # ── Parameters ────────────────────────────────────────────────────────
         self.declare_parameter('sensor_id',           0)
-        self.declare_parameter('width',               1280)
+        self.declare_parameter('width',               1280)   # sensor capture size
         self.declare_parameter('height',              720)
-        self.declare_parameter('out_width',           1280)
+        self.declare_parameter('out_width',           1280)   # FULL published size
         self.declare_parameter('out_height',          720)
+        self.declare_parameter('small_width',         480)    # downscaled (follower) size
+        self.declare_parameter('small_height',        270)
         self.declare_parameter('framerate',           30)
         self.declare_parameter('flip_method',         0)
         self.declare_parameter('frame_id',            'camera_optical_frame')
         self.declare_parameter('topic_raw',           '/camera/image_raw')
-        self.declare_parameter('color_cal_file',      '')
+        self.declare_parameter('topic_small',         '/camera/image_small')
         self.declare_parameter('undistort_file',      '')
+        self.declare_parameter('undistort_enabled',   True)   # applies to SMALL stream only
         self.declare_parameter('publish_camera_info', False)
         self.declare_parameter('camera_info_file',    '')
         self.declare_parameter('topic_camera_info',   '/camera/camera_info')
 
-        sensor_id         = self.get_parameter('sensor_id').value
-        self._width       = self.get_parameter('width').value
-        self._height      = self.get_parameter('height').value
-        self._out_w       = self.get_parameter('out_width').value
-        self._out_h       = self.get_parameter('out_height').value
-        self._fps         = self.get_parameter('framerate').value
-        self._flip_method = int(self.get_parameter('flip_method').value)
-        self._frame_id    = self.get_parameter('frame_id').value
-        topic_raw         = self.get_parameter('topic_raw').value
+        sensor_id          = int(self.get_parameter('sensor_id').value)
+        self._width        = int(self.get_parameter('width').value)
+        self._height       = int(self.get_parameter('height').value)
+        self._out_w        = int(self.get_parameter('out_width').value)
+        self._out_h        = int(self.get_parameter('out_height').value)
+        self._small_w      = int(self.get_parameter('small_width').value)
+        self._small_h      = int(self.get_parameter('small_height').value)
+        self._fps          = int(self.get_parameter('framerate').value)
+        self._flip_method  = int(self.get_parameter('flip_method').value)
+        self._frame_id     = self.get_parameter('frame_id').value
+        topic_raw          = self.get_parameter('topic_raw').value
+        topic_small        = self.get_parameter('topic_small').value
+        self._undist_en    = bool(self.get_parameter('undistort_enabled').value)
 
-        # Use all 4 Jetson Nano cores for OpenCV operations (Team2 technique).
+        # Use all 4 cores for OpenCV (e.g. the small-stream remap).
         cv2.setNumThreads(4)
 
-        self._pub_raw = self.create_publisher(Image, topic_raw, _IMAGE_QOS)
+        self._pub_raw   = self.create_publisher(Image, topic_raw,   _IMAGE_QOS)
+        self._pub_small = self.create_publisher(Image, topic_small, _IMAGE_QOS)
 
-        # ── Lens undistortion ─────────────────────────────────────────────────
-        self._map1 = self._map2 = None
+        # ── Undistort map for the SMALL stream (scaled K) ─────────────────────
+        # The full stream is published RAW (YOLO undistorts off-board), so the costly
+        # full-res remap is gone. The small stream optionally undistorts at low res; the
+        # intrinsics K are calibrated at (width x height), so scale them to (small_w x
+        # small_h). dist coeffs are dimensionless (radial) → unchanged.
+        self._small_map1 = self._small_map2 = None
         undistort_file = self.get_parameter('undistort_file').value
-        if undistort_file:
+        if undistort_file and self._undist_en:
             try:
                 with open(undistort_file) as f:
                     cal = json.load(f)
-                K    = np.array(cal['K'],    dtype=np.float64)
+                K    = np.array(cal['K'],    dtype=np.float64).reshape(3, 3)
                 dist = np.array(cal['dist'], dtype=np.float64)
-                self._map1, self._map2 = cv2.initUndistortRectifyMap(
-                    K, dist, None, K, (self._out_w, self._out_h), cv2.CV_16SC2)
+                sx = self._small_w / float(self._width)
+                sy = self._small_h / float(self._height)
+                Ks = K.copy()
+                Ks[0, 0] *= sx; Ks[0, 2] *= sx   # fx, cx
+                Ks[1, 1] *= sy; Ks[1, 2] *= sy   # fy, cy
+                self._small_map1, self._small_map2 = cv2.initUndistortRectifyMap(
+                    Ks, dist, None, Ks, (self._small_w, self._small_h), cv2.CV_16SC2)
                 self.get_logger().info(
-                    f'Undistortion loaded: {undistort_file}  '
-                    f'(RMSE={cal.get("rmse", "?")} px)')
+                    f'Undistortion ENABLED on {topic_small} '
+                    f'({self._small_w}x{self._small_h}, K scaled by {sx:.3f}x{sy:.3f}, '
+                    f'RMSE={cal.get("rmse", "?")} px)')
             except Exception as e:
-                self.get_logger().warning(f'Could not load undistort_file "{undistort_file}": {e}')
+                self.get_logger().warning(
+                    f'Could not load undistort_file "{undistort_file}": {e}')
+        else:
+            self.get_logger().info(
+                f'Undistortion DISABLED on {topic_small} '
+                f'(undistort_enabled={self._undist_en}, file={"set" if undistort_file else "empty"})')
 
-        # ── Color calibration ─────────────────────────────────────────────────
-        self._color_gains = None
-        cal_file = self.get_parameter('color_cal_file').value
-        if cal_file:
-            try:
-                cal = np.load(cal_file)
-                gains = cal['arr_0'].astype(np.float32)
-                self.get_logger().info(
-                    f'Color calibration loaded: shape={gains.shape}, file={cal_file}')
-                if gains.ndim == 3 and gains.shape != (self._out_h, self._out_w, 3):
-                    self.get_logger().warning(
-                        f'color_gains shape {gains.shape} != frame shape '
-                        f'({self._out_h},{self._out_w},3) — disabling color correction')
-                    gains = None
-                self._color_gains = gains
-            except Exception as e:
-                self.get_logger().warning(f'Could not load color_cal_file "{cal_file}": {e}')
-
-        # ── CameraInfo publisher ──────────────────────────────────────────────
+        # ── CameraInfo publisher (full-res K) ─────────────────────────────────
         self._pub_camera_info = None
         self._camera_info_msg = None
         if self.get_parameter('publish_camera_info').value:
@@ -129,10 +149,8 @@ class CameraRawPublisher(Node):
                 try:
                     self._camera_info_msg = self._load_camera_info(info_file)
                     self._pub_camera_info = self.create_publisher(
-                        CameraInfo,
-                        self.get_parameter('topic_camera_info').value,
-                        _RELIABLE_QOS,
-                    )
+                        CameraInfo, self.get_parameter('topic_camera_info').value,
+                        _RELIABLE_QOS)
                     self.get_logger().info(f'CameraInfo loaded: {info_file}')
                 except Exception as e:
                     self.get_logger().warning(f'Could not load camera_info_file "{info_file}": {e}')
@@ -140,63 +158,136 @@ class CameraRawPublisher(Node):
                 self.get_logger().warning(
                     'publish_camera_info=true but camera_info_file is empty — skipping')
 
-        # ── GStreamer pipeline ────────────────────────────────────────────────
-        pipeline = self._gstreamer_pipeline(sensor_id)
-        self.get_logger().info(f'Opening pipeline:\n  {pipeline}')
+        # ── FPS stats ─────────────────────────────────────────────────────────
+        self._n_full = 0
+        self._n_small = 0
+        self._t_stats = self.get_clock().now()
 
-        self._cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
-        if not self._cap.isOpened():
-            self.get_logger().fatal(
-                'Failed to open camera. Check that:\n'
-                '  1. nvargus-daemon is running  (sudo systemctl start nvargus-daemon)\n'
-                '  2. The flex cable is seated correctly\n'
-                '  3. No other process has the camera open'
-            )
-            raise RuntimeError('Camera open failed')
+        # ── GStreamer pipeline: tee → two hardware-scaled appsinks ────────────
+        Gst.init(None)
+        self._pipeline = Gst.parse_launch(self._pipeline_str(sensor_id))
 
+        self._sink_full  = self._pipeline.get_by_name('full')
+        self._sink_small = self._pipeline.get_by_name('small')
+        for sink in (self._sink_full, self._sink_small):
+            sink.set_property('emit-signals', True)
+            sink.set_property('max-buffers', 1)
+            sink.set_property('drop', True)
+            sink.set_property('sync', False)
+        self._sink_full.connect('new-sample',  self._on_sample, 'full')
+        self._sink_small.connect('new-sample', self._on_sample, 'small')
+
+        bus = self._pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect('message', self._on_bus)
+
+        self._glib_loop = GLib.MainLoop()
+        self._glib_thread = threading.Thread(
+            target=self._glib_loop.run, name='gst_mainloop', daemon=True)
+        self._glib_thread.start()
+
+        rc = self._pipeline.set_state(Gst.State.PLAYING)
         self.get_logger().info(
-            f'Camera ready  {self._width}x{self._height}'
-            f'  -> published at {self._out_w}x{self._out_h}'
-            f'  -> {topic_raw}'
-        )
+            f'Camera pipeline PLAYING ({rc.value_nick})  '
+            f'{self._width}x{self._height} -> full {self._out_w}x{self._out_h} '
+            f'({topic_raw}) + small {self._small_w}x{self._small_h} ({topic_small})')
 
-        # ── Shared state (Condition-based, Team2 pattern) ─────────────────────
-        # One Condition guards the shared slot.  The capture thread writes into
-        # _slot and increments _slot_seq, then notifies.  The publish thread
-        # wakes, grabs the reference, and publishes.  If the publish thread is
-        # slower than capture, the slot is simply overwritten — newest frame wins.
-        self._capture_thread_running = True
-        self._slot_cv   = threading.Condition()
-        self._slot      = None   # (stamp, frame ndarray) or None
-        self._slot_seq  = 0      # incremented on every captured frame
-        self._pub_seq   = 0     # sequence last published
-
-        # Reconnect counters (kept from original)
-        self._consecutive_failures  = 0
-        self._reconnect_attempts    = 0
-        self._MAX_CONSECUTIVE_FAILURES = 10
-        self._MAX_RECONNECT_ATTEMPTS   = 5
-        self._RECONNECT_SLEEP_SEC      = 3.0
-
-        # FPS statistics (Team2 pattern)
-        self._cap_frames = 0
-        self._pub_frames = 0
-        self._t_stats    = self.get_clock().now()
-
-        self._cap_thread = threading.Thread(
-            target=self._capture_loop, name='camera_capture', daemon=True)
-        self._pub_thread = threading.Thread(
-            target=self._publish_loop, name='camera_publish', daemon=True)
-
-        self._cap_thread.start()
-        self._pub_thread.start()
-
-        # Stats every 5 s — instant visibility into achieved fps (Team2 pattern).
         self.create_timer(5.0, self._log_stats)
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
+    # ── GStreamer pipeline string ──────────────────────────────────────────────
+
+    def _sensor_framerate(self) -> int:
+        # The 1280x720 sensor mode supports 60 fps; otherwise use the requested fps.
+        return 60 if (self._width == 1280 and self._height == 720) else self._fps
+
+    def _pipeline_str(self, sensor_id: int) -> str:
+        sfps = self._sensor_framerate()
+        # nvarguscamerasrc (ISP) -> NVMM -> tee -> two nvvidconv (VIC hardware) branches.
+        # Each branch: flip + scale to its target size in hardware, then a CPU videoconvert
+        # to BGR for the appsink. The FULL branch keeps out_w x out_h; the SMALL branch
+        # scales to small_w x small_h (the big CPU saving — every downstream op is ~Nx
+        # cheaper on the small frame).
+        return (
+            f'nvarguscamerasrc sensor-id={sensor_id} ! '
+            f'video/x-raw(memory:NVMM), width={self._width}, height={self._height}, '
+            f'framerate={sfps}/1 ! tee name=t '
+            f't. ! queue max-size-buffers=1 leaky=downstream ! '
+            f'nvvidconv flip-method={self._flip_method} ! '
+            f'video/x-raw, width={self._out_w}, height={self._out_h}, format=BGRx ! '
+            f'videoconvert ! video/x-raw, format=BGR ! '
+            f'appsink name=full emit-signals=true max-buffers=1 drop=true sync=false '
+            f't. ! queue max-size-buffers=1 leaky=downstream ! '
+            f'nvvidconv flip-method={self._flip_method} ! '
+            f'video/x-raw, width={self._small_w}, height={self._small_h}, format=BGRx ! '
+            f'videoconvert ! video/x-raw, format=BGR ! '
+            f'appsink name=small emit-signals=true max-buffers=1 drop=true sync=false'
+        )
+
+    # ── appsink callback ────────────────────────────────────────────────────────
+
+    def _on_sample(self, sink, which):
+        """Pull one frame from an appsink and publish it (runs on a GStreamer thread)."""
+        sample = sink.emit('pull-sample')
+        if sample is None:
+            return Gst.FlowReturn.OK
+        buf  = sample.get_buffer()
+        caps = sample.get_caps().get_structure(0)
+        w = caps.get_value('width')
+        h = caps.get_value('height')
+        ok, mi = buf.map(Gst.MapFlags.READ)
+        if not ok:
+            return Gst.FlowReturn.OK
+        try:
+            # Copy out of the mapped buffer (freed on unmap). BGR, tightly packed.
+            frame = np.frombuffer(mi.data, np.uint8, w * h * 3).reshape(h, w, 3).copy()
+        finally:
+            buf.unmap(mi)
+
+        stamp = self.get_clock().now().to_msg()
+        if which == 'small':
+            if self._small_map1 is not None:
+                frame = cv2.remap(frame, self._small_map1, self._small_map2,
+                                  cv2.INTER_LINEAR)
+            self._publish(self._pub_small, frame, stamp)
+            self._n_small += 1
+        else:
+            self._publish(self._pub_raw, frame, stamp)
+            self._n_full += 1
+            if self._pub_camera_info is not None and self._camera_info_msg is not None:
+                self._camera_info_msg.header.stamp = stamp
+                self._pub_camera_info.publish(self._camera_info_msg)
+        return Gst.FlowReturn.OK
+
+    def _publish(self, pub, frame, stamp):
+        h, w, c = frame.shape
+        msg = Image()
+        msg.header.stamp    = stamp
+        msg.header.frame_id = self._frame_id
+        msg.height       = h
+        msg.width        = w
+        msg.encoding     = 'bgr8'
+        msg.is_bigendian = 0
+        msg.step         = w * c
+        # array.array activates rclpy's buffer fast-path (avoids the per-byte loop).
+        msg.data = array.array('B', frame.tobytes())
+        pub.publish(msg)
+
+    # ── bus + stats + cleanup ───────────────────────────────────────────────────
+
+    def _on_bus(self, bus, message):
+        t = message.type
+        if t == Gst.MessageType.ERROR:
+            err, dbg = message.parse_error()
+            self.get_logger().error(f'GStreamer ERROR: {err} | {dbg}')
+        elif t == Gst.MessageType.EOS:
+            self.get_logger().error('GStreamer end-of-stream (camera dropped).')
+        elif t == Gst.MessageType.WARNING:
+            warn, dbg = message.parse_warning()
+            self.get_logger().warning(f'GStreamer WARN: {warn} | {dbg}')
+        return True
 
     def _load_camera_info(self, path: str) -> CameraInfo:
+        import yaml
         with open(path) as f:
             d = yaml.safe_load(f)
         msg = CameraInfo()
@@ -210,147 +301,24 @@ class CameraRawPublisher(Node):
         msg.p = d['projection_matrix']['data']
         return msg
 
-    def _sensor_framerate(self) -> int:
-        if self._width == 1280 and self._height == 720:
-            return 60
-        return self._fps
-
-    def _gstreamer_pipeline(self, sensor_id: int) -> str:
-        sensor_fps = self._sensor_framerate()
-        return (
-            f'nvarguscamerasrc sensor-id={sensor_id} ! '
-            f'video/x-raw(memory:NVMM), '
-            f'width={self._width}, height={self._height}, '
-            f'framerate={sensor_fps}/1 ! '
-            f'nvvidconv flip-method={self._flip_method} ! '
-            f'video/x-raw, width={self._out_w}, height={self._out_h}, format=BGRx ! '
-            f'videoconvert ! '
-            f'video/x-raw, format=BGR ! '
-            f'appsink drop=true max-buffers=1 sync=false'
-        )
-
-    # ── Background capture loop ───────────────────────────────────────────────
-
-    def _capture_loop(self):
-        self.get_logger().info('Capture thread started.')
-        while self._capture_thread_running:
-            ret, frame = self._cap.read()
-            if ret:
-                self._consecutive_failures = 0
-                if self._map1 is not None:
-                    frame = cv2.remap(frame, self._map1, self._map2, cv2.INTER_LINEAR)
-                if self._color_gains is not None:
-                    try:
-                        frame = (frame.astype(np.float32) * self._color_gains).clip(0, 255).astype(np.uint8)
-                    except Exception as e:
-                        self.get_logger().warning(f'Color correction failed: {e} — disabling')
-                        self._color_gains = None
-                stamp = self.get_clock().now().to_msg()
-                with self._slot_cv:
-                    self._slot = (stamp, frame)
-                    self._slot_seq += 1
-                    self._slot_cv.notify_all()   # wake the publish thread
-                self._cap_frames += 1
-            else:
-                self._consecutive_failures += 1
-                self.get_logger().warning(
-                    f'cap.read() failed (consecutive={self._consecutive_failures})')
-                if self._consecutive_failures >= self._MAX_CONSECUTIVE_FAILURES:
-                    if self._reconnect_attempts >= self._MAX_RECONNECT_ATTEMPTS:
-                        self.get_logger().error(
-                            f'Camera failed after {self._MAX_RECONNECT_ATTEMPTS} '
-                            'reconnect attempts. Shutting down.')
-                        self._capture_thread_running = False
-                        with self._slot_cv:
-                            self._slot_cv.notify_all()
-                        rclpy.shutdown()
-                        return
-                    self._reconnect_attempts += 1
-                    self.get_logger().warning(
-                        f'Reconnecting {self._reconnect_attempts}/'
-                        f'{self._MAX_RECONNECT_ATTEMPTS} ...')
-                    self._cap.release()
-                    time.sleep(self._RECONNECT_SLEEP_SEC)
-                    sensor_id = self.get_parameter('sensor_id').value
-                    self._cap = cv2.VideoCapture(
-                        self._gstreamer_pipeline(sensor_id), cv2.CAP_GSTREAMER)
-                    if self._cap.isOpened():
-                        self.get_logger().info('Reconnect succeeded.')
-                        self._consecutive_failures = 0
-                    else:
-                        self.get_logger().error('Reconnect failed — will retry.')
-        self.get_logger().info('Capture thread exiting.')
-
-    # ── Dedicated publish loop (Team2 pattern) ────────────────────────────────
-
-    def _publish_loop(self):
-        """Publish thread — wakes on each new captured frame via Condition.
-
-        cv2 and rclpy publish both release the GIL, so this thread can run on
-        a separate core while the capture thread continues uninterrupted.
-        The array.array fast-path avoids rclpy's byte-by-byte isinstance loop.
-        """
-        self.get_logger().info('Publish thread started.')
-        while self._capture_thread_running:
-            # Block until there is a frame we haven't published yet.
-            with self._slot_cv:
-                while (self._capture_thread_running
-                       and self._slot_seq == self._pub_seq):
-                    self._slot_cv.wait(timeout=1.0)
-                if not self._capture_thread_running:
-                    break
-                self._pub_seq = self._slot_seq
-                stamp, frame = self._slot   # grab reference under lock
-
-            # Build and publish outside the lock.
-            h, w, c = frame.shape
-            msg = Image()
-            msg.header.stamp    = stamp
-            msg.header.frame_id = self._frame_id
-            msg.height     = h
-            msg.width      = w
-            msg.encoding   = 'bgr8'
-            msg.is_bigendian = 0
-            msg.step       = w * c
-            # array.array activates rclpy's buffer fast-path — avoids the
-            # per-byte isinstance loop that takes ~108 ms for 320×240.
-            msg.data = array.array('B', frame.tobytes())
-            self._pub_raw.publish(msg)
-
-            if self._pub_camera_info is not None and self._camera_info_msg is not None:
-                self._camera_info_msg.header.stamp = stamp
-                self._pub_camera_info.publish(self._camera_info_msg)
-
-            self._pub_frames += 1
-
-        self.get_logger().info('Publish thread exiting.')
-
-    # ── FPS statistics (Team2 pattern) ────────────────────────────────────────
-
     def _log_stats(self):
         now = self.get_clock().now()
-        dt  = (now - self._t_stats).nanoseconds * 1e-9
+        dt = (now - self._t_stats).nanoseconds * 1e-9
         if dt > 0:
             self.get_logger().info(
-                f'camera: cap={self._cap_frames / dt:.1f}  '
-                f'pub={self._pub_frames / dt:.1f} fps')
-        self._cap_frames = self._pub_frames = 0
+                f'camera: full={self._n_full / dt:.1f} fps  '
+                f'small={self._n_small / dt:.1f} fps')
+        self._n_full = self._n_small = 0
         self._t_stats = now
 
-    # ── Cleanup ───────────────────────────────────────────────────────────────
-
     def destroy_node(self):
-        self._capture_thread_running = False
-        # Wake both threads so they can exit their wait loops.
-        with self._slot_cv:
-            self._slot_cv.notify_all()
-        for t in (getattr(self, '_cap_thread', None),
-                  getattr(self, '_pub_thread', None)):
-            if t is not None and t.is_alive():
-                t.join(timeout=2.0)
-        if hasattr(self, '_cap') and self._cap.isOpened():
-            self._cap.release()
-            self.get_logger().info(f'Camera released after {self._pub_frames} published frames.')
+        try:
+            if hasattr(self, '_pipeline') and self._pipeline is not None:
+                self._pipeline.set_state(Gst.State.NULL)
+            if hasattr(self, '_glib_loop') and self._glib_loop is not None:
+                self._glib_loop.quit()
+        except Exception:
+            pass
         super().destroy_node()
 
 
@@ -360,9 +328,7 @@ def main(args=None):
     try:
         node = CameraRawPublisher()
         rclpy.spin(node)
-    except RuntimeError:
-        pass
-    except KeyboardInterrupt:
+    except (RuntimeError, KeyboardInterrupt):
         pass
     finally:
         if node is not None:

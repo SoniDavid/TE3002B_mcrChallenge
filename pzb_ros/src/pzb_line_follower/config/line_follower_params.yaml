@@ -42,7 +42,7 @@ line_follower_node:
     #   ramp on a real curve. Lower = smoother but slower to commit; 0 disables.
     # steer_hysteresis_px: once steering commits to a side, the error must exceed this
     #   on the opposite side before the command may reverse — kills center jitter.
-    curve_min_speed: 0.06
+    curve_min_speed: 0.05
     angular_slew_max: 0.12
     steer_hysteresis_px: 6
     # Sharp-turn slew bypass: on a genuine sharp turn (|error| >= slew_bypass_error_px
@@ -73,6 +73,15 @@ line_follower_node:
     # ramp (downstream max_angular_accel raised to 4.0) so the robot turns hard AND slow
     # only on the tightest curves.
     tight_turn_error_px: 110
+    # Error-driven early braking (opt-bags turn-overshoot fix): the curve slowdown used
+    # to couple speed to the SLEW-LIMITED angular.z, which lags the turn — at turn entry
+    # |error| is already large but angular.z is still ramping, so the robot stayed near
+    # full speed exactly when it should brake and the line swept off the squashed ROI
+    # before it could round the bend (opt5 t≈15: error 4→159, cx pinned at 319 in ~0.1s).
+    # The node now also brakes off the IMMEDIATE |error|: speed scales down from full at
+    # |error|<=dead_band to the full curve_speed_reduction at curve_brake_error_px, so it
+    # slows the instant a turn is SEEN. Lower = brakes harder/earlier on gentler curves.
+    curve_brake_error_px: 90
     # Stale-frame safety: the camera runs at a poor, variable 4.7-9.5 fps with stalls up
     # to 1.4 s. If no new frame arrives for frame_stale_s the 20 Hz publisher scales the
     # linear speed by stale_speed_scale (steering held) so the robot doesn't drive blind
@@ -97,9 +106,24 @@ line_follower_node:
     search_timeout_s: 1.2
     search_speed_mps: 0.04
     search_angular_z: 0.25
+    # Non-terminal rotate-until-found recovery (opt-bags stale fix). After the Phase-1
+    # forward creep (search_timeout_s) the robot rotates IN PLACE (linear=0, never drives
+    # into a wall) toward the last-seen side, reversing every search_sweep_s so it scans
+    # both sides, and KEEPS doing it until a line is re-acquired — no permanent stop (the
+    # old search-then-STOP left opt6/7/8 stale forever). search_rotate_z = capped yaw.
+    search_rotate_z: 0.30
+    search_sweep_s:  2.0
+    # Blind-stall full stop: frame_stale_s holds steering through a brief frame drop, but a
+    # multi-second camera FREEZE (opt6-9: both streams hang 3-9 s) would let the recovery
+    # rotation spin the robot blind. Past frame_blind_s with no fresh frame, publish (0,0);
+    # the sweep resumes the instant frames return. Keep > frame_stale_s.
+    frame_blind_s: 1.0
 
-    # Forward speed in m/s (desired; curve reduction may reduce this)
-    linear_speed: 0.10
+    # Forward speed in m/s (desired; curve reduction may reduce this).
+    # Lowered 0.10->0.06 (opt-bags turn fix): faster cruise outran the squashed-ROI
+    # look-ahead and the line swept off the ROI edge before the robot rounded sharp
+    # turns (opt4/opt5 out of bounds). The launch file also defaults this to 0.06.
+    linear_speed: 0.06
 
     # Hard cap on linear output in m/s (also enforced by twist_slew_limiter)
     max_linear_speed: 0.20
@@ -228,7 +252,10 @@ line_follower_node:
     # advancing through a real bend instead of crawling and falling behind (curve fix).
     # sharp_turn_speed is now only the absolute floor; curve_min_speed dominates on curves.
     # Threshold raised 60→80 so a moderate curve error doesn't trip the slowest regime.
-    sharp_turn_threshold_px: 80
+    # Lowered 80→60 again (opt-bags turn fix) so the hard curve-speed floor engages
+    # earlier, now backed by error-driven early braking (curve_brake_error_px) so the
+    # robot is already slowing before this floor. The launch file also defaults to 60.
+    sharp_turn_threshold_px: 60
     sharp_turn_speed: 0.03
 
     # Input and output topic names
