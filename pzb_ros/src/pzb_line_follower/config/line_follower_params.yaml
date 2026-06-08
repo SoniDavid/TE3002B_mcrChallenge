@@ -112,6 +112,14 @@ line_follower_node:
     cross_turn_z:             0.6   # yaw rate (rad/s) during the in-crossing lane turn
     cross_turn_s:             1.6   # turn duration (s) — tune for ~90° at cross_turn_z
     cross_turn_speed:         0.06  # forward speed (m/s) during the turn
+    # Sign-only IN-FRONT turn: fire the arc as soon as a fresh turn sign's bbox area
+    # fraction (appended by the YOLO detector as "<class>:<area_frac>") is >= the min —
+    # i.e. the sign is close/in front — WITHOUT needing a dashed line. One sign = one turn
+    # (disarms until the sign leaves view for turn_sign_rearm_gap_s). Set
+    # turn_sign_only_enabled:false to revert to the dashed-gated turn.
+    turn_sign_only_enabled:   true
+    turn_sign_min_area_frac:  0.045  # bbox/frame area at which the sign counts as "in front" — tune on-robot
+    turn_sign_rearm_gap_s:    1.0    # sign must be gone this long before another turn can fire
     angular_slew_max_sharp: 0.45
     # Curve dashed-suppression: ignore a "dashed" classification while |steering error|
     # exceeds this — a real crossing is approached head-on (small error) while a sharp

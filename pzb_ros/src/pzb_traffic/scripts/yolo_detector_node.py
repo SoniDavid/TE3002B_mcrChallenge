@@ -148,8 +148,17 @@ class YoloDetectorNode(Node):
                     best_class = cls_name
 
         # Publish the closest detected class (or 'none') for the behavior layer.
+        # Append the bbox area fraction (closest sign's pixels / frame pixels) so the
+        # follower can fire a turn only when the sign is actually IN FRONT (large box),
+        # not on a far-away first detection. Format: "<class>:<area_frac>" (e.g.
+        # "letIzquierda:0.082"); 'none' is published bare for backward compatibility.
         self._last_class = best_class
-        self._publish_sign(best_class)
+        if best_class != 'none' and best_area > 0:
+            fh, fw = frame.shape[0], frame.shape[1]
+            area_frac = best_area / float(max(fh * fw, 1))
+            self._publish_sign(f'{best_class}:{area_frac:.4f}')
+        else:
+            self._publish_sign(best_class)
 
         # Only build + publish the (CPU-costly) debug overlay if someone is watching it.
         if want_debug:

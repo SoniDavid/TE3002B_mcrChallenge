@@ -175,7 +175,9 @@ class TrafficLightFSMNode(Node):
         (consumed in the publish loop only when OUTSIDE a curve); GIVE WAY re-arms only
         after it leaves view.
         """
-        c = msg.data.strip()
+        # /yolo/sign may carry "<class>:<area_frac>" (the follower uses the area fraction
+        # to gate turns by "in front"); the FSM only needs the class — strip the suffix.
+        c = msg.data.strip().split(':', 1)[0]
         now = time.monotonic()
         if c in self._slow_signs:
             self._sign_slow_until = now + self._sign_lost_timeout

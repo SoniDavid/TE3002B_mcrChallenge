@@ -106,6 +106,9 @@ class LineFollowerNode : public rclcpp::Node {
     p.cross_turn_speed = gd("cross_turn_speed", p.cross_turn_speed);
     p.crossing_coast_speed = gd("crossing_coast_speed", p.crossing_coast_speed);
     p.crossing_exit_frames = gd("crossing_exit_frames", p.crossing_exit_frames);
+    p.turn_sign_only_enabled = gd("turn_sign_only_enabled", p.turn_sign_only_enabled);
+    p.turn_sign_min_area_frac = gd("turn_sign_min_area_frac", p.turn_sign_min_area_frac);
+    p.turn_sign_rearm_gap_s = gd("turn_sign_rearm_gap_s", p.turn_sign_rearm_gap_s);
     std::string topic_in = gd("topic_image_in", std::string("/camera/image_small"));
     std::string topic_cmd = gd("topic_cmd_vel", std::string("/cmd_vel_desired_raw"));
 

@@ -57,6 +57,15 @@ struct FollowerParams {
   std::string turn_sign_left_class = "letIzquierda", turn_sign_right_class = "letDerecha",
               turn_sign_straight_class = "letRecto";
   double turn_sign_stale_s = 4.0, cross_turn_z = 0.6, cross_turn_s = 1.6, cross_turn_speed = 0.06;
+  // Sign-only turn (no dashed cue needed): fire the open-loop arc as soon as a fresh
+  // turn sign is IN FRONT — i.e. the sign's bbox area fraction (published as
+  // "<class>:<area_frac>" on /yolo/sign) is >= turn_sign_min_area_frac. After a turn
+  // fires, suppress re-firing for turn_sign_refire_lockout_s so one sign = one turn.
+  bool   turn_sign_only_enabled = true;
+  double turn_sign_min_area_frac = 0.045;   // bbox/frame fraction = "close enough / in front"
+  // After a turn fires, do NOT turn again until the sign has LEFT view (gone stale) for
+  // this long — one physical sign = one turn, even though it stays visible for seconds.
+  double turn_sign_rearm_gap_s = 1.0;
   // Crossing-state gap handling: coast through the inter-intersection gap until a real
   // line (>=2 slots for crossing_exit_frames frames) returns, instead of stopping.
   double crossing_coast_speed = 0.06; int crossing_exit_frames = 3;
@@ -101,6 +110,14 @@ class FollowerCore {
   bool was_dashed_ = false; double acq_until_ = NAN;
   int dashed_live_break_count_ = 0, dashed_live_break_sign_ = 0;
   bool crossing_active_ = false; double crossing_done_t_ = NAN; int real_line_streak_ = 0;
+
+  // ── sign-only in-front turn ──
+  double turn_sign_area_ = 0.0;            // latched bbox area fraction of the last turn sign
+  double turn_sign_last_seen_t_ = NAN;     // last time ANY turn sign was in view (for re-arm)
+  bool so_turn_active_ = false;            // a sign-only turn arc is in progress
+  double so_turn_dir_ = 0.0;               // +1 left / -1 right
+  double so_turn_start_ = NAN;             // when the arc started
+  bool so_armed_ = true;                   // can fire? cleared after a turn, re-armed once sign leaves view
 
   // ── recovery / guards ──
   double search_until_ = NAN, search_dir_ = 0.0, search_sweep_dir_ = 1.0, search_sweep_until_ = NAN;

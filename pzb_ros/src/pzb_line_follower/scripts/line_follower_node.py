@@ -168,6 +168,15 @@ class LineFollowerNode(Node):
         # returns (≥2 line slots for crossing_exit_frames frames), then resume centering.
         self.declare_parameter('crossing_coast_speed',    0.06)
         self.declare_parameter('crossing_exit_frames',    3)
+        # Sign-only IN-FRONT turn (no dashed cue needed): fire the open-loop arc as soon as
+        # a fresh turn sign is large enough in frame — the detector appends the bbox area
+        # fraction as "<class>:<area_frac>" on /yolo/sign, and we turn when that is
+        # >= turn_sign_min_area_frac. One physical sign = one turn: after a turn fires we
+        # disarm until the sign has LEFT view for turn_sign_rearm_gap_s. With this enabled
+        # the dashed crossing only coasts straight (it no longer owns the turn).
+        self.declare_parameter('turn_sign_only_enabled',  True)
+        self.declare_parameter('turn_sign_min_area_frac', 0.045)
+        self.declare_parameter('turn_sign_rearm_gap_s',   1.0)
         # Curve dashed-suppression (newnew-bags fix): suppress a "dashed" classification
         # while the steering error is past this — a real crossing is approached head-on
         # (small error); a sharp curve (large error) breaks the line into co-linear blobs
@@ -281,6 +290,16 @@ class LineFollowerNode(Node):
         self._turn_sign   = None     # 'left' | 'right' | 'straight' | None (latched)
         self._turn_sign_t = None     # monotonic time the turn sign was last seen
         self._cross_turn_start = None  # set when the in-crossing turn arc begins
+        # sign-only in-front turn
+        self._turn_sign_only = bool(self.get_parameter('turn_sign_only_enabled').value)
+        self._turn_sign_min_area = float(self.get_parameter('turn_sign_min_area_frac').value)
+        self._turn_sign_rearm_gap_s = float(self.get_parameter('turn_sign_rearm_gap_s').value)
+        self._turn_sign_area = 0.0       # bbox area fraction of the latched turn sign
+        self._turn_sign_last_seen = None # last time any turn sign was in view (re-arm)
+        self._so_turn_active = False     # sign-only arc in progress
+        self._so_turn_dir = 0.0          # +1 left / -1 right
+        self._so_turn_start = None
+        self._so_armed = True            # fire only when armed; re-armed after sign leaves view
         self._dashed_suppress_error_px = float(self.get_parameter('dashed_suppress_error_px').value)
         self._tight_turn_error_px = float(self.get_parameter('tight_turn_error_px').value)
         self._curve_brake_error_px = float(self.get_parameter('curve_brake_error_px').value)
@@ -631,8 +650,59 @@ class LineFollowerNode(Node):
                 self._acq_until = now + self._acquire_guard_s
                 self._err_hist.clear()
 
+        # ── Sign-only IN-FRONT turn (no dashed cue required) ──────────────────────
+        # Fire an open-loop arc the moment a fresh turn sign is large enough in frame
+        # (area >= min). One physical sign = one turn: after firing, disarm until the
+        # sign has LEFT view for _turn_sign_rearm_gap_s. Highest priority so the dashed
+        # path never also turns for the same sign (its turn is gated off below).
+        _so_cmd = None
+        if self._turn_sign_only:
+            _sign_in_view = (self._turn_sign_last_seen is not None
+                             and (now - self._turn_sign_last_seen) <= self._turn_sign_rearm_gap_s)
+            if not self._so_turn_active and not _sign_in_view:
+                self._so_armed = True
+            if self._so_turn_active:
+                if (now - self._so_turn_start) < self._cross_turn_s:
+                    _so_cmd = Twist()
+                    _so_cmd.linear.x  = self._cross_turn_speed * max(self._speed_scale, 1.0)
+                    _so_cmd.angular.z = self._so_turn_dir * self._cross_turn_z
+                else:
+                    # arc done → disarm until the sign leaves view; clear the latch
+                    self._so_turn_active = False
+                    self._so_armed = False
+                    self._turn_sign = None
+                    self._turn_sign_t = None
+                    self._turn_sign_area = 0.0
+                    self._detector.reset_tracker_anchors()
+                    self._acq_until = now + self._acquire_guard_s
+                    self._err_hist.clear()
+            if _so_cmd is None and not self._so_turn_active and self._so_armed:
+                # Fire only while the sign is CURRENTLY in view — a sign that already left
+                # view must not resurrect a turn after the re-arm gap via stale freshness.
+                _td = self._fresh_turn_sign() if _sign_in_view else None
+                if _td in ('left', 'right') and self._turn_sign_area >= self._turn_sign_min_area:
+                    self._so_turn_active = True
+                    self._so_turn_dir = 1.0 if _td == 'left' else -1.0
+                    self._so_turn_start = now
+                    self.get_logger().info(
+                        f'Sign-only turn {_td.upper()} (in front, '
+                        f'area={self._turn_sign_area:.3f}).')
+                    _so_cmd = Twist()
+                    _so_cmd.linear.x  = self._cross_turn_speed * max(self._speed_scale, 1.0)
+                    _so_cmd.angular.z = self._so_turn_dir * self._cross_turn_z
+
+        if _so_cmd is not None:
+            self._latest_cmd = _so_cmd
+            self._prev_az = _so_cmd.angular.z
+            self._error_hist.clear()
+            cx_msg = Int32();  cx_msg.data = cx
+            self._pub_cx.publish(cx_msg)
+            err_msg = Float32();  err_msg.data = float(cx - self._img_w // 2)
+            self._pub_error.publish(err_msg)
+            type_msg = String();  type_msg.data = line_type
+            self._pub_line_type.publish(type_msg)
         # The crossing FSM runs while a crossing is active OR the current frame is dashed.
-        if self._crossing_active or line_type == 'dashed':
+        elif self._crossing_active or line_type == 'dashed':
             # Intersection handling — align EARLY, then cross straight, then stop:
             #   Phase A — Align/coast (bad_ignment4 strong-safeguard): drive forward
             #             at the APPROACH speed while squaring up to the dashes, but
@@ -681,7 +751,11 @@ class LineFollowerNode(Node):
             # YOLO turn action (Part 2): once aligned, if a FRESH turn sign says left/right,
             # turn INTO that lane open-loop instead of crossing straight. letRecto / no sign
             # → straight cross (unchanged). The turn arc runs for cross_turn_s, then Phase C.
-            _turn_dir = self._fresh_turn_sign() if self._aligned_latch else None
+            # When sign-only turning is enabled, the open-loop TURN is owned by the
+            # sign-only path above; the dashed path only aligns + coasts straight so the
+            # same sign never turns twice.
+            _turn_dir = (self._fresh_turn_sign()
+                         if (self._aligned_latch and not self._turn_sign_only) else None)
             _do_turn  = _turn_dir in ('left', 'right')
 
             if not self._aligned_latch:
@@ -1189,14 +1263,25 @@ class LineFollowerNode(Node):
         latched class is consumed at the next confirmed dashed crossing and expires after
         turn_sign_stale_s so an old detection never fires at the wrong crossing.
         """
-        c = msg.data.strip()
+        # /yolo/sign may carry "<class>:<area_frac>" — the area fraction lets us fire the
+        # turn only when the sign is IN FRONT (large box). Parse the optional suffix.
+        raw = msg.data.strip()
+        c, _, area_s = raw.partition(':')
+        try:
+            area = float(area_s) if area_s else 0.0
+        except ValueError:
+            area = 0.0
+        now = time.monotonic()
         if c == self._sign_left:
-            self._turn_sign, self._turn_sign_t = 'left', time.monotonic()
+            self._turn_sign, self._turn_sign_t = 'left', now
         elif c == self._sign_right:
-            self._turn_sign, self._turn_sign_t = 'right', time.monotonic()
+            self._turn_sign, self._turn_sign_t = 'right', now
         elif c == self._sign_straight:
-            self._turn_sign, self._turn_sign_t = 'straight', time.monotonic()
-        # other classes (slow signs / none) don't change the latched turn intent
+            self._turn_sign, self._turn_sign_t = 'straight', now
+        else:
+            return  # slow signs / none don't change the latched turn intent
+        self._turn_sign_area = area
+        self._turn_sign_last_seen = now
 
     def _fresh_turn_sign(self):
         """Return the latched turn sign if still fresh, else None."""

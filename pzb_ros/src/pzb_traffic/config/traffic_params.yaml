@@ -1,6 +1,7 @@
 color_detector_node:
   ros__parameters:
     use_sim_time: false
+    input_topic: /camera/image_small   # always published; no publish_raw flag needed
 
     # --- HSV ranges (OpenCV: H in [0,180], S and V in [0,255]) ---
     # Calibrated from camera images of the actual color sources:

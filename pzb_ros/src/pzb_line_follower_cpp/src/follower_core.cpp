@@ -33,10 +33,19 @@ FollowerCore::FollowerCore(const FollowerParams& p, std::function<double()> cloc
     : detector(clock_fn ? clock_fn : steady_now), p_(p),
       clock_(clock_fn ? std::move(clock_fn) : steady_now) {}
 
-void FollowerCore::set_yolo_sign(const std::string& cls, double now_s) {
-  if (cls == p_.turn_sign_left_class)      { turn_sign_ = "left";     turn_sign_t_ = now_s; }
-  else if (cls == p_.turn_sign_right_class){ turn_sign_ = "right";    turn_sign_t_ = now_s; }
-  else if (cls == p_.turn_sign_straight_class) { turn_sign_ = "straight"; turn_sign_t_ = now_s; }
+void FollowerCore::set_yolo_sign(const std::string& cls_in, double now_s) {
+  // Accept "<class>" or "<class>:<area_frac>" (the detector appends the bbox area
+  // fraction so we can tell when the sign is IN FRONT). Parse the optional suffix.
+  std::string cls = cls_in;
+  double area = 0.0;
+  auto colon = cls_in.find(':');
+  if (colon != std::string::npos) {
+    cls = cls_in.substr(0, colon);
+    try { area = std::stod(cls_in.substr(colon + 1)); } catch (...) { area = 0.0; }
+  }
+  if (cls == p_.turn_sign_left_class)      { turn_sign_ = "left";     turn_sign_t_ = now_s; turn_sign_area_ = area; turn_sign_last_seen_t_ = now_s; }
+  else if (cls == p_.turn_sign_right_class){ turn_sign_ = "right";    turn_sign_t_ = now_s; turn_sign_area_ = area; turn_sign_last_seen_t_ = now_s; }
+  else if (cls == p_.turn_sign_straight_class) { turn_sign_ = "straight"; turn_sign_t_ = now_s; turn_sign_area_ = area; turn_sign_last_seen_t_ = now_s; }
 }
 
 std::string FollowerCore::fresh_turn_sign(double now) const {
@@ -215,6 +224,49 @@ Twist2 FollowerCore::process_frame(const cv::Mat& small_bgr, double now_s,
 
   Twist2 cmd;
 
+  // ── Sign-only IN-FRONT turn (no dashed cue required) ──────────────────────────
+  // Fire an open-loop turn arc the moment a fresh turn sign is large enough in frame
+  // (area >= turn_sign_min_area_frac = "in front"). One sign → one turn: after firing,
+  // a lockout suppresses re-triggering. This makes turns robust to the dashed line not
+  // being detected. Runs on the laptop, so the extra logic cost is irrelevant.
+  if (p_.turn_sign_only_enabled) {
+    // Re-arm once the (previously fired) sign has LEFT view for turn_sign_rearm_gap_s,
+    // so one physical sign fires exactly one turn even while it stays visible for seconds.
+    bool sign_in_view = !std::isnan(turn_sign_last_seen_t_) &&
+                        (now - turn_sign_last_seen_t_) <= p_.turn_sign_rearm_gap_s;
+    if (!so_turn_active_ && !sign_in_view) so_armed_ = true;
+
+    if (so_turn_active_) {
+      if ((now - so_turn_start_) < p_.cross_turn_s) {
+        cmd.v = p_.cross_turn_speed * std::max(speed_scale_, 1.0);
+        cmd.w = so_turn_dir_ * p_.cross_turn_z;
+        prev_az_ = cmd.w; error_hist_.clear();
+        cx_out = cx; error_out = static_cast<double>(cx - half); line_type_out = line_type;
+        return cmd;
+      }
+      // arc done → disarm until the sign leaves view; clear the latch
+      so_turn_active_ = false;
+      so_armed_ = false;
+      turn_sign_.clear(); turn_sign_t_ = kNaN; turn_sign_area_ = 0.0;
+      detector.reset_tracker_anchors();
+      acq_until_ = now + p_.acquire_guard_s; error_hist_.clear();
+    }
+    // Fire only while the sign is CURRENTLY in view (not merely "seen within stale_s"):
+    // a turn sign that already left view must not resurrect a turn after the re-arm gap.
+    std::string td = sign_in_view ? fresh_turn_sign(now) : "";
+    if (!so_turn_active_ && so_armed_ && (td == "left" || td == "right") &&
+        turn_sign_area_ >= p_.turn_sign_min_area_frac) {
+      so_turn_active_ = true;
+      so_turn_dir_ = (td == "left") ? 1.0 : -1.0;
+      so_turn_start_ = now;
+      cmd.v = p_.cross_turn_speed * std::max(speed_scale_, 1.0);
+      cmd.w = so_turn_dir_ * p_.cross_turn_z;
+      prev_az_ = cmd.w; error_hist_.clear();
+      cx_out = cx; error_out = static_cast<double>(cx - half); line_type_out = line_type;
+      return cmd;
+    }
+  }
+
   if (crossing_active_ || line_type == "dashed") {
     // Phase A — align perpendicular to the dash row, then turn-or-straight cross, then stop.
     double elapsed = !std::isnan(dashed_first_t_) ? (now - dashed_first_t_) : 0.0;
@@ -229,7 +281,10 @@ Twist2 FollowerCore::process_frame(const cv::Mat& small_bgr, double now_s,
     }
     if (!aligned_latch_ && elapsed >= p_.align_window_s) { aligned_latch_ = true; align_done_t_ = now; }
 
-    std::string tdir = aligned_latch_ ? fresh_turn_sign(now) : "";
+    // When sign-only turning is enabled, the open-loop TURN is owned by the sign-only
+    // path (above); the dashed path here only aligns + coasts straight through the gap,
+    // so we never double-turn for the same sign.
+    std::string tdir = (aligned_latch_ && !p_.turn_sign_only_enabled) ? fresh_turn_sign(now) : "";
     bool do_turn = (tdir == "left" || tdir == "right");
 
     if (!aligned_latch_) {

@@ -63,9 +63,11 @@ class ColorDetectorNode(Node):
         self.declare_parameter('min_blob_area',  800.0)
         self.declare_parameter('confirm_frames', 3)
         self.declare_parameter('loop_hz',        30.0)
+        self.declare_parameter('input_topic',    '/camera/image_small')
 
         self._min_area    = float(self.get_parameter('min_blob_area').value)
         self._confirm_n   = int(self.get_parameter('confirm_frames').value)
+        in_topic          = str(self.get_parameter('input_topic').value)
 
         # Confirmation filter state
         self._candidate       = 'none'   # color being accumulated
@@ -81,10 +83,11 @@ class ColorDetectorNode(Node):
 
         self.create_subscription(
             Image,
-            '/camera/image_raw',
+            in_topic,
             self._image_callback,
             _BEST_EFFORT_QOS,
         )
+        self.get_logger().info(f'color_detector_node: subscribing to {in_topic}')
 
         self._color_pub = self.create_publisher(String, '/traffic_light_color', 10)
         self._debug_pub = self.create_publisher(Image, '/traffic_detector/debug_image', 1)
