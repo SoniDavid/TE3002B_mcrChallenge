@@ -27,7 +27,7 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 
 
@@ -53,6 +53,7 @@ def generate_launch_description():
     arg_Kd_angular              = DeclareLaunchArgument('Kd_angular',              default_value='0.0',    description='Derivative steering gain (rad/s per px/frame); DISABLED (anti-stutter) — output EMA + error median do the damping')
     arg_dead_band_px            = DeclareLaunchArgument('dead_band_px',            default_value='12',    description='Pixel dead band for steering (widened for anti-stutter)')
     arg_publish_debug           = DeclareLaunchArgument('publish_debug',           default_value='false', description='Publish /camera/image_debug topic')
+    arg_impl                    = DeclareLaunchArgument('impl',                    default_value='py',    description="Line-follower implementation: 'py' (pzb_line_follower) or 'cpp' (pzb_line_follower_cpp). C++ is a drop-in (same node name/topics/params) for lower Jetson CPU/memory.")
     arg_use_traffic             = DeclareLaunchArgument('use_traffic',             default_value='true',  description='Launch traffic light detector and FSM. It subscribes to the FULL-res /camera/image_raw (now raw/undistorted-off). It frame-skips (every 3rd frame) to limit CPU; if the Jetson is still tight, it can be repointed to /camera/image_small (it downscales its crop to 320x160 either way) or undistort re-enabled for it.')
     arg_undistort_enabled       = DeclareLaunchArgument('undistort_enabled',       default_value='true',  description='Apply lens undistortion to the small (line-follower) stream. Set false to A/B test the CPU saving (the follower is closed-loop and tolerates mild distortion).')
     arg_small_width             = DeclareLaunchArgument('small_width',             default_value='480',   description='Hardware-downscaled width for the line-follower stream (/camera/image_small)')
@@ -63,8 +64,9 @@ def generate_launch_description():
     arg_max_angular_accel       = DeclareLaunchArgument('max_angular_accel',       default_value='4.0',   description='Max angular acceleration for slew limiter (rad/s²). Raised 1.20->4.0: at 1.20 the downstream slew node needed ~0.47s (~3 cam frames @7fps) to ramp steering to 0.56 rad/s, so the robot left the mat before full steering reached the motors on sharp turns. 4.0 ramps in ~0.15s (~1 frame). Linear accel is left untouched (the brown-out concern is linear steps, not angular).')
     arg_sharp_turn_threshold_px = DeclareLaunchArgument('sharp_turn_threshold_px', default_value='60',    description='|error| px above which sharp-turn slow mode activates. Lowered 80->60 (opt-bags turn fix) so the hard curve-speed floor engages earlier, paired with the new error-driven early braking (curve_brake_error_px).')
     arg_sharp_turn_speed        = DeclareLaunchArgument('sharp_turn_speed',        default_value='0.03',  description='Linear speed (m/s) during sharp turns')
-    arg_publish_compressed      = DeclareLaunchArgument('publish_compressed',      default_value='false', description='Also publish a JPEG /camera/image_compressed off the full frame (for off-board YOLO on the laptop GPU). Built from the same GStreamer full appsink — no extra camera handle — so it coexists with the line follower. Only encodes when a subscriber is present.')
+    arg_publish_compressed      = DeclareLaunchArgument('publish_compressed',      default_value='true',  description='Publish a JPEG /camera/image_compressed off the full frame for off-board YOLO (laptop GPU). Built from the same GStreamer full appsink — no extra camera handle. Only encodes when a subscriber is present, so it costs ~0 until YOLO connects. Default TRUE so YOLO has its feed without the heavy raw stream.')
     arg_jpeg_quality            = DeclareLaunchArgument('jpeg_quality',            default_value='75',    description='JPEG quality (1-100) for /camera/image_compressed')
+    arg_publish_raw             = DeclareLaunchArgument('publish_raw',             default_value='false', description='Publish the FULL-res 2.76 MB /camera/image_raw Image. Default FALSE: this heavy publish + its DDS transport + bag recording back-pressured the GStreamer pipeline and froze the WHOLE graph for 1-18 s on the yolo bags (robot drove blind off curves). Off-board YOLO uses /camera/image_compressed instead, so raw is not needed on the robot. Set true only if a subscriber genuinely needs the uncompressed frame.')
 
     # ── 1. MCU bridge ─────────────────────────────────────────────────────────
     # Bridges the STM32 over UART to ROS 2 — publishes /wheel_speeds, subscribes /cmd_vel.
@@ -97,6 +99,7 @@ def generate_launch_description():
             'publish_camera_info': True,
             'publish_compressed':  LaunchConfiguration('publish_compressed'),
             'jpeg_quality':        LaunchConfiguration('jpeg_quality'),
+            'publish_raw':         LaunchConfiguration('publish_raw'),
         }],
     )
 
@@ -145,8 +148,14 @@ def generate_launch_description():
     # Detects the line in /camera/image_raw and publishes steering + speed commands
     # to /cmd_vel_desired_raw, which the slew limiter forwards to /cmd_vel_desired.
     # Comment out to drive manually or with a different planner.
+    # Select the Python or the C++ line follower (drop-in: identical node name, topics,
+    # and parameters). impl:=cpp uses pzb_line_follower_cpp for lower Jetson CPU/memory.
+    _lf_pkg = PythonExpression([
+        "'pzb_line_follower_cpp' if '", LaunchConfiguration('impl'),
+        "' == 'cpp' else 'pzb_line_follower'"])
+
     node_line_follower = Node(
-        package='pzb_line_follower',
+        package=_lf_pkg,
         executable='line_follower_node',
         name='line_follower_node',
         output='screen',
@@ -204,6 +213,7 @@ def generate_launch_description():
         arg_Kd_angular,
         arg_dead_band_px,
         arg_publish_debug,
+        arg_impl,
         arg_use_traffic,
         arg_undistort_enabled,
         arg_small_width,
@@ -216,6 +226,7 @@ def generate_launch_description():
         arg_sharp_turn_speed,
         arg_publish_compressed,
         arg_jpeg_quality,
+        arg_publish_raw,
 
         # node_mcu_bridge,          # 1 — MCU serial bridge (commented: start separately)
         node_camera,                # 2 — CSI camera + lens undistortion → /camera/image_raw
