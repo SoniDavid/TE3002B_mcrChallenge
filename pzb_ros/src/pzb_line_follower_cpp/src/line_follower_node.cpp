@@ -22,6 +22,19 @@ class LineFollowerNode : public rclcpp::Node {
   LineFollowerNode() : rclcpp::Node("line_follower_node") {
     pzb::FollowerParams p;
     auto gd = [&](const std::string& n, auto def) { return this->declare_parameter(n, def); };
+    // gdf: declare a DOUBLE parameter that tolerates a YAML integer literal (e.g. "20").
+    // rclcpp won't let a YAML int override a declared double, so declare with dynamic
+    // typing and coerce int→double. Used for all *_px / numeric doubles whose YAML value
+    // may be written without a decimal point.
+    auto gdf = [&](const std::string& n, double def) -> double {
+      rcl_interfaces::msg::ParameterDescriptor d; d.dynamic_typing = true;
+      this->declare_parameter(n, rclcpp::ParameterValue(def), d);
+      rclcpp::Parameter pv = this->get_parameter(n);
+      auto t = pv.get_type();
+      if (t == rclcpp::ParameterType::PARAMETER_INTEGER) return static_cast<double>(pv.as_int());
+      if (t == rclcpp::ParameterType::PARAMETER_DOUBLE) return pv.as_double();
+      return def;
+    };
     p.image_width = gd("image_width", p.image_width);
     p.image_height = gd("image_height", p.image_height);
     p.Kp_angular = gd("Kp_angular", p.Kp_angular);
@@ -44,10 +57,10 @@ class LineFollowerNode : public rclcpp::Node {
     p.turn_approach_delay_s = gd("turn_approach_delay_s", p.turn_approach_delay_s);
     p.acquire_guard_s = gd("acquire_guard_s", p.acquire_guard_s);
     p.stuck_lock_s = gd("stuck_lock_s", p.stuck_lock_s);
-    p.stuck_lock_band_px = gd("stuck_lock_band_px", p.stuck_lock_band_px);
-    p.stuck_lock_var_px = gd("stuck_lock_var_px", p.stuck_lock_var_px);
+    p.stuck_lock_band_px = gdf("stuck_lock_band_px", p.stuck_lock_band_px);
+    p.stuck_lock_var_px = gdf("stuck_lock_var_px", p.stuck_lock_var_px);
     p.dashed_recovery_enabled = gd("dashed_recovery_enabled", p.dashed_recovery_enabled);
-    p.max_error_jump_px = gd("max_error_jump_px", p.max_error_jump_px);
+    p.max_error_jump_px = gdf("max_error_jump_px", p.max_error_jump_px);
     p.error_median_n = gd("error_median_n", p.error_median_n);
     p.search_timeout_s = gd("search_timeout_s", p.search_timeout_s);
     p.search_speed_mps = gd("search_speed_mps", p.search_speed_mps);
@@ -57,33 +70,33 @@ class LineFollowerNode : public rclcpp::Node {
     p.frame_blind_s = gd("frame_blind_s", p.frame_blind_s);
     p.curve_min_speed = gd("curve_min_speed", p.curve_min_speed);
     p.angular_slew_max = gd("angular_slew_max", p.angular_slew_max);
-    p.slew_bypass_error_px = gd("slew_bypass_error_px", p.slew_bypass_error_px);
+    p.slew_bypass_error_px = gdf("slew_bypass_error_px", p.slew_bypass_error_px);
     p.angular_slew_max_sharp = gd("angular_slew_max_sharp", p.angular_slew_max_sharp);
     p.curve_gain = gd("curve_gain", p.curve_gain);
     p.turn_latch_enabled = gd("turn_latch_enabled", p.turn_latch_enabled);
-    p.turn_latch_error_px = gd("turn_latch_error_px", p.turn_latch_error_px);
+    p.turn_latch_error_px = gdf("turn_latch_error_px", p.turn_latch_error_px);
     p.turn_latch_frames = gd("turn_latch_frames", p.turn_latch_frames);
     p.turn_latch_z = gd("turn_latch_z", p.turn_latch_z);
-    p.turn_latch_exit_px = gd("turn_latch_exit_px", p.turn_latch_exit_px);
+    p.turn_latch_exit_px = gdf("turn_latch_exit_px", p.turn_latch_exit_px);
     p.turn_latch_exit_frames = gd("turn_latch_exit_frames", p.turn_latch_exit_frames);
     p.turn_latch_max_s = gd("turn_latch_max_s", p.turn_latch_max_s);
     p.turn_latch_speed = gd("turn_latch_speed", p.turn_latch_speed);
-    p.dashed_suppress_error_px = gd("dashed_suppress_error_px", p.dashed_suppress_error_px);
-    p.tight_turn_error_px = gd("tight_turn_error_px", p.tight_turn_error_px);
-    p.curve_brake_error_px = gd("curve_brake_error_px", p.curve_brake_error_px);
+    p.dashed_suppress_error_px = gdf("dashed_suppress_error_px", p.dashed_suppress_error_px);
+    p.tight_turn_error_px = gdf("tight_turn_error_px", p.tight_turn_error_px);
+    p.curve_brake_error_px = gdf("curve_brake_error_px", p.curve_brake_error_px);
     p.frame_stale_s = gd("frame_stale_s", p.frame_stale_s);
     p.stale_speed_scale = gd("stale_speed_scale", p.stale_speed_scale);
-    p.steer_hysteresis_px = gd("steer_hysteresis_px", p.steer_hysteresis_px);
-    p.error_sat_px = gd("error_sat_px", p.error_sat_px);
+    p.steer_hysteresis_px = gdf("steer_hysteresis_px", p.steer_hysteresis_px);
+    p.error_sat_px = gdf("error_sat_px", p.error_sat_px);
     p.error_sat_frames = gd("error_sat_frames", p.error_sat_frames);
     p.dashed_align_enabled = gd("dashed_align_enabled", p.dashed_align_enabled);
-    p.align_deadband_deg = gd("align_deadband_deg", p.align_deadband_deg);
-    p.k_align_z = gd("k_align_z", p.k_align_z);
-    p.align_max_z = gd("align_max_z", p.align_max_z);
-    p.align_sign = gd("align_sign", p.align_sign);
+    p.align_deadband_deg = gdf("align_deadband_deg", p.align_deadband_deg);
+    p.k_align_z = gdf("k_align_z", p.k_align_z);
+    p.align_max_z = gdf("align_max_z", p.align_max_z);
+    p.align_sign = gdf("align_sign", p.align_sign);
     p.align_slope_median_n = gd("align_slope_median_n", p.align_slope_median_n);
     p.align_window_s = gd("align_window_s", p.align_window_s);
-    p.align_max_tilt_deg = gd("align_max_tilt_deg", p.align_max_tilt_deg);
+    p.align_max_tilt_deg = gdf("align_max_tilt_deg", p.align_max_tilt_deg);
     p.turn_sign_left_class = gd("turn_sign_left_class", p.turn_sign_left_class);
     p.turn_sign_right_class = gd("turn_sign_right_class", p.turn_sign_right_class);
     p.turn_sign_straight_class = gd("turn_sign_straight_class", p.turn_sign_straight_class);
