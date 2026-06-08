@@ -31,6 +31,7 @@ array.array activates the buffer protocol and drops that to ~8 ms.
 
 import array
 import json
+import queue
 import threading
 
 import numpy as np
@@ -82,6 +83,14 @@ class CameraRawPublisher(Node):
         self.declare_parameter('frame_id',            'camera_optical_frame')
         self.declare_parameter('topic_raw',           '/camera/image_raw')
         self.declare_parameter('topic_small',         '/camera/image_small')
+        # Publish the FULL-res raw frame (2.76 MB/msg). Default OFF: it back-pressures
+        # the GStreamer pipeline (publish + DDS transport + bag recording on the same
+        # streaming thread) and froze the WHOLE graph for 1-18 s on the yolo bags. When
+        # YOLO is off-board it consumes the JPEG /camera/image_compressed instead, so the
+        # raw Image is not needed on the robot. The full GStreamer branch still runs (the
+        # compressed encode + camera_info ride on it) — only the raw Image publish is
+        # skipped. Set true only if a subscriber genuinely needs the uncompressed frame.
+        self.declare_parameter('publish_raw',         False)
         self.declare_parameter('undistort_file',      '')
         self.declare_parameter('undistort_enabled',   True)   # applies to SMALL stream only
         self.declare_parameter('publish_camera_info', False)
@@ -110,11 +119,18 @@ class CameraRawPublisher(Node):
         topic_small        = self.get_parameter('topic_small').value
         self._undist_en    = bool(self.get_parameter('undistort_enabled').value)
 
+        self._publish_raw  = bool(self.get_parameter('publish_raw').value)
+
         # Use all 4 cores for OpenCV (e.g. the small-stream remap).
         cv2.setNumThreads(4)
 
-        self._pub_raw   = self.create_publisher(Image, topic_raw,   _IMAGE_QOS)
+        # Only create the raw publisher when raw output is enabled — no idle publisher.
+        self._pub_raw   = (self.create_publisher(Image, topic_raw, _IMAGE_QOS)
+                           if self._publish_raw else None)
         self._pub_small = self.create_publisher(Image, topic_small, _IMAGE_QOS)
+        self.get_logger().info(
+            f'Raw full-res publish {"ENABLED" if self._publish_raw else "DISABLED"} '
+            f'({topic_raw}) — disabled keeps the heavy 2.76 MB frame off DDS/disk')
 
         # ── Optional compressed publisher (off the full frame) ────────────────
         self._pub_compressed = None
@@ -181,6 +197,26 @@ class CameraRawPublisher(Node):
         self._n_small = 0
         self._t_stats = self.get_clock().now()
 
+        # ── Publisher worker threads (stall isolation) ────────────────────────
+        # CRITICAL FIX: previously _on_sample published (and JPEG-encoded) INLINE on the
+        # GStreamer streaming thread. A slow subscriber / DDS transport / bag-record disk
+        # write then back-pressured that thread, which blocked the appsink and froze the
+        # WHOLE pipeline — BOTH streams + the rest of the graph (observed 1-18 s stalls on
+        # the yolo bags). Now the streaming callback only copies the frame into a depth-1
+        # queue (drop-oldest) and returns immediately; a dedicated worker thread per
+        # stream does the publish/encode. If a worker blocks, frames are dropped (latest
+        # wins) but CAPTURE NEVER STALLS — the small stream the follower depends on keeps
+        # flowing. depth-1 + drop-oldest matches the appsink's own max-buffers=1/drop.
+        self._run_workers = True
+        self._q_small = queue.Queue(maxsize=1)
+        self._q_full  = queue.Queue(maxsize=1)
+        self._worker_small = threading.Thread(
+            target=self._publish_worker, args=('small',), name='pub_small', daemon=True)
+        self._worker_full = threading.Thread(
+            target=self._publish_worker, args=('full',), name='pub_full', daemon=True)
+        self._worker_small.start()
+        self._worker_full.start()
+
         # ── GStreamer pipeline: tee → two hardware-scaled appsinks ────────────
         Gst.init(None)
         self._pipeline = Gst.parse_launch(self._pipeline_str(sensor_id))
@@ -244,7 +280,13 @@ class CameraRawPublisher(Node):
     # ── appsink callback ────────────────────────────────────────────────────────
 
     def _on_sample(self, sink, which):
-        """Pull one frame from an appsink and publish it (runs on a GStreamer thread)."""
+        """Pull one frame and hand it to the publisher worker (runs on a GStreamer thread).
+
+        This MUST stay light and non-blocking: it copies the frame out of the mapped
+        buffer and drops it into a depth-1 queue (drop-oldest), then returns. All
+        publishing/encoding happens on the worker thread, so a slow subscriber or disk
+        write can never back-pressure capture and freeze the pipeline.
+        """
         sample = sink.emit('pull-sample')
         if sample is None:
             return Gst.FlowReturn.OK
@@ -262,32 +304,70 @@ class CameraRawPublisher(Node):
             buf.unmap(mi)
 
         stamp = self.get_clock().now().to_msg()
-        if which == 'small':
-            if self._small_map1 is not None:
-                frame = cv2.remap(frame, self._small_map1, self._small_map2,
-                                  cv2.INTER_LINEAR)
-            self._publish(self._pub_small, frame, stamp)
-            self._n_small += 1
-        else:
-            self._publish(self._pub_raw, frame, stamp)
-            self._n_full += 1
-            # JPEG-compress the full frame for off-board YOLO — only when enabled AND
-            # someone is subscribed, so it costs nothing otherwise.
-            if (self._pub_compressed is not None
-                    and self._pub_compressed.get_subscription_count() > 0):
-                ok, buf = cv2.imencode(
-                    '.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, self._jpeg_quality])
-                if ok:
-                    cmsg = CompressedImage()
-                    cmsg.header.stamp    = stamp
-                    cmsg.header.frame_id = self._frame_id
-                    cmsg.format = 'jpeg'
-                    cmsg.data   = array.array('B', buf.tobytes())
-                    self._pub_compressed.publish(cmsg)
-            if self._pub_camera_info is not None and self._camera_info_msg is not None:
-                self._camera_info_msg.header.stamp = stamp
-                self._pub_camera_info.publish(self._camera_info_msg)
+        q = self._q_small if which == 'small' else self._q_full
+        # Drop-oldest: if the worker is still busy, discard the stale queued frame and
+        # enqueue the newest so we never block the GStreamer thread.
+        try:
+            q.put_nowait((frame, stamp))
+        except queue.Full:
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                q.put_nowait((frame, stamp))
+            except queue.Full:
+                pass
         return Gst.FlowReturn.OK
+
+    def _publish_worker(self, which):
+        """Dedicated per-stream publisher thread — drains the queue and publishes/encodes.
+
+        Isolated from the GStreamer streaming thread so transport/disk stalls drop frames
+        (latest-wins) instead of freezing capture.
+        """
+        q = self._q_small if which == 'small' else self._q_full
+        while self._run_workers:
+            try:
+                frame, stamp = q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if frame is None:                       # shutdown sentinel
+                break
+            try:
+                if which == 'small':
+                    if self._small_map1 is not None:
+                        frame = cv2.remap(frame, self._small_map1, self._small_map2,
+                                          cv2.INTER_LINEAR)
+                    self._publish(self._pub_small, frame, stamp)
+                    self._n_small += 1
+                else:
+                    self._n_full += 1
+                    # Raw full-res Image publish — only when explicitly enabled (the heavy
+                    # 2.76 MB frame that caused the whole-graph stalls). The full GStreamer
+                    # branch keeps running regardless so the compressed/camera_info below
+                    # still get a frame.
+                    if self._pub_raw is not None:
+                        self._publish(self._pub_raw, frame, stamp)
+                    # JPEG-compress the full frame for off-board YOLO — only when enabled
+                    # AND someone is subscribed, so it costs nothing otherwise.
+                    if (self._pub_compressed is not None
+                            and self._pub_compressed.get_subscription_count() > 0):
+                        ok, jbuf = cv2.imencode(
+                            '.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, self._jpeg_quality])
+                        if ok:
+                            cmsg = CompressedImage()
+                            cmsg.header.stamp    = stamp
+                            cmsg.header.frame_id = self._frame_id
+                            cmsg.format = 'jpeg'
+                            cmsg.data   = array.array('B', jbuf.tobytes())
+                            self._pub_compressed.publish(cmsg)
+                    if (self._pub_camera_info is not None
+                            and self._camera_info_msg is not None):
+                        self._camera_info_msg.header.stamp = stamp
+                        self._pub_camera_info.publish(self._camera_info_msg)
+            except Exception as e:
+                self.get_logger().warning(f'{which} publish worker error: {e}')
 
     def _publish(self, pub, frame, stamp):
         h, w, c = frame.shape
@@ -348,6 +428,19 @@ class CameraRawPublisher(Node):
                 self._pipeline.set_state(Gst.State.NULL)
             if hasattr(self, '_glib_loop') and self._glib_loop is not None:
                 self._glib_loop.quit()
+            # Stop the publisher workers (sentinel + join).
+            if getattr(self, '_run_workers', False):
+                self._run_workers = False
+                for q in (getattr(self, '_q_small', None), getattr(self, '_q_full', None)):
+                    if q is not None:
+                        try:
+                            q.put_nowait((None, None))
+                        except queue.Full:
+                            pass
+                for w in (getattr(self, '_worker_small', None),
+                          getattr(self, '_worker_full', None)):
+                    if w is not None:
+                        w.join(timeout=1.0)
         except Exception:
             pass
         super().destroy_node()

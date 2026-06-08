@@ -2,17 +2,28 @@
 """
 Traffic light FSM node.
 
-Consumes detected traffic light color and applies behavioral rules:
-  - Green  → full speed (scale = 1.0)
-  - Yellow → fixed reduced speed (yellow_speed_scale, e.g. 0.4) while yellow visible
-  - Red    → immediate stop (scale = 0.0)
-  - None   → treat as green, resume full speed
+Consumes the traffic-light color AND YOLO signs, and outputs a single speed scale.
+
+Traffic light:
+  - Green / None → full speed (1.0)
+  - Yellow       → reduced speed (yellow_speed_scale) while visible
+  - Red          → full stop (0.0)
+
+YOLO signs (non-turn; turn signs handled by the line follower at a dashed crossing):
+  - construccion → reduce speed (yellow_speed_scale) while seen
+  - stopSign     → FULL STOP while seen; resume after it leaves view + a confirm delay
+  - GIVE WAY     → ONE brief stop (give_way_pause_s) then continue; re-arms after it
+                   leaves view (once per sighting)
+  stopSign / GIVE WAY only fire OUTSIDE a curve (|/line_follower/error| <= curve gate);
+  if seen mid-curve the action is deferred until the robot is straight again.
 
 Subscribes:
-  /traffic_light_color  (std_msgs/String)  "red" | "green" | "yellow" | "none"
+  /traffic_light_color  (std_msgs/String)
+  /yolo/sign            (std_msgs/String)   detected sign class, or 'none'
+  /line_follower/error  (std_msgs/Float32)  steering error px (the 'in curve' gate)
 
 Publishes:
-  /traffic_speed_scale  (std_msgs/Float32)  multiplier applied to waypoint follower v
+  /traffic_speed_scale  (std_msgs/Float32)  multiplier applied to the follower's v
 """
 
 import signal
@@ -38,24 +49,73 @@ class TrafficLightFSMNode(Node):
         self.declare_parameter('yellow_speed_scale', 0.4)
         self.declare_parameter('color_lost_timeout', 1.5)
         self.declare_parameter('loop_hz',            20.0)
+        # YOLO sign behaviors (the non-turn signs; turn signs are handled by the line
+        # follower at a dashed crossing). Three distinct actions:
+        #   construccion → SLOW (reduce speed like yellow) while seen.
+        #   stopSign     → FULL STOP while seen; resume after it leaves view + a confirm
+        #                  delay (stop_resume_confirm_s).
+        #   GIVE WAY     → ONE brief stop (give_way_pause_s) then continue; re-arms only
+        #                  after the sign leaves view (once per sighting).
+        # stopSign / GIVE WAY only fire OUTSIDE a curve (|steering error| <= curve gate);
+        # if seen mid-curve the action is DEFERRED until the robot is straight again.
+        self.declare_parameter('sign_topic',          '/yolo/sign')
+        self.declare_parameter('slow_sign_classes',   ['construccion'])
+        self.declare_parameter('stop_sign_classes',   ['stopSign'])
+        self.declare_parameter('give_way_classes',    ['GIVE WAY'])
+        self.declare_parameter('sign_lost_timeout',   1.0)   # construccion slow hold
+        self.declare_parameter('give_way_pause_s',    1.5)   # brief stop duration
+        self.declare_parameter('stop_resume_confirm_s', 0.5) # delay after stopSign gone
+        # 'Outside a curve' gate: act only when |steering error| <= this (px). The robot
+        # publishes /line_follower/error; large |error| = a curve, so stops are deferred.
+        self.declare_parameter('error_topic',         '/line_follower/error')
+        self.declare_parameter('curve_gate_error_px', 35.0)
+        self.declare_parameter('sign_intent_stale_s', 3.0)   # forget a deferred intent older than this
 
         self._yellow_scale = float(self.get_parameter('yellow_speed_scale').value)
         self._lost_timeout = float(self.get_parameter('color_lost_timeout').value)
+        self._slow_signs   = set(self.get_parameter('slow_sign_classes').value)
+        self._stop_signs   = set(self.get_parameter('stop_sign_classes').value)
+        self._give_way_signs = set(self.get_parameter('give_way_classes').value)
+        self._sign_lost_timeout = float(self.get_parameter('sign_lost_timeout').value)
+        self._give_way_pause_s  = float(self.get_parameter('give_way_pause_s').value)
+        self._stop_resume_confirm_s = float(self.get_parameter('stop_resume_confirm_s').value)
+        self._curve_gate_px = float(self.get_parameter('curve_gate_error_px').value)
+        self._sign_intent_stale_s = float(self.get_parameter('sign_intent_stale_s').value)
 
         self._state              = TrafficState.RUNNING
         self._last_color         = 'none'
         self._last_color_time    = None
         self._waiting_for_green  = False   # latched True on red; only green clears it
+        # construccion slow input — INDEPENDENT of the light; combined in the scale.
+        self._sign_slow_until    = None    # monotonic time until which the slow sign holds
+        # 'in curve' gate from /line_follower/error
+        self._abs_error          = 0.0
+        # stopSign state: latched intent (seen, pending) + last-seen time + a resume timer
+        self._stop_seen_t        = None    # last time stopSign was seen
+        self._stop_active        = False   # currently holding a full stop for stopSign
+        self._stop_resume_at     = None    # monotonic time we may resume (sign gone + confirm)
+        self._stop_intent_t      = None    # latched deferred stop intent timestamp
+        # GIVE WAY state: pending intent + pause window + once-per-sighting arm
+        self._gw_intent_t        = None    # latched deferred give-way intent timestamp
+        self._gw_pause_until     = None    # monotonic end of the brief pause
+        self._gw_armed           = True    # False after a pause until the sign leaves view
+        self._gw_seen_t          = None    # last time GIVE WAY was seen
 
         self.create_subscription(String, '/traffic_light_color', self._color_callback, 10)
+        self.create_subscription(
+            String, self.get_parameter('sign_topic').value, self._sign_callback, 10)
+        self.create_subscription(
+            Float32, self.get_parameter('error_topic').value, self._error_callback, 10)
         self._scale_pub = self.create_publisher(Float32, '/traffic_speed_scale', 10)
 
         hz = self.get_parameter('loop_hz').value
         self.create_timer(1.0 / hz, self._publish_loop)
 
         self.get_logger().info(
-            f'TrafficLightFSMNode ready — '
-            f'yellow_scale={self._yellow_scale}, lost_timeout={self._lost_timeout}s'
+            f'TrafficLightFSMNode ready — yellow_scale={self._yellow_scale}, '
+            f'slow={sorted(self._slow_signs)}, stop={sorted(self._stop_signs)}, '
+            f'give_way={sorted(self._give_way_signs)} (pause={self._give_way_pause_s}s), '
+            f'curve_gate=|err|<= {self._curve_gate_px}px'
         )
         self.get_logger().info(f'Initial state: {self._state.value}')
 
@@ -63,7 +123,8 @@ class TrafficLightFSMNode(Node):
 
     def _color_callback(self, msg: String):
         color = msg.data.lower().strip()
-        self._last_color_time = time.monotonic()
+        now = time.monotonic()
+        self._last_color_time = now
 
         if color == self._last_color:
             return   # no change
@@ -74,7 +135,7 @@ class TrafficLightFSMNode(Node):
         if self._state.value != self._state_for_color(prev):
             self.get_logger().info(
                 f'Traffic: {prev} → {color}  |  state → {self._state.value}  '
-                f'(scale={self._current_scale():.2f})'
+                f'(scale={self._current_scale(now):.2f})'
             )
 
     def _transition(self, color: str):
@@ -101,12 +162,100 @@ class TrafficLightFSMNode(Node):
             )
             self._state = new_state
 
-    def _current_scale(self) -> float:
-        if self._state == TrafficState.RUNNING:
-            return 1.0
-        if self._state == TrafficState.SLOW:
-            return self._yellow_scale   # fixed reduced speed while yellow visible
-        return 0.0   # STOPPED — immediate
+    def _error_callback(self, msg: Float32):
+        self._abs_error = abs(float(msg.data))
+
+    def _in_curve(self) -> bool:
+        return self._abs_error > self._curve_gate_px
+
+    def _sign_callback(self, msg: String):
+        """Route a YOLO sign to slow / stop / give-way intent.
+
+        construccion → timed slow hold. stopSign / GIVE WAY → latch a deferred intent
+        (consumed in the publish loop only when OUTSIDE a curve); GIVE WAY re-arms only
+        after it leaves view.
+        """
+        c = msg.data.strip()
+        now = time.monotonic()
+        if c in self._slow_signs:
+            self._sign_slow_until = now + self._sign_lost_timeout
+        if c in self._stop_signs:
+            self._stop_seen_t = now
+            if self._stop_intent_t is None:
+                self._stop_intent_t = now      # latch a pending stop (curve-deferred)
+        if c in self._give_way_signs:
+            self._gw_seen_t = now
+            if self._gw_armed and self._gw_intent_t is None:
+                self._gw_intent_t = now        # latch a pending give-way (curve-deferred)
+
+    def _sign_slow_active(self, now) -> bool:
+        return (self._sign_slow_until is not None
+                and now < self._sign_slow_until)
+
+    def _stop_sign_seen_recent(self, now) -> bool:
+        return (self._stop_seen_t is not None
+                and (now - self._stop_seen_t) <= self._lost_timeout)
+
+    def _give_way_seen_recent(self, now) -> bool:
+        return (self._gw_seen_t is not None
+                and (now - self._gw_seen_t) <= self._lost_timeout)
+
+    def _update_sign_behaviors(self, now):
+        """Advance the stopSign / GIVE WAY state machines (called each publish loop)."""
+        # ── GIVE WAY: re-arm once the sign has left view ──────────────────────
+        if not self._give_way_seen_recent(now):
+            self._gw_armed = True
+            self._gw_intent_t = None           # drop a stale, never-fired intent
+        # Drop a deferred give-way intent that went stale (never got a straight window).
+        if (self._gw_intent_t is not None
+                and (now - self._gw_intent_t) > self._sign_intent_stale_s):
+            self._gw_intent_t = None
+        # Fire the brief pause when out of a curve and not already pausing.
+        if (self._gw_intent_t is not None and self._gw_pause_until is None
+                and self._gw_armed and not self._in_curve()):
+            self._gw_pause_until = now + self._give_way_pause_s
+            self._gw_armed = False             # once per sighting
+            self._gw_intent_t = None
+            self.get_logger().info('GIVE WAY: brief stop, then continue.')
+        if self._gw_pause_until is not None and now >= self._gw_pause_until:
+            self._gw_pause_until = None         # pause over → resume
+
+        # ── stopSign: hold a full stop while seen; resume after gone + confirm ──
+        if (self._stop_intent_t is not None
+                and (now - self._stop_intent_t) > self._sign_intent_stale_s
+                and not self._stop_sign_seen_recent(now)):
+            self._stop_intent_t = None          # stale, never-fired intent
+        if self._stop_sign_seen_recent(now):
+            self._stop_resume_at = None         # still seeing it → no resume yet
+            # engage the hold once out of a curve (deferred until straight)
+            if not self._stop_active and not self._in_curve():
+                self._stop_active = True
+                self._stop_intent_t = None
+                self.get_logger().info('stopSign: full stop until the sign leaves view.')
+        elif self._stop_active:
+            # sign no longer seen → start/await the confirm delay, then release
+            if self._stop_resume_at is None:
+                self._stop_resume_at = now + self._stop_resume_confirm_s
+            elif now >= self._stop_resume_at:
+                self._stop_active = False
+                self._stop_resume_at = None
+                self.get_logger().info('stopSign gone — resuming.')
+
+    def _give_way_pausing(self, now) -> bool:
+        return self._gw_pause_until is not None and now < self._gw_pause_until
+
+    def _current_scale(self, now) -> float:
+        # Highest-priority FULL STOPs first.
+        if self._state == TrafficState.STOPPED:   # red light
+            return 0.0
+        if self._stop_active:                      # stopSign hold
+            return 0.0
+        if self._give_way_pausing(now):            # GIVE WAY brief pause
+            return 0.0
+        # Then SLOW: yellow light OR construccion sign.
+        if self._state == TrafficState.SLOW or self._sign_slow_active(now):
+            return self._yellow_scale
+        return 1.0
 
     @staticmethod
     def _state_for_color(color: str) -> str:
@@ -127,8 +276,11 @@ class TrafficLightFSMNode(Node):
             self._last_color = 'none'
             self._set_state(TrafficState.RUNNING)
 
+        # Advance the stopSign / GIVE WAY state machines (curve-gated, timed).
+        self._update_sign_behaviors(now)
+
         scale_msg = Float32()
-        scale_msg.data = self._current_scale()
+        scale_msg.data = self._current_scale(now)
         self._scale_pub.publish(scale_msg)
 
 

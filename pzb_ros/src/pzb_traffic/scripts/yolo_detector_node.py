@@ -20,6 +20,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 
 from sensor_msgs.msg import CompressedImage, Image
+from std_msgs.msg import String
 
 
 _IMAGE_QOS = QoSProfile(
@@ -47,6 +48,7 @@ class YoloDetectorNode(Node):
         self.declare_parameter('device',         'cuda')
         self.declare_parameter('input_topic',    '/camera/image_compressed')
         self.declare_parameter('output_topic',   '/yolo/debug_image')
+        self.declare_parameter('sign_topic',     '/yolo/sign')
 
         model_path       = self.get_parameter('model_path').value
         self._conf_thr   = float(self.get_parameter('conf_threshold').value)
@@ -56,6 +58,7 @@ class YoloDetectorNode(Node):
         device           = self.get_parameter('device').value
         in_topic         = self.get_parameter('input_topic').value
         out_topic        = self.get_parameter('output_topic').value
+        sign_topic       = self.get_parameter('sign_topic').value
 
         if not model_path:
             self.get_logger().fatal(
@@ -79,6 +82,9 @@ class YoloDetectorNode(Node):
         self.get_logger().info('YOLO model ready.')
 
         self._pub_debug = self.create_publisher(Image, out_topic, _IMAGE_QOS)
+        # Detected sign/class for the behavior layer (traffic FSM + line follower).
+        # Published every processed frame as the closest (largest-box) class, or 'none'.
+        self._pub_sign  = self.create_publisher(String, sign_topic, 10)
         self._sub = self.create_subscription(
             CompressedImage, in_topic, self._image_cb, _IMAGE_QOS)
 
@@ -95,8 +101,11 @@ class YoloDetectorNode(Node):
     # ── Image callback ────────────────────────────────────────────────────────
 
     def _image_cb(self, msg: CompressedImage):
-        # Skip work when nobody is watching the debug topic.
-        if self._pub_debug.get_subscription_count() == 0:
+        # Run whenever SOMEONE needs us: the sign topic (behavior layer) OR the debug
+        # image. The sign topic drives the robot, so don't gate inference on debug alone.
+        want_debug = self._pub_debug.get_subscription_count() > 0
+        want_sign  = self._pub_sign.get_subscription_count() > 0
+        if not (want_debug or want_sign):
             return
 
         frame = cv2.imdecode(
@@ -105,10 +114,12 @@ class YoloDetectorNode(Node):
             self.get_logger().warning('cv2.imdecode returned None — skipping frame')
             return
 
-        # Blur pre-filter (disabled when blur_threshold=0.0).
+        # Blur pre-filter (disabled when blur_threshold=0.0). Publish 'none' on a skip so
+        # a stale sign doesn't linger as if still detected.
         if self._blur_thr > 0.0:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             if cv2.Laplacian(gray, cv2.CV_64F).var() < self._blur_thr:
+                self._publish_sign('none')
                 return
 
         results = self._model(
@@ -119,6 +130,7 @@ class YoloDetectorNode(Node):
         best_box   = None
         best_area  = -1
         best_label = ''
+        best_class = 'none'
 
         if results.boxes is not None:
             for i in range(len(results.boxes)):
@@ -133,24 +145,34 @@ class YoloDetectorNode(Node):
                     cls_id     = int(results.boxes.cls[i])
                     cls_name   = results.names[cls_id]
                     best_label = f'{cls_name}  {conf:.2f}'
-                    self._last_class = cls_name
+                    best_class = cls_name
 
-        if best_box is not None:
-            x1, y1, x2, y2 = best_box
-            cv2.rectangle(frame, (x1, y1), (x2, y2), _BOX_COLOR, 2)
-            # Filled label background so text is always legible.
-            (tw, th), _ = cv2.getTextSize(
-                best_label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-            cv2.rectangle(
-                frame, (x1, y1 - th - 8), (x1 + tw + 4, y1), _BOX_COLOR, -1)
-            cv2.putText(
-                frame, best_label, (x1 + 2, y1 - 4),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, _TEXT_COLOR, 2)
+        # Publish the closest detected class (or 'none') for the behavior layer.
+        self._last_class = best_class
+        self._publish_sign(best_class)
 
-        self._publish_frame(frame, msg.header.stamp)
+        # Only build + publish the (CPU-costly) debug overlay if someone is watching it.
+        if want_debug:
+            if best_box is not None:
+                x1, y1, x2, y2 = best_box
+                cv2.rectangle(frame, (x1, y1), (x2, y2), _BOX_COLOR, 2)
+                # Filled label background so text is always legible.
+                (tw, th), _ = cv2.getTextSize(
+                    best_label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                cv2.rectangle(
+                    frame, (x1, y1 - th - 8), (x1 + tw + 4, y1), _BOX_COLOR, -1)
+                cv2.putText(
+                    frame, best_label, (x1 + 2, y1 - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, _TEXT_COLOR, 2)
+            self._publish_frame(frame, msg.header.stamp)
         self._frames += 1
 
-    # ── Publish helper ────────────────────────────────────────────────────────
+    # ── Publish helpers ───────────────────────────────────────────────────────
+
+    def _publish_sign(self, cls_name: str):
+        msg = String()
+        msg.data = cls_name
+        self._pub_sign.publish(msg)
 
     def _publish_frame(self, frame: np.ndarray, stamp):
         h, w, c = frame.shape

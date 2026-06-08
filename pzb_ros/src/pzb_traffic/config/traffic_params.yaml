@@ -37,6 +37,23 @@ traffic_light_fsm_node:
   ros__parameters:
     use_sim_time: false
 
-    yellow_speed_scale: 0.4   # fixed v multiplier while yellow is visible
+    yellow_speed_scale: 0.4   # fixed v multiplier while yellow is visible (also slow signs)
     color_lost_timeout: 1.5   # s — treat color as "none" if no detection this long
     loop_hz:             20.0
+
+    # YOLO sign behaviors (Part 2, non-turn signs; turn signs handled by the follower).
+    #   construccion → SLOW (yellow_speed_scale) while seen.
+    #   stopSign     → FULL STOP while seen; resume after it leaves view + confirm delay.
+    #   GIVE WAY     → ONE brief stop then continue; re-arms after it leaves view.
+    # stopSign / GIVE WAY only fire OUTSIDE a curve (deferred until |error| <= curve gate).
+    sign_topic:           /yolo/sign
+    slow_sign_classes:    ['construccion']
+    stop_sign_classes:    ['stopSign']
+    give_way_classes:     ['GIVE WAY']
+    sign_lost_timeout:    1.0   # s — construccion slow hold after last sighting
+    give_way_pause_s:     1.5   # s — brief GIVE WAY stop duration
+    stop_resume_confirm_s: 0.5  # s — wait after stopSign disappears before resuming
+    # 'Outside a curve' gate — act only when |steering error| <= this (px); else defer.
+    error_topic:          /line_follower/error
+    curve_gate_error_px:  35.0
+    sign_intent_stale_s:  3.0   # s — forget a deferred (never-fired) stop/give-way intent
