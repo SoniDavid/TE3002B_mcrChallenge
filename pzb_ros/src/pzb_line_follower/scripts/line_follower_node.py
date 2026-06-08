@@ -130,6 +130,44 @@ class LineFollowerNode(Node):
         # angular_slew_max_sharp so steering reaches the PD value in 1-2 frames.
         self.declare_parameter('slew_bypass_error_px',    80)
         self.declare_parameter('angular_slew_max_sharp',  0.45)
+        # Medium-curve gain boost (B1, new_implementation1 under-steer fix): Kp=0.0045 gives
+        # err 70 -> az only 0.32, so medium curves (|err| ~50-110) under-steered and the
+        # error lingered 2-5 s (t=89.8/153.1/168.3). When a turn is CONFIRMED (sharp_turn:
+        # sustained same-sign |err| >= slew_bypass_error_px) multiply Kp by curve_gain so
+        # the same error commands a real correction (err 70 -> ~0.5 at 1.5x). Only applies
+        # on a confirmed same-sign turn, so it can't amplify small-error jitter into stutter.
+        self.declare_parameter('curve_gain',              1.5)
+        # Open-loop "turn until aligned" latch (B2, opt-in, default OFF). On a CONFIRMED
+        # turn (sustained same-sign |err| >= turn_latch_error_px for turn_latch_frames),
+        # latch a fixed yaw (turn_latch_z) toward the line at reduced speed (turn_latch_speed)
+        # and HOLD until the CAMERA says aligned (|err| < turn_latch_exit_px for
+        # turn_latch_exit_frames) or turn_latch_max_s elapses. More decisive than PD on
+        # tight curves, but open-loop — enable only after on-robot A/B vs B1 (the offline
+        # harness cannot validate closed-loop steering; B1's gain boost is the default).
+        self.declare_parameter('turn_latch_enabled',      False)
+        self.declare_parameter('turn_latch_error_px',     55)
+        self.declare_parameter('turn_latch_frames',       3)
+        self.declare_parameter('turn_latch_z',            0.55)
+        self.declare_parameter('turn_latch_exit_px',      25)
+        self.declare_parameter('turn_latch_exit_frames',  3)
+        self.declare_parameter('turn_latch_max_s',        2.5)
+        self.declare_parameter('turn_latch_speed',        0.05)
+        # YOLO dashed-gated turn signs (Part 2). At a CONFIRMED dashed crossing the robot
+        # consumes the most-recent turn class: letRecto = cross straight (existing); turn
+        # signs = open-loop turn arc INTO that lane, then re-acquire. Only turn classes are
+        # latched here; the slow classes go to the traffic FSM.
+        self.declare_parameter('turn_sign_left_class',    'letIzquierda')
+        self.declare_parameter('turn_sign_right_class',   'letDerecha')
+        self.declare_parameter('turn_sign_straight_class','letRecto')
+        self.declare_parameter('turn_sign_stale_s',       4.0)   # ignore a sign older than this
+        self.declare_parameter('cross_turn_z',            0.6)   # yaw rate during the lane turn
+        self.declare_parameter('cross_turn_s',            1.6)   # turn duration (s) into the lane
+        self.declare_parameter('cross_turn_speed',        0.06)  # forward speed during the turn
+        # Crossing-state gap handling: after the turn/straight phase, COAST forward at this
+        # speed (no line steering) through the inter-intersection gap until a real line
+        # returns (≥2 line slots for crossing_exit_frames frames), then resume centering.
+        self.declare_parameter('crossing_coast_speed',    0.06)
+        self.declare_parameter('crossing_exit_frames',    3)
         # Curve dashed-suppression (newnew-bags fix): suppress a "dashed" classification
         # while the steering error is past this — a real crossing is approached head-on
         # (small error); a sharp curve (large error) breaks the line into co-linear blobs
@@ -165,11 +203,6 @@ class LineFollowerNode(Node):
         # into the wall. Conservative so a genuine curve (converges < ~1 s) never trips it.
         self.declare_parameter('error_sat_px',            150)
         self.declare_parameter('error_sat_frames',        6)
-        # Fork branch selection (pzb_not_workingcorrectly4). Default OFF: it steers the
-        # bag4 fork LEFT correctly, but per-frame geometry cannot yet separate a true
-        # fork from a sharp single-lane curve (regresses bad_ignment5/bad_alginment2),
-        # so it ships gated until a temporal/exits-based discriminator is added.
-        self.declare_parameter('fork_select_enabled',     False)
         # Perpendicular dashed-alignment (bad_alginment2 fix)
         self.declare_parameter('dashed_align_enabled',    True)
         self.declare_parameter('align_deadband_deg',      6.0)
@@ -220,6 +253,34 @@ class LineFollowerNode(Node):
         self._angular_slew_max    = float(self.get_parameter('angular_slew_max').value)
         self._slew_bypass_error_px = float(self.get_parameter('slew_bypass_error_px').value)
         self._angular_slew_max_sharp = float(self.get_parameter('angular_slew_max_sharp').value)
+        self._curve_gain          = float(self.get_parameter('curve_gain').value)
+        self._tl_en       = bool(self.get_parameter('turn_latch_enabled').value)
+        self._tl_err      = float(self.get_parameter('turn_latch_error_px').value)
+        self._tl_frames   = int(self.get_parameter('turn_latch_frames').value)
+        self._tl_z        = float(self.get_parameter('turn_latch_z').value)
+        self._tl_exit     = float(self.get_parameter('turn_latch_exit_px').value)
+        self._tl_exit_n   = int(self.get_parameter('turn_latch_exit_frames').value)
+        self._tl_max_s    = float(self.get_parameter('turn_latch_max_s').value)
+        self._tl_speed    = float(self.get_parameter('turn_latch_speed').value)
+        # Turn-latch runtime state (B2)
+        self._tl_active   = False
+        self._tl_sign     = 0.0
+        self._tl_start    = None
+        self._tl_arm      = 0
+        self._tl_exit_c   = 0
+        # YOLO turn-sign params + latch state (Part 2)
+        self._sign_left   = str(self.get_parameter('turn_sign_left_class').value)
+        self._sign_right  = str(self.get_parameter('turn_sign_right_class').value)
+        self._sign_straight = str(self.get_parameter('turn_sign_straight_class').value)
+        self._sign_stale_s = float(self.get_parameter('turn_sign_stale_s').value)
+        self._cross_turn_z = float(self.get_parameter('cross_turn_z').value)
+        self._cross_turn_s = float(self.get_parameter('cross_turn_s').value)
+        self._cross_turn_speed = float(self.get_parameter('cross_turn_speed').value)
+        self._crossing_coast_speed = float(self.get_parameter('crossing_coast_speed').value)
+        self._crossing_exit_frames = int(self.get_parameter('crossing_exit_frames').value)
+        self._turn_sign   = None     # 'left' | 'right' | 'straight' | None (latched)
+        self._turn_sign_t = None     # monotonic time the turn sign was last seen
+        self._cross_turn_start = None  # set when the in-crossing turn arc begins
         self._dashed_suppress_error_px = float(self.get_parameter('dashed_suppress_error_px').value)
         self._tight_turn_error_px = float(self.get_parameter('tight_turn_error_px').value)
         self._curve_brake_error_px = float(self.get_parameter('curve_brake_error_px').value)
@@ -228,7 +289,6 @@ class LineFollowerNode(Node):
         self._steer_hyst_px       = float(self.get_parameter('steer_hysteresis_px').value)
         self._error_sat_px        = float(self.get_parameter('error_sat_px').value)
         self._error_sat_frames    = int(self.get_parameter('error_sat_frames').value)
-        self._fork_select_enabled = bool(self.get_parameter('fork_select_enabled').value)
         self._align_enabled       = bool(self.get_parameter('dashed_align_enabled').value)
         self._align_deadband_deg  = float(self.get_parameter('align_deadband_deg').value)
         self._k_align_z           = float(self.get_parameter('k_align_z').value)
@@ -314,6 +374,17 @@ class LineFollowerNode(Node):
         self._aligned_latch  = False  # True once perpendicular → proceed to crossing
         self._align_done_t   = None   # monotonic time the align sub-phase completed
 
+        # Crossing-state ownership (inter-intersection gap fix). Once a dashed crossing is
+        # confirmed the crossing FSM OWNS control (align → turn/straight → coast) and does
+        # NOT revert to line-following while the robot is between intersections — in that
+        # gap there is no continuous line, so the detector's (L+R)/2 fallback would steer
+        # to noise. The FSM exits only when a REAL continuous line returns: ≥2 line slots
+        # for _crossing_exit_frames consecutive frames. The post-cross "coast" drives at
+        # the approach speed (straight) until then, instead of the old full-stop Phase C.
+        self._crossing_active   = False
+        self._crossing_done_t   = None   # monotonic time the turn/straight phase finished
+        self._real_line_streak  = 0      # consecutive frames with ≥2 line slots
+
         # Turn approach delay: when the camera first sees a sharp turn, coast at reduced
         # speed for _turn_approach_delay seconds before applying full angular correction.
         # This compensates for the camera looking ahead of the robot body.
@@ -336,13 +407,21 @@ class LineFollowerNode(Node):
         self._pub_error     = self.create_publisher(Float32, '/line_follower/error',      _RELIABLE_QOS)
         self._pub_line_type = self.create_publisher(String,  '/line_follower/line_type',  _RELIABLE_QOS)
         self._pub_cmd       = self.create_publisher(Twist,   topic_cmd,                   _RELIABLE_QOS)
-        self._pub_debug_img = self.create_publisher(Image,   '/line_follower/debug_image', _RELIABLE_QOS)
+        # Debug image is large (~0.5 MB/msg). BEST_EFFORT so a slow subscriber / bag
+        # recorder can never ACK-back-pressure the follower (a RELIABLE 0.5 MB topic
+        # contributed to multi-second whole-graph stalls when recorded on the Jetson).
+        self._pub_debug_img = self.create_publisher(Image,   '/line_follower/debug_image', _BEST_EFFORT_QOS)
 
         # Subscriber — raw Image; BEST_EFFORT matches camera publisher
         self.create_subscription(Image, topic_in, self._image_cb, _BEST_EFFORT_QOS)
 
         # Traffic speed scale (optional — defaults to 1.0 if never published)
         self.create_subscription(Float32, '/traffic_speed_scale', self._cb_speed_scale, _RELIABLE_QOS)
+
+        # YOLO sign (optional) — latches the most-recent TURN class so it can be applied
+        # at the next dashed crossing. Non-turn (slow) classes are handled by the traffic
+        # FSM (speed scale); only the turn classes matter to the follower.
+        self.create_subscription(String, '/yolo/sign', self._cb_yolo_sign, 10)
 
         # 20 Hz cmd_vel publish timer — decoupled from camera FPS (Team2 pattern).
         self.create_timer(1.0 / 20.0, self._cmd_publish_cb)
@@ -428,11 +507,16 @@ class LineFollowerNode(Node):
         if _confirmed_dashed:
             self._dashed_latch_t = _t_latch
             if self._dashed_first_t is None:
-                # Entering a fresh dashed crossing — reset alignment state.
+                # Entering a fresh dashed crossing — reset alignment + turn-arc state and
+                # take crossing-state ownership (held across the gap until a real line).
                 self._dashed_first_t = _t_latch
                 self._slope_buf.clear()
                 self._aligned_latch = False
                 self._align_done_t  = None
+                self._cross_turn_start = None   # turn arc (Part 2) starts fresh per crossing
+                self._crossing_active  = True
+                self._crossing_done_t  = None
+                self._real_line_streak = 0
 
         if _confirmed_dashed or (self._dashed_latch_t is not None
                 and (_t_latch - self._dashed_latch_t) < self._dashed_latch_s):
@@ -475,6 +559,10 @@ class LineFollowerNode(Node):
                 # intersection — suppress the dashed→solid anchor reset below so the
                 # tracker isn't re-centered off the curve's offset line.
                 self._was_dashed = False
+                # This was a false dashed-on-curve, not a real crossing — release
+                # crossing-state ownership so normal centering resumes immediately.
+                self._crossing_active  = False
+                self._real_line_streak = 0
         else:
             self._dashed_live_break_count = 0
             self._dashed_live_break_sign  = 0
@@ -523,7 +611,28 @@ class LineFollowerNode(Node):
             self._err_hist.clear()   # drop the pre-exit error history
         self._was_dashed = (line_type == 'dashed')
 
-        if line_type == 'dashed':
+        # Crossing-state ownership across the inter-intersection gap. Once a crossing is
+        # active the FSM keeps control until a REAL continuous line returns — ≥2 line
+        # slots visible for _crossing_exit_frames consecutive frames. In the gap the
+        # detector may briefly report "solid" with a spurious (L+R)/2 target over noise;
+        # holding crossing-state prevents steering to it. The live-error dashed-break
+        # above (a genuine curving line at large error) already cleared _crossing_active
+        # via its latch reset, so a real curve is not trapped here.
+        _n_vis_now = sum(self._detector.line_flags.values())
+        if self._crossing_active:
+            if _n_vis_now >= 2:
+                self._real_line_streak += 1
+            else:
+                self._real_line_streak = 0
+            if self._real_line_streak >= self._crossing_exit_frames:
+                # A real lane is back — exit crossing-state and resume normal centering.
+                self._crossing_active = False
+                self._detector.reset_tracker_anchors()
+                self._acq_until = now + self._acquire_guard_s
+                self._err_hist.clear()
+
+        # The crossing FSM runs while a crossing is active OR the current frame is dashed.
+        if self._crossing_active or line_type == 'dashed':
             # Intersection handling — align EARLY, then cross straight, then stop:
             #   Phase A — Align/coast (bad_ignment4 strong-safeguard): drive forward
             #             at the APPROACH speed while squaring up to the dashes, but
@@ -569,13 +678,30 @@ class LineFollowerNode(Node):
                 self._aligned_latch = True
                 self._align_done_t  = now
 
+            # YOLO turn action (Part 2): once aligned, if a FRESH turn sign says left/right,
+            # turn INTO that lane open-loop instead of crossing straight. letRecto / no sign
+            # → straight cross (unchanged). The turn arc runs for cross_turn_s, then Phase C.
+            _turn_dir = self._fresh_turn_sign() if self._aligned_latch else None
+            _do_turn  = _turn_dir in ('left', 'right')
+
             if not self._aligned_latch:
                 # Phase A — align/coast: forward + perpendicular alignment steering.
                 cmd = Twist()
                 cmd.linear.x  = cross_speed * max(self._speed_scale, 1.0)
                 cmd.angular.z = align_z
-            elif (now - self._align_done_t) < openloop_dur:
-                # Phase B — straight crossing at the approach speed.
+            elif _do_turn and (self._cross_turn_start is None
+                               or (now - self._cross_turn_start) < self._cross_turn_s):
+                # Phase B' — open-loop TURN into the indicated lane (YOLO letDerecha/Izquierda).
+                if self._cross_turn_start is None:
+                    self._cross_turn_start = now
+                    self.get_logger().info(
+                        f'Dashed crossing: turning {_turn_dir.upper()} (YOLO turn sign).')
+                cmd = Twist()
+                cmd.linear.x  = self._cross_turn_speed * max(self._speed_scale, 1.0)
+                # left lane = positive yaw (CCW); right lane = negative yaw.
+                cmd.angular.z = self._cross_turn_z if _turn_dir == 'left' else -self._cross_turn_z
+            elif not _do_turn and (now - self._align_done_t) < openloop_dur:
+                # Phase B — straight crossing at the approach speed (letRecto / no sign).
                 cmd = Twist()
                 cmd.linear.x = cross_speed * max(self._speed_scale, 1.0)
                 cmd.angular.z = 0.0
@@ -597,8 +723,19 @@ class LineFollowerNode(Node):
                     else:
                         self._recovery_side = None
             else:
-                # Phase C — full stop
+                # Phase C — COAST through the inter-intersection gap. The turn/straight
+                # phase is done but there is no continuous line yet; drive straight at the
+                # coast speed (no line steering) and KEEP crossing-state until a real lane
+                # returns (the ≥2-slot exit gate above clears _crossing_active and hands
+                # back to normal centering). Replaces the old full-stop, which either
+                # stalled the robot in the gap or let it revert to steering on noise.
+                if self._crossing_done_t is None:
+                    self._crossing_done_t = now
+                    self._turn_sign = None     # consume the sign so it can't re-fire
+                    self._turn_sign_t = None
                 cmd = Twist()
+                cmd.linear.x  = self._crossing_coast_speed * max(self._speed_scale, 1.0)
+                cmd.angular.z = 0.0
                 self._last_valid_cmd = cmd
 
             self._latest_cmd = cmd
@@ -682,6 +819,21 @@ class LineFollowerNode(Node):
                              for e in self._error_hist if abs(e) > self._dead_band)
             sharp_turn = (abs(error) >= self._slew_bypass_error_px and _same_sign)
 
+            # ── B2 open-loop "turn until aligned" latch (opt-in, default off) ──────
+            # On a confirmed turn, rotate at a fixed yaw toward the line until the camera
+            # says re-centered (or a safety cap). Bypasses PD entirely while latched.
+            if self._tl_en:
+                tl_cmd = self._turn_latch_step(error, _same_sign, now)
+                if tl_cmd is not None:
+                    self._latest_cmd     = tl_cmd
+                    self._last_valid_cmd = tl_cmd
+                    self._last_valid_t   = now
+                    self._prev_az        = tl_cmd.angular.z
+                    cx_msg = Int32();   cx_msg.data = cx;                self._pub_cx.publish(cx_msg)
+                    err_msg = Float32(); err_msg.data = error;           self._pub_error.publish(err_msg)
+                    type_msg = String(); type_msg.data = line_type;      self._pub_line_type.publish(type_msg)
+                    return
+
             # Time-based D-term (Team2 pattern): divide by actual dt in seconds so the
             # derivative gain is FPS-invariant.  At 30 fps, dt≈33 ms; at 5 fps, dt≈200 ms.
             if self._prev_error_t is not None and self._kd != 0.0:
@@ -712,12 +864,16 @@ class LineFollowerNode(Node):
             if self._acq_until is not None and now < self._acq_until:
                 _in_approach = True
 
-            # PD steering
+            # PD steering. On a CONFIRMED turn (sharp_turn) apply the medium-curve gain
+            # boost so the same error commands a decisive correction instead of a weak arc
+            # (B1 under-steer fix). Gated on sharp_turn (sustained same-sign |err|), so it
+            # never amplifies the small-error jitter the dead-band/hysteresis handle.
             if abs(error) <= self._dead_band:
                 angular_z = 0.0
             else:
+                kp = self._kp * (self._curve_gain if sharp_turn else 1.0)
                 angular_z = float(np.clip(
-                    -self._kp * error - self._kd * d_error,
+                    -kp * error - self._kd * d_error,
                     -self._max_ang, self._max_ang,
                 ))
                 # The approach/acquisition cap throttles angular to 0.3*max_ang while the
@@ -856,13 +1012,46 @@ class LineFollowerNode(Node):
             dbg_msg.data = array.array('B', dbg.tobytes())
             self._pub_debug_img.publish(dbg_msg)
 
-        # Gate fork branch selection (pzb_not_workingcorrectly4): never pick a fork
-        # branch while the robot is squaring up to a dashed crossing (Phase A of
-        # ALIGN→CROSS→STOP) — alignment owns the steering there. Re-enable once the
-        # crossing is aligned/over or we're back in solid following. Applies to the
-        # NEXT frame's detect_center_line call.
-        aligning = (line_type == 'dashed') and (not self._aligned_latch)
-        self._detector.branch_select_enabled = self._fork_select_enabled and (not aligning)
+    def _turn_latch_step(self, error, same_sign, now):
+        """Open-loop turn-until-aligned (B2). Returns a Twist while latched/firing, else None.
+
+        Enter: sustained same-sign |error| >= turn_latch_error_px for turn_latch_frames.
+        Hold:  fixed yaw toward the line at turn_latch_speed.
+        Exit:  |error| < turn_latch_exit_px for turn_latch_exit_frames (camera aligned),
+               or turn_latch_max_s elapsed (safety cap).
+        """
+        if self._tl_active:
+            if abs(error) < self._tl_exit:
+                self._tl_exit_c += 1
+            else:
+                self._tl_exit_c = 0
+            timed_out = (self._tl_start is not None
+                         and (now - self._tl_start) >= self._tl_max_s)
+            if self._tl_exit_c >= self._tl_exit_n or timed_out:
+                self._tl_active = False
+                self._tl_arm    = 0
+                return None                       # aligned → hand back to PD
+            cmd = Twist()
+            cmd.linear.x  = self._tl_speed * max(self._speed_scale, 0.0)
+            cmd.angular.z = self._tl_sign * self._tl_z
+            return cmd
+
+        # not latched — arm on a sustained confirmed turn
+        if abs(error) >= self._tl_err and same_sign:
+            self._tl_arm += 1
+        else:
+            self._tl_arm = 0
+        if self._tl_arm >= self._tl_frames:
+            self._tl_active = True
+            # PD convention: az = -kp*error, so error>0 (line right) → steer right (az<0).
+            self._tl_sign   = -1.0 if error > 0 else 1.0
+            self._tl_start  = now
+            self._tl_exit_c = 0
+            cmd = Twist()
+            cmd.linear.x  = self._tl_speed * max(self._speed_scale, 0.0)
+            cmd.angular.z = self._tl_sign * self._tl_z
+            return cmd
+        return None
 
     def _search_recovery_cmd(self, now):
         """Non-terminal loss recovery (opt-bags stale fix): rotate until found.
@@ -992,6 +1181,29 @@ class LineFollowerNode(Node):
 
     def _cb_speed_scale(self, msg: Float32):
         self._speed_scale = float(msg.data)
+
+    def _cb_yolo_sign(self, msg: String):
+        """Latch the most-recent TURN sign (left/right/straight) with a timestamp.
+
+        Only turn classes are kept; slow-down classes are owned by the traffic FSM. The
+        latched class is consumed at the next confirmed dashed crossing and expires after
+        turn_sign_stale_s so an old detection never fires at the wrong crossing.
+        """
+        c = msg.data.strip()
+        if c == self._sign_left:
+            self._turn_sign, self._turn_sign_t = 'left', time.monotonic()
+        elif c == self._sign_right:
+            self._turn_sign, self._turn_sign_t = 'right', time.monotonic()
+        elif c == self._sign_straight:
+            self._turn_sign, self._turn_sign_t = 'straight', time.monotonic()
+        # other classes (slow signs / none) don't change the latched turn intent
+
+    def _fresh_turn_sign(self):
+        """Return the latched turn sign if still fresh, else None."""
+        if (self._turn_sign is not None and self._turn_sign_t is not None
+                and (time.monotonic() - self._turn_sign_t) <= self._sign_stale_s):
+            return self._turn_sign
+        return None
 
 
 def main(args=None):
