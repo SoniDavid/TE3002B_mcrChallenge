@@ -109,6 +109,7 @@ class LineFollowerNode : public rclcpp::Node {
     p.turn_sign_only_enabled = gd("turn_sign_only_enabled", p.turn_sign_only_enabled);
     p.turn_sign_min_area_frac = gd("turn_sign_min_area_frac", p.turn_sign_min_area_frac);
     p.turn_sign_rearm_gap_s = gd("turn_sign_rearm_gap_s", p.turn_sign_rearm_gap_s);
+    std::string turn_sign_topic = gd("turn_sign_topic", std::string("/yolo/turn_sign"));
     std::string topic_in = gd("topic_image_in", std::string("/camera/image_small"));
     std::string topic_cmd = gd("topic_cmd_vel", std::string("/cmd_vel_desired_raw"));
 
@@ -129,7 +130,7 @@ class LineFollowerNode : public rclcpp::Node {
         "/traffic_speed_scale", reliable,
         [this](std_msgs::msg::Float32::SharedPtr m) { core_->set_speed_scale(m->data); });
     sub_sign_ = create_subscription<std_msgs::msg::String>(
-        "/yolo/sign", rclcpp::QoS(10),
+        turn_sign_topic, rclcpp::QoS(10),
         [this](std_msgs::msg::String::SharedPtr m) { core_->set_yolo_sign(m->data, now_s()); });
 
     timer_ = create_wall_timer(std::chrono::milliseconds(50),

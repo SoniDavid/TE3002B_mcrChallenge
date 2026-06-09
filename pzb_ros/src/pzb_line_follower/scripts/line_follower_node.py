@@ -168,14 +168,18 @@ class LineFollowerNode(Node):
         # returns (≥2 line slots for crossing_exit_frames frames), then resume centering.
         self.declare_parameter('crossing_coast_speed',    0.06)
         self.declare_parameter('crossing_exit_frames',    3)
-        # Sign-only IN-FRONT turn (no dashed cue needed): fire the open-loop arc as soon as
-        # a fresh turn sign is large enough in frame — the detector appends the bbox area
-        # fraction as "<class>:<area_frac>" on /yolo/sign, and we turn when that is
-        # >= turn_sign_min_area_frac. One physical sign = one turn: after a turn fires we
-        # disarm until the sign has LEFT view for turn_sign_rearm_gap_s. With this enabled
-        # the dashed crossing only coasts straight (it no longer owns the turn).
+        # Sign turn (no dashed cue needed): the turn ARROW latches a direction; the
+        # open-loop arc FIRES when the arrow's bbox area fraction is large enough (the
+        # arrow is close / the robot is AT the intersection). The arrow comes on its OWN
+        # /yolo/turn_sign topic so a nearer non-turn sign (GIVE WAY / construccion /
+        # stopSign) can't mask it. The 5 slowww bags proved (a) a well-driven turn keeps
+        # |error| LOW so a steering-error gate can't fire, and (b) the arrow is the
+        # published-largest on /yolo/sign less than half the time → it needs its own
+        # channel. One physical arrow = one turn: after firing, disarm until the arrow has
+        # LEFT view for turn_sign_rearm_gap_s.
         self.declare_parameter('turn_sign_only_enabled',  True)
-        self.declare_parameter('turn_sign_min_area_frac', 0.045)
+        self.declare_parameter('turn_sign_topic',         '/yolo/turn_sign')
+        self.declare_parameter('turn_sign_min_area_frac', 0.06)  # arrow bbox/frame to fire (tuned on slowww)
         self.declare_parameter('turn_sign_rearm_gap_s',   1.0)
         # Curve dashed-suppression (newnew-bags fix): suppress a "dashed" classification
         # while the steering error is past this — a real crossing is approached head-on
@@ -292,14 +296,15 @@ class LineFollowerNode(Node):
         self._cross_turn_start = None  # set when the in-crossing turn arc begins
         # sign-only in-front turn
         self._turn_sign_only = bool(self.get_parameter('turn_sign_only_enabled').value)
+        self._turn_sign_topic = str(self.get_parameter('turn_sign_topic').value)
         self._turn_sign_min_area = float(self.get_parameter('turn_sign_min_area_frac').value)
         self._turn_sign_rearm_gap_s = float(self.get_parameter('turn_sign_rearm_gap_s').value)
-        self._turn_sign_area = 0.0       # bbox area fraction of the latched turn sign
-        self._turn_sign_last_seen = None # last time any turn sign was in view (re-arm)
+        self._turn_sign_area = 0.0       # bbox area fraction of the latched turn arrow
+        self._turn_sign_last_seen = None # last time a turn arrow was in view (re-arm)
         self._so_turn_active = False     # sign-only arc in progress
         self._so_turn_dir = 0.0          # +1 left / -1 right
         self._so_turn_start = None
-        self._so_armed = True            # fire only when armed; re-armed after sign leaves view
+        self._so_armed = True            # fire only when armed; re-armed after arrow leaves view
         self._dashed_suppress_error_px = float(self.get_parameter('dashed_suppress_error_px').value)
         self._tight_turn_error_px = float(self.get_parameter('tight_turn_error_px').value)
         self._curve_brake_error_px = float(self.get_parameter('curve_brake_error_px').value)
@@ -437,10 +442,12 @@ class LineFollowerNode(Node):
         # Traffic speed scale (optional — defaults to 1.0 if never published)
         self.create_subscription(Float32, '/traffic_speed_scale', self._cb_speed_scale, _RELIABLE_QOS)
 
-        # YOLO sign (optional) — latches the most-recent TURN class so it can be applied
-        # at the next dashed crossing. Non-turn (slow) classes are handled by the traffic
-        # FSM (speed scale); only the turn classes matter to the follower.
-        self.create_subscription(String, '/yolo/sign', self._cb_yolo_sign, 10)
+        # YOLO turn arrow (optional) — its OWN channel (/yolo/turn_sign) so a nearer
+        # non-turn sign can't mask it on /yolo/sign. Latches the most-recent turn
+        # direction + bbox area; the turn fires when the area is large enough (close).
+        # Non-turn (slow/stop/give-way) classes stay on /yolo/sign for the traffic FSM.
+        self.create_subscription(
+            String, self._turn_sign_topic, self._cb_yolo_sign, 10)
 
         # 20 Hz cmd_vel publish timer — decoupled from camera FPS (Team2 pattern).
         self.create_timer(1.0 / 20.0, self._cmd_publish_cb)
@@ -677,16 +684,21 @@ class LineFollowerNode(Node):
                     self._acq_until = now + self._acquire_guard_s
                     self._err_hist.clear()
             if _so_cmd is None and not self._so_turn_active and self._so_armed:
-                # Fire only while the sign is CURRENTLY in view — a sign that already left
-                # view must not resurrect a turn after the re-arm gap via stale freshness.
+                # Fire only while the arrow is CURRENTLY in view — an arrow that already
+                # left view must not resurrect a turn after the re-arm gap via stale
+                # freshness. AREA trigger: fire once the turn arrow's bbox is large enough
+                # (it is close / the robot is AT the intersection). The slowww bags proved
+                # error stays LOW on a well-driven turn, so error cannot gate it; the
+                # un-masked /yolo/turn_sign area is the reliable "in front" signal.
                 _td = self._fresh_turn_sign() if _sign_in_view else None
-                if _td in ('left', 'right') and self._turn_sign_area >= self._turn_sign_min_area:
+                if (_td in ('left', 'right')
+                        and self._turn_sign_area >= self._turn_sign_min_area):
                     self._so_turn_active = True
                     self._so_turn_dir = 1.0 if _td == 'left' else -1.0
                     self._so_turn_start = now
                     self.get_logger().info(
-                        f'Sign-only turn {_td.upper()} (in front, '
-                        f'area={self._turn_sign_area:.3f}).')
+                        f'Sign turn {_td.upper()} (turn arrow in front, '
+                        f'area={self._turn_sign_area:.3f}>={self._turn_sign_min_area:.3f}).')
                     _so_cmd = Twist()
                     _so_cmd.linear.x  = self._cross_turn_speed * max(self._speed_scale, 1.0)
                     _so_cmd.angular.z = self._so_turn_dir * self._cross_turn_z

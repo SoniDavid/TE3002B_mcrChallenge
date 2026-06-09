@@ -49,6 +49,12 @@ class YoloDetectorNode(Node):
         self.declare_parameter('input_topic',    '/camera/image_compressed')
         self.declare_parameter('output_topic',   '/yolo/debug_image')
         self.declare_parameter('sign_topic',     '/yolo/sign')
+        # Turn arrows get their OWN channel so the line follower never loses them to a
+        # nearer/bigger non-turn sign. /yolo/sign stays the GLOBAL-largest (for the traffic
+        # FSM); /yolo/turn_sign carries the largest box among the turn classes only.
+        self.declare_parameter('turn_sign_topic', '/yolo/turn_sign')
+        self.declare_parameter('turn_sign_classes',
+                               ['letIzquierda', 'letDerecha', 'letRecto'])
 
         model_path       = self.get_parameter('model_path').value
         self._conf_thr   = float(self.get_parameter('conf_threshold').value)
@@ -59,6 +65,8 @@ class YoloDetectorNode(Node):
         in_topic         = self.get_parameter('input_topic').value
         out_topic        = self.get_parameter('output_topic').value
         sign_topic       = self.get_parameter('sign_topic').value
+        turn_sign_topic  = self.get_parameter('turn_sign_topic').value
+        self._turn_classes = set(self.get_parameter('turn_sign_classes').value)
 
         if not model_path:
             self.get_logger().fatal(
@@ -85,6 +93,8 @@ class YoloDetectorNode(Node):
         # Detected sign/class for the behavior layer (traffic FSM + line follower).
         # Published every processed frame as the closest (largest-box) class, or 'none'.
         self._pub_sign  = self.create_publisher(String, sign_topic, 10)
+        # Turn-arrow-only channel for the line follower (never masked by other signs).
+        self._pub_turn  = self.create_publisher(String, turn_sign_topic, 10)
         self._sub = self.create_subscription(
             CompressedImage, in_topic, self._image_cb, _IMAGE_QOS)
 
@@ -105,7 +115,8 @@ class YoloDetectorNode(Node):
         # image. The sign topic drives the robot, so don't gate inference on debug alone.
         want_debug = self._pub_debug.get_subscription_count() > 0
         want_sign  = self._pub_sign.get_subscription_count() > 0
-        if not (want_debug or want_sign):
+        want_turn  = self._pub_turn.get_subscription_count() > 0
+        if not (want_debug or want_sign or want_turn):
             return
 
         frame = cv2.imdecode(
@@ -120,6 +131,7 @@ class YoloDetectorNode(Node):
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             if cv2.Laplacian(gray, cv2.CV_64F).var() < self._blur_thr:
                 self._publish_sign('none')
+                self._pub_turn.publish(String(data='none'))
                 return
 
         results = self._model(
@@ -131,6 +143,10 @@ class YoloDetectorNode(Node):
         best_area  = -1
         best_label = ''
         best_class = 'none'
+        # Largest TURN-class box, tracked separately so a nearer non-turn sign can't
+        # mask the arrow on /yolo/turn_sign.
+        turn_area  = -1
+        turn_class = 'none'
 
         if results.boxes is not None:
             for i in range(len(results.boxes)):
@@ -139,13 +155,16 @@ class YoloDetectorNode(Node):
                     continue
                 x1, y1, x2, y2 = (int(v) for v in results.boxes.xyxy[i])
                 area = (x2 - x1) * (y2 - y1)
+                cls_id     = int(results.boxes.cls[i])
+                cls_name   = results.names[cls_id]
                 if area > best_area:
                     best_area  = area
                     best_box   = (x1, y1, x2, y2)
-                    cls_id     = int(results.boxes.cls[i])
-                    cls_name   = results.names[cls_id]
                     best_label = f'{cls_name}  {conf:.2f}'
                     best_class = cls_name
+                if cls_name in self._turn_classes and area > turn_area:
+                    turn_area  = area
+                    turn_class = cls_name
 
         # Publish the closest detected class (or 'none') for the behavior layer.
         # Append the bbox area fraction (closest sign's pixels / frame pixels) so the
@@ -153,12 +172,18 @@ class YoloDetectorNode(Node):
         # not on a far-away first detection. Format: "<class>:<area_frac>" (e.g.
         # "letIzquierda:0.082"); 'none' is published bare for backward compatibility.
         self._last_class = best_class
+        fh, fw = frame.shape[0], frame.shape[1]
+        frame_px = float(max(fh * fw, 1))
         if best_class != 'none' and best_area > 0:
-            fh, fw = frame.shape[0], frame.shape[1]
-            area_frac = best_area / float(max(fh * fw, 1))
-            self._publish_sign(f'{best_class}:{area_frac:.4f}')
+            self._publish_sign(f'{best_class}:{best_area / frame_px:.4f}')
         else:
             self._publish_sign(best_class)
+
+        # Turn-arrow-only channel: largest turn-class box (or 'none'), same format.
+        if turn_class != 'none' and turn_area > 0:
+            self._pub_turn.publish(String(data=f'{turn_class}:{turn_area / frame_px:.4f}'))
+        else:
+            self._pub_turn.publish(String(data='none'))
 
         # Only build + publish the (CPU-costly) debug overlay if someone is watching it.
         if want_debug:

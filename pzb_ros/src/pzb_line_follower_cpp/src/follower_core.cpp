@@ -224,11 +224,11 @@ Twist2 FollowerCore::process_frame(const cv::Mat& small_bgr, double now_s,
 
   Twist2 cmd;
 
-  // ── Sign-only IN-FRONT turn (no dashed cue required) ──────────────────────────
-  // Fire an open-loop turn arc the moment a fresh turn sign is large enough in frame
-  // (area >= turn_sign_min_area_frac = "in front"). One sign → one turn: after firing,
-  // a lockout suppresses re-triggering. This makes turns robust to the dashed line not
-  // being detected. Runs on the laptop, so the extra logic cost is irrelevant.
+  // ── Sign turn, corner-gated (no dashed cue required) ──────────────────────────
+  // The sign LATCHES a direction; the open-loop arc FIRES when the robot reaches the
+  // line CORNER (sustained large steering error at the 90° elbow), the way the teleop
+  // reference turns — NOT when the sign is biggest. One sign → one turn: after firing,
+  // re-arm only once the sign has left view. Robust to the dashed line not being detected.
   if (p_.turn_sign_only_enabled) {
     // Re-arm once the (previously fired) sign has LEFT view for turn_sign_rearm_gap_s,
     // so one physical sign fires exactly one turn even while it stays visible for seconds.
@@ -251,8 +251,11 @@ Twist2 FollowerCore::process_frame(const cv::Mat& small_bgr, double now_s,
       detector.reset_tracker_anchors();
       acq_until_ = now + p_.acquire_guard_s; error_hist_.clear();
     }
-    // Fire only while the sign is CURRENTLY in view (not merely "seen within stale_s"):
-    // a turn sign that already left view must not resurrect a turn after the re-arm gap.
+    // Fire only while the arrow is CURRENTLY in view (not merely "seen within stale_s"):
+    // an arrow that already left view must not resurrect a turn after the re-arm gap.
+    // AREA trigger: fire once the turn arrow's bbox fraction is large enough (close / AT
+    // the intersection). The slowww bags proved error stays LOW on a well-driven turn, so
+    // error can't gate it; the un-masked /yolo/turn_sign area is the reliable signal.
     std::string td = sign_in_view ? fresh_turn_sign(now) : "";
     if (!so_turn_active_ && so_armed_ && (td == "left" || td == "right") &&
         turn_sign_area_ >= p_.turn_sign_min_area_frac) {

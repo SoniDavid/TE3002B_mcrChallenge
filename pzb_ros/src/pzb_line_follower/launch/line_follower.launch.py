@@ -55,6 +55,8 @@ def generate_launch_description():
     arg_publish_debug           = DeclareLaunchArgument('publish_debug',           default_value='false', description='Publish /camera/image_debug topic')
     arg_impl                    = DeclareLaunchArgument('impl',                    default_value='cpp',   description="Line-follower implementation: 'py' (pzb_line_follower) or 'cpp' (pzb_line_follower_cpp). Defaults to C++ for lower Jetson CPU/memory; it is a drop-in (same node name/topics/params). Pass impl:=py to use the Python node.")
     arg_use_traffic             = DeclareLaunchArgument('use_traffic',             default_value='true',  description='Launch traffic light detector and FSM. It subscribes to the FULL-res /camera/image_raw (now raw/undistorted-off). It frame-skips (every 3rd frame) to limit CPU; if the Jetson is still tight, it can be repointed to /camera/image_small (it downscales its crop to 320x160 either way) or undistort re-enabled for it.')
+    arg_launch_follower         = DeclareLaunchArgument('launch_follower',         default_value='true',  description='Launch the line-follower node. Set FALSE to bring up camera + control chain + traffic WITHOUT the follower — e.g. for TELEOP recording, where the follower must not command motion (it would fight teleop on the cmd_vel chain). With it false the robot only moves from your teleop /cmd_vel.')
+    arg_launch_control          = DeclareLaunchArgument('launch_control',          default_value='true',  description='Launch the control chain (odometry, velocity_controller, slew_limiter). The velocity_controller WRITES /cmd_vel — the same topic teleop_twist_keyboard writes. For TELEOP recording set launch_control:=false (and launch_follower:=false) so teleop owns /cmd_vel directly to the MCU with no second writer fighting it. Leaves only the camera (+ traffic/detector) running to publish image topics for the bag.')
     arg_undistort_enabled       = DeclareLaunchArgument('undistort_enabled',       default_value='true',  description='Apply lens undistortion to the small (line-follower) stream. Set false to A/B test the CPU saving (the follower is closed-loop and tolerates mild distortion).')
     arg_small_width             = DeclareLaunchArgument('small_width',             default_value='480',   description='Hardware-downscaled width for the line-follower stream (/camera/image_small)')
     arg_small_height            = DeclareLaunchArgument('small_height',            default_value='270',   description='Hardware-downscaled height for the line-follower stream (/camera/image_small)')
@@ -111,6 +113,7 @@ def generate_launch_description():
         executable='odometry_node',
         name='odometry_node',
         output='screen',
+        condition=IfCondition(LaunchConfiguration('launch_control')),
         parameters=[ctrl_params],
     )
 
@@ -122,6 +125,7 @@ def generate_launch_description():
         executable='velocity_controller',
         name='velocity_controller',
         output='screen',
+        condition=IfCondition(LaunchConfiguration('launch_control')),
         parameters=[ctrl_params],
     )
 
@@ -134,6 +138,7 @@ def generate_launch_description():
         executable='twist_slew_limiter',
         name='twist_slew_limiter',
         output='screen',
+        condition=IfCondition(LaunchConfiguration('launch_control')),
         parameters=[{
             'input_topic':       '/cmd_vel_desired_raw',
             'output_topic':      '/cmd_vel_desired',
@@ -159,6 +164,7 @@ def generate_launch_description():
         executable='line_follower_node',
         name='line_follower_node',
         output='screen',
+        condition=IfCondition(LaunchConfiguration('launch_follower')),
         parameters=[
             lf_params,
             {
@@ -215,6 +221,8 @@ def generate_launch_description():
         arg_publish_debug,
         arg_impl,
         arg_use_traffic,
+        arg_launch_follower,
+        arg_launch_control,
         arg_undistort_enabled,
         arg_small_width,
         arg_small_height,

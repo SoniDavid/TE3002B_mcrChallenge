@@ -56,15 +56,18 @@ struct FollowerParams {
   // YOLO turn signs
   std::string turn_sign_left_class = "letIzquierda", turn_sign_right_class = "letDerecha",
               turn_sign_straight_class = "letRecto";
-  double turn_sign_stale_s = 4.0, cross_turn_z = 0.6, cross_turn_s = 1.6, cross_turn_speed = 0.06;
-  // Sign-only turn (no dashed cue needed): fire the open-loop arc as soon as a fresh
-  // turn sign is IN FRONT — i.e. the sign's bbox area fraction (published as
-  // "<class>:<area_frac>" on /yolo/sign) is >= turn_sign_min_area_frac. After a turn
-  // fires, suppress re-firing for turn_sign_refire_lockout_s so one sign = one turn.
+  double turn_sign_stale_s = 4.0, cross_turn_z = 0.6, cross_turn_s = 2.9, cross_turn_speed = 0.06;
+  // Sign turn (no dashed cue needed): the turn ARROW (on its OWN /yolo/turn_sign channel,
+  // so a nearer non-turn sign can't mask it) LATCHES a direction; the open-loop arc FIRES
+  // when the arrow's bbox area fraction >= turn_sign_min_area_frac (the arrow is close /
+  // robot is AT the intersection). The 5 slowww bags proved a well-driven turn keeps
+  // |error| LOW so an error gate can't fire, and that the arrow is masked on /yolo/sign —
+  // hence the separate channel + area trigger. One arrow = one turn (re-arm after the
+  // arrow leaves view for turn_sign_rearm_gap_s).
   bool   turn_sign_only_enabled = true;
-  double turn_sign_min_area_frac = 0.045;   // bbox/frame fraction = "close enough / in front"
-  // After a turn fires, do NOT turn again until the sign has LEFT view (gone stale) for
-  // this long — one physical sign = one turn, even though it stays visible for seconds.
+  double turn_sign_min_area_frac = 0.06;    // turn-arrow bbox/frame at which to fire (tuned on slowww)
+  // After a turn fires, do NOT turn again until the arrow has LEFT view for this long —
+  // one physical arrow = one turn, even though it stays visible for seconds.
   double turn_sign_rearm_gap_s = 1.0;
   // Crossing-state gap handling: coast through the inter-intersection gap until a real
   // line (>=2 slots for crossing_exit_frames frames) returns, instead of stopping.

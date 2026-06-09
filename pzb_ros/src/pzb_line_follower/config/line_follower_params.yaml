@@ -104,22 +104,26 @@ line_follower_node:
     # open-loop turn arc INTO that lane, then re-acquire and resume centered following.
     # Non-turn (slow) classes are handled by the traffic FSM, not here. The sign must be
     # fresh (seen within turn_sign_stale_s) so an old detection can't fire at the wrong
-    # crossing. Tune cross_turn_z/s on-robot for ~90° into the lane.
+    # crossing. cross_turn_z/s tuned for ~90° + margin: 0.6 rad/s × 2.9 s ≈ 1.74 rad ≈ 100°
+    # so the robot comes fully around the right-angle elbow before re-acquiring.
     turn_sign_left_class:     letIzquierda
     turn_sign_right_class:    letDerecha
     turn_sign_straight_class: letRecto
     turn_sign_stale_s:        4.0   # ignore a latched sign older than this
-    cross_turn_z:             0.6   # yaw rate (rad/s) during the in-crossing lane turn
-    cross_turn_s:             1.6   # turn duration (s) — tune for ~90° at cross_turn_z
+    cross_turn_z:             0.6   # yaw rate (rad/s) during the lane turn
+    cross_turn_s:             2.9   # turn duration (s) — ~90°+margin at cross_turn_z (was 1.6 ≈ 55°, too short)
     cross_turn_speed:         0.06  # forward speed (m/s) during the turn
-    # Sign-only IN-FRONT turn: fire the arc as soon as a fresh turn sign's bbox area
-    # fraction (appended by the YOLO detector as "<class>:<area_frac>") is >= the min —
-    # i.e. the sign is close/in front — WITHOUT needing a dashed line. One sign = one turn
-    # (disarms until the sign leaves view for turn_sign_rearm_gap_s). Set
-    # turn_sign_only_enabled:false to revert to the dashed-gated turn.
+    # Sign turn: the turn ARROW (on its OWN /yolo/turn_sign channel, so a nearer non-turn
+    # sign can't mask it) LATCHES a direction; the open-loop arc FIRES when the arrow's
+    # bbox area fraction >= turn_sign_min_area_frac (the arrow is close / robot is AT the
+    # intersection). The 5 slowww bags proved a well-driven turn keeps |error| LOW so an
+    # error gate can't fire, and that the arrow is masked on /yolo/sign — hence the
+    # separate channel + area trigger. One arrow = one turn (disarms until the arrow leaves
+    # view for turn_sign_rearm_gap_s). Set turn_sign_only_enabled:false to disable.
     turn_sign_only_enabled:   true
-    turn_sign_min_area_frac:  0.045  # bbox/frame area at which the sign counts as "in front" — tune on-robot
-    turn_sign_rearm_gap_s:    1.0    # sign must be gone this long before another turn can fire
+    turn_sign_topic:          /yolo/turn_sign
+    turn_sign_min_area_frac:  0.06   # turn-arrow bbox/frame at which to fire — tuned on slowww (arrows reach 0.08-0.17 close)
+    turn_sign_rearm_gap_s:    1.0    # arrow must be gone this long before another turn can fire
     angular_slew_max_sharp: 0.45
     # Curve dashed-suppression: ignore a "dashed" classification while |steering error|
     # exceeds this — a real crossing is approached head-on (small error) while a sharp
