@@ -114,13 +114,9 @@ class FollowerCore {
   int dashed_live_break_count_ = 0, dashed_live_break_sign_ = 0;
   bool crossing_active_ = false; double crossing_done_t_ = NAN; int real_line_streak_ = 0;
 
-  // ── sign-only in-front turn ──
-  double turn_sign_area_ = 0.0;            // latched bbox area fraction of the last turn sign
-  double turn_sign_last_seen_t_ = NAN;     // last time ANY turn sign was in view (for re-arm)
-  bool so_turn_active_ = false;            // a sign-only turn arc is in progress
-  double so_turn_dir_ = 0.0;               // +1 left / -1 right
-  double so_turn_start_ = NAN;             // when the arc started
-  bool so_armed_ = true;                   // can fire? cleared after a turn, re-armed once sign leaves view
+  // ── YOLO turn arrow (acted on at the dashed crossing) ──
+  double turn_sign_area_ = 0.0;            // latched bbox area fraction of the last turn arrow
+  double turn_sign_last_seen_t_ = NAN;     // last time a turn arrow was in view
 
   // ── recovery / guards ──
   double search_until_ = NAN, search_dir_ = 0.0, search_sweep_dir_ = 1.0, search_sweep_until_ = NAN;

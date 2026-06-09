@@ -113,17 +113,19 @@ line_follower_node:
     cross_turn_z:             0.6   # yaw rate (rad/s) during the lane turn
     cross_turn_s:             2.9   # turn duration (s) — ~90°+margin at cross_turn_z (was 1.6 ≈ 55°, too short)
     cross_turn_speed:         0.06  # forward speed (m/s) during the turn
-    # Sign turn: the turn ARROW (on its OWN /yolo/turn_sign channel, so a nearer non-turn
-    # sign can't mask it) LATCHES a direction; the open-loop arc FIRES when the arrow's
-    # bbox area fraction >= turn_sign_min_area_frac (the arrow is close / robot is AT the
-    # intersection). The 5 slowww bags proved a well-driven turn keeps |error| LOW so an
-    # error gate can't fire, and that the arrow is masked on /yolo/sign — hence the
-    # separate channel + area trigger. One arrow = one turn (disarms until the arrow leaves
-    # view for turn_sign_rearm_gap_s). Set turn_sign_only_enabled:false to disable.
+    # YOLO turn arrow → turn AT the dashed crossing. The arrow (on its OWN /yolo/turn_sign
+    # channel, so a nearer GIVE WAY/construccion/stopSign can't mask it) latches a
+    # DIRECTION; the open-loop turn-into-lane fires in the dashed-crossing FSM once the
+    # robot is aligned at the crossing — i.e. "turn AFTER the dashed lines". letRecto / no
+    # arrow → cross straight. One crossing = one turn (Phase C consumes the arrow), so
+    # re-seeing the same sign without a new crossing can't re-fire (the run4 double-fire
+    # bug). turn_sign_min_area_frac is a small freshness FLOOR (0=off), NOT the trigger.
+    # The autonomous run bags showed the arrow is seen 0-1.7s before the real turn
+    # crossings (well within turn_sign_stale_s=4.0) and stale at straight crossings.
     turn_sign_only_enabled:   true
     turn_sign_topic:          /yolo/turn_sign
-    turn_sign_min_area_frac:  0.06   # turn-arrow bbox/frame at which to fire — tuned on slowww (arrows reach 0.08-0.17 close)
-    turn_sign_rearm_gap_s:    1.0    # arrow must be gone this long before another turn can fire
+    turn_sign_min_area_frac:  0.0    # freshness floor only (0=off); NOT the trigger
+    turn_sign_rearm_gap_s:    1.0    # (legacy) re-arm window; one-per-crossing is the real guard
     angular_slew_max_sharp: 0.45
     # Curve dashed-suppression: ignore a "dashed" classification while |steering error|
     # exceeds this — a real crossing is approached head-on (small error) while a sharp

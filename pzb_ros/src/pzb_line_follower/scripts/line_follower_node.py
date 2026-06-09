@@ -168,18 +168,18 @@ class LineFollowerNode(Node):
         # returns (≥2 line slots for crossing_exit_frames frames), then resume centering.
         self.declare_parameter('crossing_coast_speed',    0.06)
         self.declare_parameter('crossing_exit_frames',    3)
-        # Sign turn (no dashed cue needed): the turn ARROW latches a direction; the
-        # open-loop arc FIRES when the arrow's bbox area fraction is large enough (the
-        # arrow is close / the robot is AT the intersection). The arrow comes on its OWN
-        # /yolo/turn_sign topic so a nearer non-turn sign (GIVE WAY / construccion /
-        # stopSign) can't mask it. The 5 slowww bags proved (a) a well-driven turn keeps
-        # |error| LOW so a steering-error gate can't fire, and (b) the arrow is the
-        # published-largest on /yolo/sign less than half the time → it needs its own
-        # channel. One physical arrow = one turn: after firing, disarm until the arrow has
-        # LEFT view for turn_sign_rearm_gap_s.
+        # YOLO turn arrow → turn AT the dashed crossing. The arrow (on its OWN
+        # /yolo/turn_sign topic, so a nearer GIVE WAY / construccion / stopSign can't mask
+        # it) latches a DIRECTION; the open-loop turn-into-lane fires in the dashed-crossing
+        # FSM once the robot is aligned at the crossing (this is "turn AFTER the dashed
+        # lines"). letRecto / no arrow → cross straight. One crossing = one turn (Phase C
+        # consumes the arrow), so re-seeing the same sign without a new crossing can't
+        # re-fire (this was the run4 double-fire bug). turn_sign_only_enabled is the master
+        # on/off for acting on turn arrows. turn_sign_min_area_frac is a small freshness
+        # FLOOR on the latched arrow ("a real arrow, not a far speck"), NOT the trigger.
         self.declare_parameter('turn_sign_only_enabled',  True)
         self.declare_parameter('turn_sign_topic',         '/yolo/turn_sign')
-        self.declare_parameter('turn_sign_min_area_frac', 0.06)  # arrow bbox/frame to fire (tuned on slowww)
+        self.declare_parameter('turn_sign_min_area_frac', 0.0)   # freshness floor only (0=off); NOT the trigger
         self.declare_parameter('turn_sign_rearm_gap_s',   1.0)
         # Curve dashed-suppression (newnew-bags fix): suppress a "dashed" classification
         # while the steering error is past this — a real crossing is approached head-on
@@ -294,17 +294,13 @@ class LineFollowerNode(Node):
         self._turn_sign   = None     # 'left' | 'right' | 'straight' | None (latched)
         self._turn_sign_t = None     # monotonic time the turn sign was last seen
         self._cross_turn_start = None  # set when the in-crossing turn arc begins
-        # sign-only in-front turn
+        # YOLO turn arrow (acted on at the dashed crossing — see _cb_yolo_sign + the FSM)
         self._turn_sign_only = bool(self.get_parameter('turn_sign_only_enabled').value)
         self._turn_sign_topic = str(self.get_parameter('turn_sign_topic').value)
         self._turn_sign_min_area = float(self.get_parameter('turn_sign_min_area_frac').value)
         self._turn_sign_rearm_gap_s = float(self.get_parameter('turn_sign_rearm_gap_s').value)
         self._turn_sign_area = 0.0       # bbox area fraction of the latched turn arrow
-        self._turn_sign_last_seen = None # last time a turn arrow was in view (re-arm)
-        self._so_turn_active = False     # sign-only arc in progress
-        self._so_turn_dir = 0.0          # +1 left / -1 right
-        self._so_turn_start = None
-        self._so_armed = True            # fire only when armed; re-armed after arrow leaves view
+        self._turn_sign_last_seen = None # last time a turn arrow was in view
         self._dashed_suppress_error_px = float(self.get_parameter('dashed_suppress_error_px').value)
         self._tight_turn_error_px = float(self.get_parameter('tight_turn_error_px').value)
         self._curve_brake_error_px = float(self.get_parameter('curve_brake_error_px').value)
@@ -657,64 +653,16 @@ class LineFollowerNode(Node):
                 self._acq_until = now + self._acquire_guard_s
                 self._err_hist.clear()
 
-        # ── Sign-only IN-FRONT turn (no dashed cue required) ──────────────────────
-        # Fire an open-loop arc the moment a fresh turn sign is large enough in frame
-        # (area >= min). One physical sign = one turn: after firing, disarm until the
-        # sign has LEFT view for _turn_sign_rearm_gap_s. Highest priority so the dashed
-        # path never also turns for the same sign (its turn is gated off below).
-        _so_cmd = None
-        if self._turn_sign_only:
-            _sign_in_view = (self._turn_sign_last_seen is not None
-                             and (now - self._turn_sign_last_seen) <= self._turn_sign_rearm_gap_s)
-            if not self._so_turn_active and not _sign_in_view:
-                self._so_armed = True
-            if self._so_turn_active:
-                if (now - self._so_turn_start) < self._cross_turn_s:
-                    _so_cmd = Twist()
-                    _so_cmd.linear.x  = self._cross_turn_speed * max(self._speed_scale, 1.0)
-                    _so_cmd.angular.z = self._so_turn_dir * self._cross_turn_z
-                else:
-                    # arc done → disarm until the sign leaves view; clear the latch
-                    self._so_turn_active = False
-                    self._so_armed = False
-                    self._turn_sign = None
-                    self._turn_sign_t = None
-                    self._turn_sign_area = 0.0
-                    self._detector.reset_tracker_anchors()
-                    self._acq_until = now + self._acquire_guard_s
-                    self._err_hist.clear()
-            if _so_cmd is None and not self._so_turn_active and self._so_armed:
-                # Fire only while the arrow is CURRENTLY in view — an arrow that already
-                # left view must not resurrect a turn after the re-arm gap via stale
-                # freshness. AREA trigger: fire once the turn arrow's bbox is large enough
-                # (it is close / the robot is AT the intersection). The slowww bags proved
-                # error stays LOW on a well-driven turn, so error cannot gate it; the
-                # un-masked /yolo/turn_sign area is the reliable "in front" signal.
-                _td = self._fresh_turn_sign() if _sign_in_view else None
-                if (_td in ('left', 'right')
-                        and self._turn_sign_area >= self._turn_sign_min_area):
-                    self._so_turn_active = True
-                    self._so_turn_dir = 1.0 if _td == 'left' else -1.0
-                    self._so_turn_start = now
-                    self.get_logger().info(
-                        f'Sign turn {_td.upper()} (turn arrow in front, '
-                        f'area={self._turn_sign_area:.3f}>={self._turn_sign_min_area:.3f}).')
-                    _so_cmd = Twist()
-                    _so_cmd.linear.x  = self._cross_turn_speed * max(self._speed_scale, 1.0)
-                    _so_cmd.angular.z = self._so_turn_dir * self._cross_turn_z
+        # NOTE: the standalone "sign-only IN-FRONT turn" (area-anywhere) block was REMOVED.
+        # Real autonomous runs (run3/run4/run_2026) showed it fires at the wrong time vs the
+        # dashed crossing — it turned mid-straight and DOUBLE-fired the same sign re-seen
+        # after a turn — because area alone is ignorant of where the robot is on the track.
+        # The turn is now OWNED by the dashed-crossing FSM below (turn-into-lane), which is
+        # the user's "turn AFTER the dashed lines": the arrow gives DIRECTION, the dashed
+        # crossing gives the WHEN, and Phase C consumes the sign so one crossing = one turn.
 
-        if _so_cmd is not None:
-            self._latest_cmd = _so_cmd
-            self._prev_az = _so_cmd.angular.z
-            self._error_hist.clear()
-            cx_msg = Int32();  cx_msg.data = cx
-            self._pub_cx.publish(cx_msg)
-            err_msg = Float32();  err_msg.data = float(cx - self._img_w // 2)
-            self._pub_error.publish(err_msg)
-            type_msg = String();  type_msg.data = line_type
-            self._pub_line_type.publish(type_msg)
         # The crossing FSM runs while a crossing is active OR the current frame is dashed.
-        elif self._crossing_active or line_type == 'dashed':
+        if self._crossing_active or line_type == 'dashed':
             # Intersection handling — align EARLY, then cross straight, then stop:
             #   Phase A — Align/coast (bad_ignment4 strong-safeguard): drive forward
             #             at the APPROACH speed while squaring up to the dashes, but
@@ -760,14 +708,14 @@ class LineFollowerNode(Node):
                 self._aligned_latch = True
                 self._align_done_t  = now
 
-            # YOLO turn action (Part 2): once aligned, if a FRESH turn sign says left/right,
-            # turn INTO that lane open-loop instead of crossing straight. letRecto / no sign
-            # → straight cross (unchanged). The turn arc runs for cross_turn_s, then Phase C.
-            # When sign-only turning is enabled, the open-loop TURN is owned by the
-            # sign-only path above; the dashed path only aligns + coasts straight so the
-            # same sign never turns twice.
+            # YOLO turn action: once aligned at the dashed crossing, if a FRESH turn arrow
+            # (from /yolo/turn_sign) says left/right, turn INTO that lane open-loop instead
+            # of crossing straight — this is "turn AFTER the dashed lines". letRecto / no
+            # arrow → straight cross (unchanged). The arc runs for cross_turn_s, then Phase
+            # C consumes the arrow (one crossing = one turn). The arrow's AREA is not the
+            # trigger here — being AT the crossing with a fresh arrow is.
             _turn_dir = (self._fresh_turn_sign()
-                         if (self._aligned_latch and not self._turn_sign_only) else None)
+                         if (self._aligned_latch and self._turn_sign_only) else None)
             _do_turn  = _turn_dir in ('left', 'right')
 
             if not self._aligned_latch:
@@ -1269,20 +1217,21 @@ class LineFollowerNode(Node):
         self._speed_scale = float(msg.data)
 
     def _cb_yolo_sign(self, msg: String):
-        """Latch the most-recent TURN sign (left/right/straight) with a timestamp.
+        """Latch the most-recent TURN arrow (left/right/straight) from /yolo/turn_sign.
 
-        Only turn classes are kept; slow-down classes are owned by the traffic FSM. The
-        latched class is consumed at the next confirmed dashed crossing and expires after
-        turn_sign_stale_s so an old detection never fires at the wrong crossing.
+        The arrow is consumed at the next confirmed dashed crossing (turn-into-lane) and
+        expires after turn_sign_stale_s so an old detection never fires at the wrong
+        crossing. Area is a freshness FLOOR only (reject a far-off speck), not the trigger.
         """
-        # /yolo/sign may carry "<class>:<area_frac>" — the area fraction lets us fire the
-        # turn only when the sign is IN FRONT (large box). Parse the optional suffix.
         raw = msg.data.strip()
         c, _, area_s = raw.partition(':')
         try:
             area = float(area_s) if area_s else 0.0
         except ValueError:
             area = 0.0
+        # Freshness floor: a too-small (far) arrow doesn't (re)latch a direction.
+        if self._turn_sign_min_area > 0.0 and area < self._turn_sign_min_area:
+            return
         now = time.monotonic()
         if c == self._sign_left:
             self._turn_sign, self._turn_sign_t = 'left', now
