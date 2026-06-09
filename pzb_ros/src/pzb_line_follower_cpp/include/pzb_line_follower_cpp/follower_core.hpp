@@ -6,7 +6,9 @@
 
 #include <deque>
 #include <functional>
+#include <map>
 #include <string>
+#include <vector>
 
 #include "pzb_line_follower_cpp/center_line_detector.hpp"
 
@@ -57,21 +59,52 @@ struct FollowerParams {
   std::string turn_sign_left_class = "letIzquierda", turn_sign_right_class = "letDerecha",
               turn_sign_straight_class = "letRecto";
   double turn_sign_stale_s = 4.0, cross_turn_z = 0.6, cross_turn_s = 2.9, cross_turn_speed = 0.06;
-  // Sign turn (no dashed cue needed): the turn ARROW (on its OWN /yolo/turn_sign channel,
-  // so a nearer non-turn sign can't mask it) LATCHES a direction; the open-loop arc FIRES
-  // when the arrow's bbox area fraction >= turn_sign_min_area_frac (the arrow is close /
-  // robot is AT the intersection). The 5 slowww bags proved a well-driven turn keeps
-  // |error| LOW so an error gate can't fire, and that the arrow is masked on /yolo/sign —
-  // hence the separate channel + area trigger. One arrow = one turn (re-arm after the
-  // arrow leaves view for turn_sign_rearm_gap_s).
+  // Sign turn — turn at the arrow's CLOSEST point (area peak-then-drop). The arrow (own
+  // /yolo/turn_sign channel) is an ACTIVATION FLAG: latch a direction + track running-max
+  // area. FIRE when running-max >= turn_peak_min_area (genuinely close) AND current area
+  // < turn_peak_drop_frac × max (past closest). Validated on dashed_turn_v1/v2 (fires at
+  // the area peak, not early). The dashed-crossing FSM is the FALLBACK. turn_sign_min_area_frac
+  // is a tiny freshness floor (0=off), NOT the trigger.
   bool   turn_sign_only_enabled = true;
-  double turn_sign_min_area_frac = 0.06;    // turn-arrow bbox/frame at which to fire (tuned on slowww)
-  // After a turn fires, do NOT turn again until the arrow has LEFT view for this long —
-  // one physical arrow = one turn, even though it stays visible for seconds.
-  double turn_sign_rearm_gap_s = 1.0;
+  double turn_sign_min_area_frac = 0.0;     // freshness floor only (0=off)
+  // Arrow gone this long → reset running-max + re-arm (a new approach).
+  double turn_sign_rearm_gap_s = 4.0;
+  // After a turn fires, block any new sign turn for this long (one sign = one turn).
+  double turn_fire_cooldown_s = 8.0;
+  double turn_peak_min_area = 0.03;         // arrow must get this close before a turn can fire
+  double turn_peak_drop_frac = 0.7;         // fire when current area < this × running-max
+  // Curve lockout: don't let a sign arc preempt a real corner on the solid line — hold the
+  // latch while |error| is past curve_lockout_error_px on solid for curve_lockout_frames
+  // consecutive frames; fire only after the corner settles back near center.
+  double curve_lockout_error_px = 70.0; int curve_lockout_frames = 3;
   // Crossing-state gap handling: coast through the inter-intersection gap until a real
   // line (>=2 slots for crossing_exit_frames frames) returns, instead of stopping.
   double crossing_coast_speed = 0.06; int crossing_exit_frames = 3;
+
+  // ── miniretoS8 reference line-follow control (ROUND 8) ────────────────────────
+  // control_mode: "ref" = use the reference detector center-pick + soft-dir control law
+  // for solid-line following (smooth, no slot-swap thrash; validated offline); "pd" = the
+  // original cx-PD path. The dashed-FSM / sign-turn / open-loop paths are unchanged either
+  // way. The reference normalizes the line offset to `direction` ∈ [-1,1]:
+  //   raw EMA(α) → direction slew(±rate·dt) → soft = dir·|dir|^exp → ω = -kp·soft (clamp
+  //   ±max_w) → ω EMA + ω slew → v = linear·(1-cs_k·|dir|)·(1-as_k·|ω|/max_w).
+  std::string control_mode = "ref";
+  double ref_kp = 1.5, ref_max_w = 2.0;
+  double ref_direction_alpha = 0.35, ref_direction_slew_rate = 10.0;
+  double ref_omega_alpha = 1.0, ref_omega_slew_rate = 10.0;
+  double ref_soft_dir_exp = 0.75;
+  double ref_curve_scale_k = 0.75, ref_angular_scale_k = 0.45;
+  double ref_lost_speed_scale = 0.65, ref_deadband = 0.0;
+
+  // ── Teach-by-demonstration sign actions (ROUND 9) ─────────────────────────────
+  // When enabled, a fresh turn sign latched AT a dashed crossing triggers an OPEN-LOOP
+  // replay of a recorded /cmd_vel sequence (one CSV per sign: left/right/straight) instead
+  // of the synthetic cross_turn arc — the maneuver the user demonstrated. After the
+  // sequence ends, hand off to the Phase-C coast-reacquire. sign_action_dir holds the CSVs
+  // (t,vx,wz rows). If disabled or no CSV for the latched sign, the synthetic arc / dashed
+  // FSM is used (backward compatible).
+  bool   sign_action_enabled = true;
+  std::string sign_action_dir = "";   // set by the node from the package share dir
 };
 
 class FollowerCore {
@@ -88,6 +121,15 @@ class FollowerCore {
   // external inputs
   void set_speed_scale(double s) { speed_scale_ = s; }
   void set_yolo_sign(const std::string& cls, double now_s);
+
+  // Load per-sign demonstrated actions from CSVs (sign_action_dir/<sign>.csv, rows t,vx,wz)
+  // for sign ∈ {left,right,straight}. Missing files are simply skipped. Returns #loaded.
+  int load_sign_actions();
+
+  // True while the last process_frame returned an OPEN-LOOP sign-turn arc command — the
+  // node routes it DIRECTLY to /cmd_vel (zero down the normal chain) so the slew_limiter +
+  // velocity_controller PI can't fight the timed arc. Matches the Python node's _so_open_loop.
+  bool open_loop() const { return so_open_loop_; }
 
   CenterLineDetector detector;
 
@@ -114,9 +156,31 @@ class FollowerCore {
   int dashed_live_break_count_ = 0, dashed_live_break_sign_ = 0;
   bool crossing_active_ = false; double crossing_done_t_ = NAN; int real_line_streak_ = 0;
 
-  // ── YOLO turn arrow (acted on at the dashed crossing) ──
-  double turn_sign_area_ = 0.0;            // latched bbox area fraction of the last turn arrow
+  // ── YOLO turn arrow (peak-area turn) ──
+  double turn_sign_area_ = 0.0;            // latest bbox area fraction of the latched arrow
+  double turn_peak_max_ = 0.0;             // running max area while the arrow is in view
   double turn_sign_last_seen_t_ = NAN;     // last time a turn arrow was in view
+  bool turn_peak_reached_ = false;         // running-max crossed turn_peak_min_area this approach
+  int curve_lockout_streak_ = 0;           // consecutive cornering-on-solid frames (sign lockout)
+  double last_turn_fire_t_ = NAN;          // time the last sign turn fired (post-fire cooldown)
+  // peak-turn open-loop arc state
+  bool so_turn_active_ = false;
+  double so_turn_dir_ = 0.0;
+  double so_turn_start_ = NAN;
+  bool so_armed_ = true;
+  bool so_open_loop_ = false;              // last frame returned an open-loop arc command
+
+  // ── teach-by-demonstration replay (ROUND 9) ──
+  struct ActionSample { double t, vx, wz; };
+  std::map<std::string, std::vector<ActionSample>> sign_actions_;  // "left"/"right"/"straight"
+  bool action_replay_active_ = false;
+  double action_replay_start_ = NAN;       // monotonic time the replay began
+  std::string action_replay_sign_;         // which sign is replaying
+
+  // ── miniretoS8 reference control-law state (ROUND 8) ──
+  double ref_raw_dir_ = 0.0, ref_filtered_dir_ = 0.0, ref_prev_filtered_dir_ = 0.0;
+  double ref_omega_filtered_ = 0.0, ref_prev_dir_ = 0.0;
+  double ref_last_ctrl_t_ = NAN;
 
   // ── recovery / guards ──
   double search_until_ = NAN, search_dir_ = 0.0, search_sweep_dir_ = 1.0, search_sweep_until_ = NAN;

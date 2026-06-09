@@ -70,6 +70,14 @@ class TrafficLightFSMNode(Node):
         self.declare_parameter('error_topic',         '/line_follower/error')
         self.declare_parameter('curve_gate_error_px', 35.0)
         self.declare_parameter('sign_intent_stale_s', 3.0)   # forget a deferred intent older than this
+        # Peak-area trigger (ROUND 5): construccion / GIVE WAY act at the sign's CLOSEST
+        # point — when the bbox area (parsed off /yolo/sign) has PEAKED then dropped below
+        # peak_drop_frac × running-max, past peak_min_area. This matches the user's
+        # "trigger at maximum pixel count or just after (closest)". stopSign is EXEMPT
+        # (it acts while seen — set sign_peak_enabled false to revert all to seen-based).
+        self.declare_parameter('sign_peak_enabled',   True)
+        self.declare_parameter('sign_peak_min_area',  0.05)  # area must reach this before acting
+        self.declare_parameter('sign_peak_drop_frac', 0.7)   # act when area < this × running-max
 
         self._yellow_scale = float(self.get_parameter('yellow_speed_scale').value)
         self._lost_timeout = float(self.get_parameter('color_lost_timeout').value)
@@ -81,6 +89,12 @@ class TrafficLightFSMNode(Node):
         self._stop_resume_confirm_s = float(self.get_parameter('stop_resume_confirm_s').value)
         self._curve_gate_px = float(self.get_parameter('curve_gate_error_px').value)
         self._sign_intent_stale_s = float(self.get_parameter('sign_intent_stale_s').value)
+        self._sign_peak_enabled = bool(self.get_parameter('sign_peak_enabled').value)
+        self._sign_peak_min_area = float(self.get_parameter('sign_peak_min_area').value)
+        self._sign_peak_drop_frac = float(self.get_parameter('sign_peak_drop_frac').value)
+        # Per-class running-max area + last-seen, for the peak trigger.
+        self._peak_max  = {}   # class -> running max area while in view
+        self._peak_seen = {}   # class -> last time seen
 
         self._state              = TrafficState.RUNNING
         self._last_color         = 'none'
@@ -171,23 +185,45 @@ class TrafficLightFSMNode(Node):
     def _sign_callback(self, msg: String):
         """Route a YOLO sign to slow / stop / give-way intent.
 
-        construccion → timed slow hold. stopSign / GIVE WAY → latch a deferred intent
-        (consumed in the publish loop only when OUTSIDE a curve); GIVE WAY re-arms only
-        after it leaves view.
+        construccion / GIVE WAY act at the sign's CLOSEST point: their area is tracked as a
+        per-class running-max and the intent is latched only when the area has PEAKED then
+        dropped below sign_peak_drop_frac × max (past closest), past sign_peak_min_area —
+        the user's "trigger at maximum pixel count or just after". stopSign is EXEMPT (acts
+        while seen). With sign_peak_enabled=false all revert to the prior seen-based latch.
         """
-        # /yolo/sign may carry "<class>:<area_frac>" (the follower uses the area fraction
-        # to gate turns by "in front"); the FSM only needs the class — strip the suffix.
-        c = msg.data.strip().split(':', 1)[0]
+        # /yolo/sign carries "<class>:<area_frac>". Parse both.
+        raw = msg.data.strip()
+        c, _, area_s = raw.partition(':')
+        try:
+            area = float(area_s) if area_s else 0.0
+        except ValueError:
+            area = 0.0
         now = time.monotonic()
+
+        def _past_peak(cls):
+            """True once cls's area peaked (>= min) and dropped below drop_frac × max."""
+            if not self._sign_peak_enabled:
+                return True   # peak disabled → act on sight (legacy)
+            # reset running-max if cls had left view (new approach)
+            seen = self._peak_seen.get(cls)
+            if seen is None or (now - seen) > self._sign_lost_timeout:
+                self._peak_max[cls] = 0.0
+            self._peak_seen[cls] = now
+            self._peak_max[cls] = max(self._peak_max.get(cls, 0.0), area)
+            mx = self._peak_max[cls]
+            return mx >= self._sign_peak_min_area and area <= self._sign_peak_drop_frac * mx
+
         if c in self._slow_signs:
-            self._sign_slow_until = now + self._sign_lost_timeout
+            if _past_peak(c):
+                self._sign_slow_until = now + self._sign_lost_timeout
         if c in self._stop_signs:
+            # stopSign EXEMPT from peak — act while seen.
             self._stop_seen_t = now
             if self._stop_intent_t is None:
                 self._stop_intent_t = now      # latch a pending stop (curve-deferred)
         if c in self._give_way_signs:
             self._gw_seen_t = now
-            if self._gw_armed and self._gw_intent_t is None:
+            if self._gw_armed and self._gw_intent_t is None and _past_peak(c):
                 self._gw_intent_t = now        # latch a pending give-way (curve-deferred)
 
     def _sign_slow_active(self, now) -> bool:

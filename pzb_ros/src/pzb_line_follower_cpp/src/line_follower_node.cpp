@@ -109,12 +109,38 @@ class LineFollowerNode : public rclcpp::Node {
     p.turn_sign_only_enabled = gd("turn_sign_only_enabled", p.turn_sign_only_enabled);
     p.turn_sign_min_area_frac = gd("turn_sign_min_area_frac", p.turn_sign_min_area_frac);
     p.turn_sign_rearm_gap_s = gd("turn_sign_rearm_gap_s", p.turn_sign_rearm_gap_s);
+    p.turn_fire_cooldown_s = gd("turn_fire_cooldown_s", p.turn_fire_cooldown_s);
+    p.turn_peak_min_area = gd("turn_peak_min_area", p.turn_peak_min_area);
+    p.turn_peak_drop_frac = gd("turn_peak_drop_frac", p.turn_peak_drop_frac);
+    p.curve_lockout_error_px = gd("curve_lockout_error_px", p.curve_lockout_error_px);
+    p.curve_lockout_frames = gd("curve_lockout_frames", p.curve_lockout_frames);
+    // miniretoS8 reference line-follow control (ROUND 8)
+    p.control_mode = gd("control_mode", p.control_mode);
+    p.ref_kp = gd("ref_kp", p.ref_kp);
+    p.ref_max_w = gd("ref_max_w", p.ref_max_w);
+    p.ref_direction_alpha = gd("ref_direction_alpha", p.ref_direction_alpha);
+    p.ref_direction_slew_rate = gd("ref_direction_slew_rate", p.ref_direction_slew_rate);
+    p.ref_omega_alpha = gd("ref_omega_alpha", p.ref_omega_alpha);
+    p.ref_omega_slew_rate = gd("ref_omega_slew_rate", p.ref_omega_slew_rate);
+    p.ref_soft_dir_exp = gd("ref_soft_dir_exp", p.ref_soft_dir_exp);
+    p.ref_curve_scale_k = gd("ref_curve_scale_k", p.ref_curve_scale_k);
+    p.ref_angular_scale_k = gd("ref_angular_scale_k", p.ref_angular_scale_k);
+    p.ref_lost_speed_scale = gd("ref_lost_speed_scale", p.ref_lost_speed_scale);
+    p.ref_deadband = gd("ref_deadband", p.ref_deadband);
+    // Teach-by-demonstration sign actions (ROUND 9)
+    p.sign_action_enabled = gd("sign_action_enabled", p.sign_action_enabled);
+    p.sign_action_dir = gd("sign_action_dir", std::string(""));
     std::string turn_sign_topic = gd("turn_sign_topic", std::string("/yolo/turn_sign"));
     std::string topic_in = gd("topic_image_in", std::string("/camera/image_small"));
     std::string topic_cmd = gd("topic_cmd_vel", std::string("/cmd_vel_desired_raw"));
 
     // Clock: use the image header stamp for dt parity; fall back to steady_clock.
     core_ = std::make_unique<pzb::FollowerCore>(p, [this]() { return cur_t_; });
+    if (p.sign_action_enabled) {
+      int nloaded = core_->load_sign_actions();
+      RCLCPP_INFO(get_logger(), "sign actions: loaded %d from '%s'", nloaded,
+                  p.sign_action_dir.c_str());
+    }
 
     auto best_effort = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort();
     auto reliable = rclcpp::QoS(rclcpp::KeepLast(10)).reliable();
@@ -123,6 +149,10 @@ class LineFollowerNode : public rclcpp::Node {
     pub_err_ = create_publisher<std_msgs::msg::Float32>("/line_follower/error", reliable);
     pub_type_ = create_publisher<std_msgs::msg::String>("/line_follower/line_type", reliable);
     pub_cmd_ = create_publisher<geometry_msgs::msg::Twist>(topic_cmd, reliable);
+    // TRUE open-loop turn bypass (ROUND 7): during the sign arc, publish ZERO down the
+    // normal chain (topic_cmd → slew_limiter → velocity_controller, which idles /cmd_vel to
+    // zero) and send the arc Twist STRAIGHT to /cmd_vel from this publisher — no slew, no PI.
+    pub_cmd_direct_ = create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", reliable);
 
     sub_img_ = create_subscription<sensor_msgs::msg::Image>(
         topic_in, best_effort, std::bind(&LineFollowerNode::on_image, this, _1));
@@ -160,6 +190,7 @@ class LineFollowerNode : public rclcpp::Node {
     int cx; double err; std::string lt;
     pzb::Twist2 cmd = core_->process_frame(full, cur_t_, cx, err, lt);
     latest_v_ = cmd.v; latest_w_ = cmd.w;
+    latest_open_loop_ = core_->open_loop();
 
     std_msgs::msg::Int32 cm; cm.data = cx; pub_cx_->publish(cm);
     std_msgs::msg::Float32 em; em.data = static_cast<float>(err); pub_err_->publish(em);
@@ -168,6 +199,15 @@ class LineFollowerNode : public rclcpp::Node {
 
   void on_timer() {
     geometry_msgs::msg::Twist cmd;
+    // OPEN-LOOP sign turn: timed, camera-independent. Kill the chain's output (zero down
+    // topic_cmd) and publish the arc STRAIGHT to /cmd_vel — no slew, no PI. Skip the
+    // stale/blind safety so the arc runs its full duration regardless of frame timing.
+    if (latest_open_loop_) {
+      cmd.linear.x = latest_v_; cmd.angular.z = latest_w_;
+      pub_cmd_->publish(geometry_msgs::msg::Twist());  // zero down the normal chain
+      pub_cmd_direct_->publish(cmd);                   // arc direct to /cmd_vel
+      return;
+    }
     double blind_for = (last_frame_t_ > 0) ? (now_s() - last_frame_t_) : 0.0;
     if (p_.frame_blind_s > 0 && last_frame_t_ > 0 && blind_for > p_.frame_blind_s) {
       // multi-second freeze → full stop
@@ -184,11 +224,13 @@ class LineFollowerNode : public rclcpp::Node {
   pzb::FollowerParams p_;
   std::unique_ptr<pzb::FollowerCore> core_;
   double cur_t_ = 0.0, last_frame_t_ = 0.0, latest_v_ = 0.0, latest_w_ = 0.0;
+  bool latest_open_loop_ = false;
 
   rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr pub_cx_;
   rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr pub_err_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pub_type_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr pub_cmd_;
+  rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr pub_cmd_direct_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_img_;
   rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr sub_scale_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr sub_sign_;

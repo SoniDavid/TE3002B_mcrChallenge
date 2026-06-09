@@ -168,19 +168,50 @@ class LineFollowerNode(Node):
         # returns (≥2 line slots for crossing_exit_frames frames), then resume centering.
         self.declare_parameter('crossing_coast_speed',    0.06)
         self.declare_parameter('crossing_exit_frames',    3)
-        # YOLO turn arrow → turn AT the dashed crossing. The arrow (on its OWN
-        # /yolo/turn_sign topic, so a nearer GIVE WAY / construccion / stopSign can't mask
-        # it) latches a DIRECTION; the open-loop turn-into-lane fires in the dashed-crossing
-        # FSM once the robot is aligned at the crossing (this is "turn AFTER the dashed
-        # lines"). letRecto / no arrow → cross straight. One crossing = one turn (Phase C
-        # consumes the arrow), so re-seeing the same sign without a new crossing can't
-        # re-fire (this was the run4 double-fire bug). turn_sign_only_enabled is the master
-        # on/off for acting on turn arrows. turn_sign_min_area_frac is a small freshness
-        # FLOOR on the latched arrow ("a real arrow, not a far speck"), NOT the trigger.
+        # YOLO turn arrow → turn at the sign's CLOSEST point (area peak-then-drop). The
+        # arrow (on its OWN /yolo/turn_sign topic, so a nearer GIVE WAY / construccion /
+        # stopSign can't mask it) is an ACTIVATION FLAG: it latches a DIRECTION and we track
+        # a running-MAX of its bbox area while it's in view. The open-loop turn-into-lane
+        # fires when the arrow has been genuinely close (max >= turn_peak_min_area) AND its
+        # area has now DROPPED below turn_peak_drop_frac × that max — i.e. the robot just
+        # passed the closest point (the dashed_turn bags: letIzquierda area rises to a peak
+        # ~0.15-0.22 right AT the turn, then falls). letRecto / no arrow → cross straight.
+        # FALLBACK: if a dashed crossing + fresh arrow occurs but no clean peak was seen
+        # (arrow left the frame edge first), the dashed FSM still turns at the crossing.
+        # turn_sign_only_enabled is the master on/off. turn_sign_min_area_frac is a tiny
+        # freshness floor (reject a far speck), NOT the trigger.
         self.declare_parameter('turn_sign_only_enabled',  True)
         self.declare_parameter('turn_sign_topic',         '/yolo/turn_sign')
-        self.declare_parameter('turn_sign_min_area_frac', 0.0)   # freshness floor only (0=off); NOT the trigger
-        self.declare_parameter('turn_sign_rearm_gap_s',   1.0)
+        self.declare_parameter('turn_sign_min_area_frac', 0.0)   # freshness floor only (0=off)
+        self.declare_parameter('turn_sign_rearm_gap_s',   4.0)
+        self.declare_parameter('turn_peak_min_area',      0.03)  # arrow must get this close before a turn
+        self.declare_parameter('turn_peak_drop_frac',     0.7)   # fire when area < this × running-max
+        # Post-fire cooldown: after a sign turn fires, block ANY new sign turn for this long
+        # (regardless of detections). One sign = one turn — the robot commits to the arc +
+        # coast + reacquire and won't re-fire on the SAME sign re-seen while it manoeuvres.
+        self.declare_parameter('turn_fire_cooldown_s',    8.0)
+        # Curve lockout: don't let a sign arc preempt a REAL corner the robot is already
+        # taking on the solid line. While the robot is actively cornering (solid line +
+        # |median steering error| past curve_lockout_error_px for curve_lockout_frames
+        # consecutive frames) the latched sign is HELD, not consumed — it fires only after
+        # the corner settles back near center. Otherwise the open-loop arc would fight the
+        # PD mid-curve and drive off the bend.
+        self.declare_parameter('curve_lockout_error_px',  70.0)
+        self.declare_parameter('curve_lockout_frames',    3)
+        # miniretoS8 reference line-follow control (ROUND 8). control_mode='ref' uses the
+        # reference center-pick + soft-dir control law; 'pd' = the original cx-PD path.
+        self.declare_parameter('control_mode',            'ref')
+        self.declare_parameter('ref_kp',                  1.5)
+        self.declare_parameter('ref_max_w',               2.0)
+        self.declare_parameter('ref_direction_alpha',     0.35)
+        self.declare_parameter('ref_direction_slew_rate', 10.0)
+        self.declare_parameter('ref_omega_alpha',         1.0)
+        self.declare_parameter('ref_omega_slew_rate',     10.0)
+        self.declare_parameter('ref_soft_dir_exp',        0.75)
+        self.declare_parameter('ref_curve_scale_k',       0.75)
+        self.declare_parameter('ref_angular_scale_k',     0.45)
+        self.declare_parameter('ref_lost_speed_scale',    0.65)
+        self.declare_parameter('ref_deadband',            0.0)
         # Curve dashed-suppression (newnew-bags fix): suppress a "dashed" classification
         # while the steering error is past this — a real crossing is approached head-on
         # (small error); a sharp curve (large error) breaks the line into co-linear blobs
@@ -294,13 +325,46 @@ class LineFollowerNode(Node):
         self._turn_sign   = None     # 'left' | 'right' | 'straight' | None (latched)
         self._turn_sign_t = None     # monotonic time the turn sign was last seen
         self._cross_turn_start = None  # set when the in-crossing turn arc begins
-        # YOLO turn arrow (acted on at the dashed crossing — see _cb_yolo_sign + the FSM)
+        # YOLO turn arrow → turn at the area peak (see _cb_yolo_sign + the peak-turn block)
         self._turn_sign_only = bool(self.get_parameter('turn_sign_only_enabled').value)
         self._turn_sign_topic = str(self.get_parameter('turn_sign_topic').value)
         self._turn_sign_min_area = float(self.get_parameter('turn_sign_min_area_frac').value)
         self._turn_sign_rearm_gap_s = float(self.get_parameter('turn_sign_rearm_gap_s').value)
-        self._turn_sign_area = 0.0       # bbox area fraction of the latched turn arrow
+        self._turn_peak_min_area = float(self.get_parameter('turn_peak_min_area').value)
+        self._turn_peak_drop_frac = float(self.get_parameter('turn_peak_drop_frac').value)
+        self._curve_lockout_error_px = float(self.get_parameter('curve_lockout_error_px').value)
+        self._curve_lockout_frames = int(self.get_parameter('curve_lockout_frames').value)
+        self._turn_sign_area = 0.0       # latest bbox area fraction of the latched turn arrow
+        self._turn_peak_max = 0.0        # running max area while the arrow is in view
         self._turn_sign_last_seen = None # last time a turn arrow was in view
+        self._turn_peak_reached = False  # running-max has crossed turn_peak_min_area this approach
+        self._curve_lockout_streak = 0   # consecutive cornering-on-solid frames (sign lockout)
+        self._turn_fire_cooldown_s = float(self.get_parameter('turn_fire_cooldown_s').value)
+        self._last_turn_fire_t = None    # monotonic time the last sign turn fired (cooldown)
+        # miniretoS8 reference control state + params (ROUND 8)
+        self._control_mode = str(self.get_parameter('control_mode').value)
+        self._ref_kp = float(self.get_parameter('ref_kp').value)
+        self._ref_max_w = float(self.get_parameter('ref_max_w').value)
+        self._ref_dir_alpha = float(self.get_parameter('ref_direction_alpha').value)
+        self._ref_dir_slew = float(self.get_parameter('ref_direction_slew_rate').value)
+        self._ref_omega_alpha = float(self.get_parameter('ref_omega_alpha').value)
+        self._ref_omega_slew = float(self.get_parameter('ref_omega_slew_rate').value)
+        self._ref_soft_exp = float(self.get_parameter('ref_soft_dir_exp').value)
+        self._ref_curve_k = float(self.get_parameter('ref_curve_scale_k').value)
+        self._ref_ang_k = float(self.get_parameter('ref_angular_scale_k').value)
+        self._ref_lost_scale = float(self.get_parameter('ref_lost_speed_scale').value)
+        self._ref_deadband = float(self.get_parameter('ref_deadband').value)
+        self._ref_raw_dir = 0.0
+        self._ref_filtered_dir = 0.0
+        self._ref_omega_filt = 0.0
+        self._ref_prev_dir = 0.0
+        self._ref_last_ctrl_t = None
+        # peak-turn open-loop arc state
+        self._so_turn_active = False
+        self._so_turn_dir = 0.0
+        self._so_turn_start = None
+        self._so_armed = True
+        self._so_open_loop = False   # True while the arc is being published direct to /cmd_vel
         self._dashed_suppress_error_px = float(self.get_parameter('dashed_suppress_error_px').value)
         self._tight_turn_error_px = float(self.get_parameter('tight_turn_error_px').value)
         self._curve_brake_error_px = float(self.get_parameter('curve_brake_error_px').value)
@@ -427,6 +491,14 @@ class LineFollowerNode(Node):
         self._pub_error     = self.create_publisher(Float32, '/line_follower/error',      _RELIABLE_QOS)
         self._pub_line_type = self.create_publisher(String,  '/line_follower/line_type',  _RELIABLE_QOS)
         self._pub_cmd       = self.create_publisher(Twist,   topic_cmd,                   _RELIABLE_QOS)
+        # TRUE open-loop turn bypass (ROUND 7): during the sign arc the normal command
+        # path (→ /cmd_vel_desired_raw → slew_limiter → velocity_controller PI → /cmd_vel)
+        # mangles the arc — the velocity_controller PI on the noisy /robot_vel.w adds a
+        # spurious correction (the bags' arc 0.6 became a 0.8 spike) and the slew ramps it.
+        # The user's directive: kill /cmd_vel (publish zero through the chain) and publish
+        # the arc DIRECTLY. So while _so_turn_active we send a ZERO to topic_cmd (the chain
+        # idles to zero) and emit the arc Twist straight onto /cmd_vel from this publisher.
+        self._pub_cmd_direct = self.create_publisher(Twist,  '/cmd_vel',                  _RELIABLE_QOS)
         # Debug image is large (~0.5 MB/msg). BEST_EFFORT so a slow subscriber / bag
         # recorder can never ACK-back-pressure the follower (a RELIABLE 0.5 MB topic
         # contributed to multi-second whole-graph stalls when recorded on the Jetson).
@@ -653,16 +725,109 @@ class LineFollowerNode(Node):
                 self._acq_until = now + self._acquire_guard_s
                 self._err_hist.clear()
 
-        # NOTE: the standalone "sign-only IN-FRONT turn" (area-anywhere) block was REMOVED.
-        # Real autonomous runs (run3/run4/run_2026) showed it fires at the wrong time vs the
-        # dashed crossing — it turned mid-straight and DOUBLE-fired the same sign re-seen
-        # after a turn — because area alone is ignorant of where the robot is on the track.
-        # The turn is now OWNED by the dashed-crossing FSM below (turn-into-lane), which is
-        # the user's "turn AFTER the dashed lines": the arrow gives DIRECTION, the dashed
-        # crossing gives the WHEN, and Phase C consumes the sign so one crossing = one turn.
+        # ── Peak-area turn (PRIMARY trigger) ──────────────────────────────────────
+        # The arrow is an ACTIVATION FLAG. The turn fires at the sign's CLOSEST point
+        # ("max pixels = closest"): the area rises to a peak as the robot approaches, then
+        # falls. Fire when EITHER (a) the running-max has been genuinely close
+        # (>= turn_peak_min_area) AND the current area has DROPPED below
+        # turn_peak_drop_frac × that max (a clean peak-drop while still in view), OR
+        # (b) the arrow LEAVES view having reached turn_peak_min_area (it exited the frame
+        # edge at close range — past closest, common on a tight approach). Direction is the
+        # last in-view latch, so (b) still knows left/right. Previously firing ALSO required
+        # the arrow to be back in view, which it never is once the robot reaches the sign —
+        # so no clean arc ever fired (new_run1/2/3). The dashed-crossing FSM below is the
+        # FALLBACK when no peak/leave-view fire happened. While _so_turn_active the command
+        # is OPEN-LOOP and bypasses the control chain (see _so_open_loop + _cmd_publish_cb).
+        _so_cmd = None
+        self._so_open_loop = False   # default: normal chain; set True only when an arc fires
+        if self._turn_sign_only:
+            _in_view = (self._turn_sign_last_seen is not None
+                        and (now - self._turn_sign_last_seen) <= self._turn_sign_rearm_gap_s)
+            # Curve lockout: if the robot is actively cornering on the REAL solid line
+            # (large sustained steering error), DON'T let a sign arc preempt it — finish
+            # the corner first, then fire. We hold the latch (don't consume it) while
+            # locked out. Uses last frame's accepted error (this frame's PD error is
+            # computed later); a corner persists across frames so the one-frame lag is
+            # harmless — same pattern as the dashed-suppress guard above.
+            if line_type == 'solid' and abs(self._last_good_error) >= self._curve_lockout_error_px:
+                self._curve_lockout_streak += 1
+            else:
+                self._curve_lockout_streak = 0
+            _curve_locked = self._curve_lockout_streak >= self._curve_lockout_frames
 
+            # Arm once a fresh direction is latched (no longer gated on "out of view").
+            if not self._so_turn_active and self._fresh_turn_sign() in ('left', 'right'):
+                self._so_armed = True
+            if self._so_turn_active:
+                if (now - self._so_turn_start) < self._cross_turn_s:
+                    _so_cmd = Twist()
+                    _so_cmd.linear.x  = self._cross_turn_speed * max(self._speed_scale, 1.0)
+                    _so_cmd.angular.z = self._so_turn_dir * self._cross_turn_z
+                else:
+                    # Arc done → DON'T resume PD immediately (it thrashes between line
+                    # fragments at the busy intersection and goes OOB — dashed_turn_v1_2
+                    # 2nd turn). Hand off to the dashed-FSM Phase-C COAST: drive straight,
+                    # no line steering, until ≥2 line slots are stable for
+                    # crossing_exit_frames, THEN resume centering. We enter crossing-state
+                    # already "past the turn/straight phases" so the next frame lands in
+                    # Phase C coast directly.
+                    self._so_turn_active = False
+                    self._so_armed = False
+                    self._turn_sign = None        # consumed → _do_turn=False, no re-fire
+                    self._turn_sign_t = None
+                    self._turn_peak_max = 0.0
+                    self._turn_peak_reached = False
+                    self._detector.reset_tracker_anchors()
+                    self._err_hist.clear()
+                    self._crossing_active = True
+                    self._aligned_latch   = True
+                    self._align_done_t    = now - 999.0   # straight-cross window already elapsed
+                    self._cross_turn_start = now - 999.0  # Phase B' already elapsed
+                    self._crossing_done_t = None          # Phase C will stamp it
+                    self._real_line_streak = 0
+            _in_cooldown = (self._last_turn_fire_t is not None
+                            and (now - self._last_turn_fire_t) < self._turn_fire_cooldown_s)
+            if (_so_cmd is None and not self._so_turn_active
+                    and self._so_armed and not _curve_locked and not _in_cooldown):
+                _td = self._turn_sign if self._turn_sign in ('left', 'right') else None
+                # (a) clean peak-drop while still in view
+                _fire_peak = (_in_view and _td is not None
+                              and self._turn_peak_reached
+                              and self._turn_sign_area
+                              <= self._turn_peak_drop_frac * self._turn_peak_max)
+                # (b) arrow left view after getting close (exited frame past closest)
+                _fire_leave = ((not _in_view) and _td is not None
+                               and self._turn_peak_reached)
+                if _fire_peak or _fire_leave:
+                    self._so_turn_active = True
+                    self._so_turn_dir = 1.0 if _td == 'left' else -1.0
+                    self._so_turn_start = now
+                    self._last_turn_fire_t = now   # start the one-turn-per-sign cooldown
+                    self.get_logger().info(
+                        f'Sign turn {_td.upper()} '
+                        f'({"peak-drop" if _fire_peak else "left-view"}: '
+                        f'max={self._turn_peak_max:.3f}, now={self._turn_sign_area:.3f}).')
+                    _so_cmd = Twist()
+                    _so_cmd.linear.x  = self._cross_turn_speed * max(self._speed_scale, 1.0)
+                    _so_cmd.angular.z = self._so_turn_dir * self._cross_turn_z
+
+        if _so_cmd is not None:
+            # OPEN-LOOP turn: route the arc DIRECTLY to /cmd_vel and send zero down the
+            # normal chain so the slew_limiter + velocity_controller idle to zero (no PI
+            # correction, no slew on the arc). _cmd_publish_cb reads _so_open_loop.
+            self._so_open_loop = True
+            self._latest_cmd = _so_cmd
+            self._prev_az = _so_cmd.angular.z
+            self._error_hist.clear()
+            cx_msg = Int32();  cx_msg.data = cx
+            self._pub_cx.publish(cx_msg)
+            err_msg = Float32();  err_msg.data = float(cx - self._img_w // 2)
+            self._pub_error.publish(err_msg)
+            type_msg = String();  type_msg.data = line_type
+            self._pub_line_type.publish(type_msg)
         # The crossing FSM runs while a crossing is active OR the current frame is dashed.
-        if self._crossing_active or line_type == 'dashed':
+        # It is the FALLBACK turn path (turn-into-lane) when the peak trigger didn't fire.
+        elif self._crossing_active or line_type == 'dashed':
             # Intersection handling — align EARLY, then cross straight, then stop:
             #   Phase A — Align/coast (bad_ignment4 strong-safeguard): drive forward
             #             at the APPROACH speed while squaring up to the dashes, but
@@ -816,6 +981,49 @@ class LineFollowerNode(Node):
         else:
             self._last_valid_t = now
             self._search_until = None   # line re-acquired — clear any active search window
+
+            # ── miniretoS8 reference control (ROUND 8) ────────────────────────
+            # Smooth normalized-direction following on the solid line. Runs the reference
+            # center-pick on the SAME ROI, then the soft-dir control law. The dashed /
+            # sign / open-loop paths above already returned, so this only governs solid
+            # following. control_mode='pd' falls back to the original cx-PD below.
+            if self._control_mode == 'ref':
+                direction, ref_found = self._detector.ref_center_line(img, self._ref_prev_dir)
+                self._ref_prev_dir = direction if ref_found else 0.0
+                dt = 0.05 if self._ref_last_ctrl_t is None else max(0.015, min(0.12, now - self._ref_last_ctrl_t))
+                speed_scale = 1.0
+                if ref_found:
+                    self._ref_raw_dir = ((1.0 - self._ref_dir_alpha) * self._ref_raw_dir
+                                         + self._ref_dir_alpha * direction)
+                    target = self._ref_raw_dir if abs(self._ref_raw_dir) >= self._ref_deadband else 0.0
+                    max_dd = self._ref_dir_slew * dt
+                    self._ref_filtered_dir = max(self._ref_filtered_dir - max_dd,
+                                                 min(self._ref_filtered_dir + max_dd, target))
+                    if abs(self._ref_filtered_dir) < self._ref_deadband:
+                        self._ref_filtered_dir = 0.0
+                else:
+                    self._ref_filtered_dir = 0.0
+                    speed_scale = self._ref_lost_scale
+                self._ref_last_ctrl_t = now
+                soft = self._ref_filtered_dir * abs(self._ref_filtered_dir) ** self._ref_soft_exp
+                w_t = max(-self._ref_max_w, min(self._ref_max_w, -self._ref_kp * soft))
+                w_sm = (1.0 - self._ref_omega_alpha) * self._ref_omega_filt + self._ref_omega_alpha * w_t
+                maxd = self._ref_omega_slew * dt
+                w = max(self._ref_omega_filt - maxd, min(self._ref_omega_filt + maxd, w_sm))
+                w = max(-self._ref_max_w, min(self._ref_max_w, w))
+                self._ref_omega_filt = w
+                curve_s = 1.0 - self._ref_curve_k * min(1.0, abs(self._ref_filtered_dir))
+                ang_s = 1.0 - self._ref_ang_k * min(1.0, abs(w) / max(1e-6, self._ref_max_w))
+                v = self._linear_speed * speed_scale * curve_s * ang_s * max(self._speed_scale, 0.0)
+                self._last_good_error = direction * (self._img_w // 2)
+                self._prev_az = w
+                cmd = Twist();  cmd.linear.x = float(v);  cmd.angular.z = float(w)
+                self._latest_cmd = cmd
+                cx_ref = int(round((direction + 1.0) * (self._img_w // 2)))
+                cx_msg = Int32();  cx_msg.data = cx_ref;  self._pub_cx.publish(cx_msg)
+                err_msg = Float32();  err_msg.data = float(direction * (self._img_w // 2));  self._pub_error.publish(err_msg)
+                type_msg = String();  type_msg.data = line_type;  self._pub_line_type.publish(type_msg)
+                return
 
             raw_error = float(cx - self._img_w // 2)
 
@@ -1197,6 +1405,19 @@ class LineFollowerNode(Node):
         This is a mitigation; the real fix for the low fps is on the camera/compute side.
         """
         cmd = self._latest_cmd
+
+        # OPEN-LOOP sign turn (ROUND 7): the arc is a timed, camera-independent motion.
+        # Bypass the whole control chain so nothing fights it — publish a ZERO down the
+        # normal path (topic_cmd → slew_limiter → velocity_controller, which then idles
+        # its /cmd_vel output to zero since v_des=w_des=0) and send the arc Twist STRAIGHT
+        # to /cmd_vel from this 20 Hz timer (no slew ramp, no PI correction). The
+        # stale/blind camera safety is intentionally skipped here — the arc must run for
+        # its full duration regardless of frame timing.
+        if self._so_open_loop and self._so_turn_active:
+            self._pub_cmd.publish(Twist())     # kill the chain's output
+            self._pub_cmd_direct.publish(cmd)  # open-loop arc direct to /cmd_vel
+            return
+
         blind_for = (time.monotonic() - self._last_frame_t) if self._last_frame_t is not None else 0.0
         if (self._frame_blind_s > 0 and self._last_frame_t is not None
                 and blind_for > self._frame_blind_s):
@@ -1217,11 +1438,12 @@ class LineFollowerNode(Node):
         self._speed_scale = float(msg.data)
 
     def _cb_yolo_sign(self, msg: String):
-        """Latch the most-recent TURN arrow (left/right/straight) from /yolo/turn_sign.
+        """Latch the most-recent TURN arrow (left/right/straight) from /yolo/turn_sign and
+        track its running-MAX area while in view.
 
-        The arrow is consumed at the next confirmed dashed crossing (turn-into-lane) and
-        expires after turn_sign_stale_s so an old detection never fires at the wrong
-        crossing. Area is a freshness FLOOR only (reject a far-off speck), not the trigger.
+        The arrow is an activation flag: the peak-turn block fires the turn when the area
+        peaks then drops. The running-max resets when the arrow has left view (a new
+        approach). Area floor (optional) rejects a far-off speck.
         """
         raw = msg.data.strip()
         c, _, area_s = raw.partition(':')
@@ -1233,6 +1455,11 @@ class LineFollowerNode(Node):
         if self._turn_sign_min_area > 0.0 and area < self._turn_sign_min_area:
             return
         now = time.monotonic()
+        # Reset the running-max if the arrow had left view (a NEW approach starts).
+        if (self._turn_sign_last_seen is None
+                or (now - self._turn_sign_last_seen) > self._turn_sign_rearm_gap_s):
+            self._turn_peak_max = 0.0
+            self._turn_peak_reached = False
         if c == self._sign_left:
             self._turn_sign, self._turn_sign_t = 'left', now
         elif c == self._sign_right:
@@ -1242,6 +1469,12 @@ class LineFollowerNode(Node):
         else:
             return  # slow signs / none don't change the latched turn intent
         self._turn_sign_area = area
+        self._turn_peak_max = max(self._turn_peak_max, area)
+        # Latch "got genuinely close" once the running-max crosses the min area. The
+        # peak-turn block fires on the subsequent drop OR when the arrow leaves view —
+        # both require this flag, so a far-off speck never triggers a turn.
+        if self._turn_peak_max >= self._turn_peak_min_area:
+            self._turn_peak_reached = True
         self._turn_sign_last_seen = now
 
     def _fresh_turn_sign(self):

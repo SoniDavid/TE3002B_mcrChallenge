@@ -6,6 +6,105 @@ import numpy as np
 import cv2
 
 
+# ── miniretoS8 reference center-pick helpers (ROUND 8) ────────────────────────
+# Faithful ports of line_detector2.py (_threshold_dark / _scan_band_centers /
+# _fallback_contour_center). The zebra guard is intentionally omitted.
+def _odd_ge(v):
+    v = max(3, int(v))
+    return v if v % 2 == 1 else v + 1
+
+
+def _ref_threshold_dark(roi):
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    block = _odd_ge(min(151, max(41, roi.shape[1] // 5)))
+    adaptive = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                     cv2.THRESH_BINARY_INV, block, 8)
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    dark_v = cv2.inRange(hsv[:, :, 2], 0, 115)
+    mask = cv2.bitwise_or(adaptive, dark_v)
+    mask = cv2.erode(mask, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE,
+                            cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)), iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
+                            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
+    return mask
+
+
+def _ref_find_runs(b):
+    runs, in_run, s = [], False, 0
+    for i, v in enumerate(b):
+        if v and not in_run:
+            s, in_run = i, True
+        elif not v and in_run:
+            runs.append((s, i - 1)); in_run = False
+    if in_run:
+        runs.append((s, len(b) - 1))
+    return runs
+
+
+def _ref_scan_bands(mask, prev_cx_roi):
+    roi_h, roi_w = mask.shape[:2]
+    centers = []
+    expected = prev_cx_roi if prev_cx_roi is not None else roi_w / 2.0
+    for r0, r1, bw in [(0.82, 1.00, 1.00), (0.68, 0.84, 0.85), (0.54, 0.70, 0.65),
+                       (0.40, 0.56, 0.45), (0.26, 0.42, 0.30)]:
+        y0, y1 = int(r0 * roi_h), int(r1 * roi_h)
+        band = mask[y0:y1, :]
+        if band.size == 0:
+            continue
+        if cv2.countNonZero(band) / float(band.size) > 0.55:
+            continue
+        col = np.sum(band > 0, axis=0).astype(np.float32)
+        if float(np.max(col)) < 3.0:
+            continue
+        col = cv2.GaussianBlur(col.reshape(1, -1), (1, 31), 0).flatten()
+        thr = max(3.0, 0.32 * float(np.max(col)))
+        valid = []
+        for x0, x1 in _ref_find_runs(col > thr):
+            width = x1 - x0 + 1
+            if width < 5 or width > 0.58 * roi_w:
+                continue
+            valid.append((0.5 * (x0 + x1), float(np.max(col[x0:x1 + 1])), width))
+        if not valid:
+            continue
+        valid.sort(key=lambda r: r[0])
+        if len(valid) >= 3:
+            cx, peak, width = valid[len(valid) // 2]
+        else:
+            cx, peak, width = min(valid, key=lambda r: abs(r[0] - expected))
+        expected = cx
+        wq = 1.0 - min(1.0, width / (0.58 * roi_w))
+        centers.append((cx, bw * peak * (1.0 + 0.1 * wq)))
+    return centers
+
+
+def _ref_fallback_center(mask, prev_cx_roi):
+    roi_h, roi_w = mask.shape[:2]
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    expected = prev_cx_roi if prev_cx_roi is not None else roi_w / 2.0
+    best, best_score = None, -1.0
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < 120:
+            continue
+        x, y, w, h = cv2.boundingRect(cnt)
+        if w > 0.65 * roi_w and h < 0.30 * roi_h:
+            continue
+        if h < 6:
+            continue
+        M = cv2.moments(cnt)
+        if M['m00'] == 0:
+            continue
+        cx = float(M['m10'] / M['m00'])
+        score = area * (0.55 * (y + h) / roi_h + 0.45 * (1.0 - min(1.0, abs(cx - expected) / (0.5 * roi_w))))
+        if score > best_score:
+            best_score, best = score, cx
+    return best
+
+
 class CenterLineDetector:
     """
     v4 — three-line tracker + dashed-line (intersection) detection.
@@ -213,6 +312,45 @@ class CenterLineDetector:
         self.prev_center = None
         self._halfwidth_hist.clear()
         self.centering   = False
+
+    # ── miniretoS8 reference center-pick (ROUND 8) ────────────────────────────
+    def ref_center_line(self, roi_bgr, prev_direction):
+        """Reference 5-band center-pick → normalized direction ∈ [-1,1] (negative=left).
+
+        Faithful port of line_detector2.py (_threshold_dark + _scan_band_centers +
+        _fallback_contour_center); the zebra guard is OMITTED (the dashed-FSM + YOLO
+        handle crossings). Independent of the slot tracker, used as the LINE-FOLLOW
+        steering source when the node runs in reference-control mode. Returns
+        (direction, found).
+        """
+        h, w = roi_bgr.shape[:2]
+        crop_x0, crop_x1 = int(w * 0.05), int(w * 0.95)
+        roi = roi_bgr[:, crop_x0:crop_x1]
+        mask = _ref_threshold_dark(roi)
+        roi_w = mask.shape[1]
+
+        prev_cx_roi = None
+        if prev_direction is not None:
+            prev_cx_full = (prev_direction + 1.0) * (w / 2.0)
+            prev_cx_roi = max(0.0, min(float(roi_w - 1), prev_cx_full - crop_x0))
+
+        centers = _ref_scan_bands(mask, prev_cx_roi)
+        cx_roi = roi_w / 2.0
+        found = False
+        if centers:
+            ws = sum(c * s for c, s in centers)
+            wt = sum(s for _, s in centers)
+            cx_roi = ws / max(1e-6, wt)
+            found = (min(1.0, len(centers) / 4.0) > 0.15) or len(centers) >= 1
+        else:
+            fb = _ref_fallback_center(mask, prev_cx_roi)
+            if fb is not None:
+                cx_roi = fb
+                found = True
+
+        cx_full = max(0.0, min(float(w - 1), cx_roi + crop_x0))
+        direction = (cx_full / (w / 2.0)) - 1.0
+        return max(-1.0, min(1.0, float(direction))), found
 
     # ── main entry point ──────────────────────────────────────────────────────
 

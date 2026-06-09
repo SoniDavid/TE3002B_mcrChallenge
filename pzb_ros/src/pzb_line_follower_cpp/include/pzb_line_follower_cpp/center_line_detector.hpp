@@ -76,6 +76,15 @@ class CenterLineDetector {
 
   void reset_tracker_anchors();
 
+  // ── miniretoS8 reference center-pick (ROUND 8) ─────────────────────────────
+  // Independent of the slot tracker: runs the reference's 5-band center scan on the ROI
+  // (adaptive-dark threshold + bottom-weighted middle-of-3 / nearest-to-prev continuity)
+  // and returns the normalized line offset `direction` ∈ [-1,1] (negative=left) plus a
+  // found flag. NO zebra guard (our dashed-FSM + YOLO handle crossings). `prev_direction`
+  // gives continuity on curves. Used as the LINE-FOLLOW steering source when the follower
+  // runs in reference-control mode; the slot tracker still runs for line_type/line_flags.
+  double ref_center_line(const cv::Mat& roi_bgr, double prev_direction, bool& found);
+
   // ── public attributes the node reads (mirror Python) ──────────────────────
   std::string line_type = "solid";
   std::map<std::string, double> line_positions{{"left", NAN}, {"center", NAN}, {"right", NAN}};

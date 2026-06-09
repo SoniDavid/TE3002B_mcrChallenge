@@ -4,6 +4,26 @@ line_follower_node:
     image_width:  320
     image_height: 240
 
+    # ── Line-follow control mode (ROUND 8) ────────────────────────────────────────
+    # "ref" = miniretoS8 reference control: normalized-direction center-pick (5-band
+    # middle-of-3 + continuity, NO zebra guard) + soft-dir control law (EMA + slew +
+    # |dir|^exp + curve/angular speed-shaping). Smooth, no slot-swap thrash (validated
+    # offline: 0% false line-loss vs the slot tracker's junction teleports). "pd" = the
+    # original cx-PD + slot tracker. The dashed-crossing FSM + YOLO sign turns are
+    # UNCHANGED in both modes (they own the command before the solid-follow path).
+    control_mode: ref
+    ref_kp: 1.5                  # rad/s per unit soft-direction (reference default)
+    ref_max_w: 2.0
+    ref_direction_alpha: 0.35    # raw-direction EMA
+    ref_direction_slew_rate: 10.0
+    ref_omega_alpha: 1.0         # 1.0 = omega EMA off (slew still limits)
+    ref_omega_slew_rate: 10.0
+    ref_soft_dir_exp: 0.75       # dir·|dir|^0.75 — gentle near center, firm at large offset
+    ref_curve_scale_k: 0.75      # v *= 1 - k·|dir|
+    ref_angular_scale_k: 0.45    # v *= 1 - k·|w|/max_w
+    ref_lost_speed_scale: 0.65
+    ref_deadband: 0.0
+
     # Proportional steering gain (rad/s per pixel of error)
     # Raised 0.0035->0.0045 (adaptive_new fix): medium curves were under-steered
     # (50 px x 0.0035 = 0.175, too weak — the line drifted off). 0.0045 gives ~0.23 at
@@ -113,19 +133,38 @@ line_follower_node:
     cross_turn_z:             0.6   # yaw rate (rad/s) during the lane turn
     cross_turn_s:             2.9   # turn duration (s) — ~90°+margin at cross_turn_z (was 1.6 ≈ 55°, too short)
     cross_turn_speed:         0.06  # forward speed (m/s) during the turn
-    # YOLO turn arrow → turn AT the dashed crossing. The arrow (on its OWN /yolo/turn_sign
-    # channel, so a nearer GIVE WAY/construccion/stopSign can't mask it) latches a
-    # DIRECTION; the open-loop turn-into-lane fires in the dashed-crossing FSM once the
-    # robot is aligned at the crossing — i.e. "turn AFTER the dashed lines". letRecto / no
-    # arrow → cross straight. One crossing = one turn (Phase C consumes the arrow), so
-    # re-seeing the same sign without a new crossing can't re-fire (the run4 double-fire
-    # bug). turn_sign_min_area_frac is a small freshness FLOOR (0=off), NOT the trigger.
-    # The autonomous run bags showed the arrow is seen 0-1.7s before the real turn
-    # crossings (well within turn_sign_stale_s=4.0) and stale at straight crossings.
+    # YOLO turn arrow → turn at the sign's CLOSEST point (area peak-then-drop). The arrow
+    # (on its OWN /yolo/turn_sign channel, so a nearer GIVE WAY/construccion/stopSign can't
+    # mask it) is an ACTIVATION FLAG: latch a DIRECTION + track the running-MAX of its bbox
+    # area. Fire the open-loop turn when max >= turn_peak_min_area (genuinely close) AND the
+    # area has dropped below turn_peak_drop_frac × max (just past closest). Validated on
+    # dashed_turn_v1/v2 (letIzquierda peaks ~0.15-0.22 AT the turn; fires there, not early
+    # at the dashed crossing, not on first sight). The dashed-crossing FSM is the FALLBACK.
+    # letRecto / no arrow → cross straight. turn_sign_min_area_frac = tiny freshness floor.
     turn_sign_only_enabled:   true
     turn_sign_topic:          /yolo/turn_sign
     turn_sign_min_area_frac:  0.0    # freshness floor only (0=off); NOT the trigger
-    turn_sign_rearm_gap_s:    1.0    # (legacy) re-arm window; one-per-crossing is the real guard
+    # rearm gap 1.0 -> 4.0 (ROUND 7): the SAME sign is re-detected as separate episodes a few
+    # seconds apart as the robot manoeuvres (new_run1 gap 3.3s). 4.0 treats those as one
+    # approach (no peak reset / re-arm) so one sign = one turn.
+    turn_sign_rearm_gap_s:    4.0    # arrow gone this long → reset peak-max + re-arm (new approach)
+    # Post-fire cooldown: after a turn fires, block any new sign turn for this long so the
+    # same sign re-seen during the arc/coast/reacquire can't re-fire (new_run2 saw it 3×).
+    turn_fire_cooldown_s:     8.0
+    # turn_peak_min_area lowered 0.08 -> 0.03 (ROUND 7): new_run3's right-arrow lay TILTED on
+    # the mat, so its bbox area_frac peaked at only 0.039 even at the closest point — 0.08
+    # would never fire. new_run1/2 (upright signs) peak 0.23/0.35, so 0.03 still fires there.
+    # Noise/far specks on these bags stay <=0.02, so 0.03 separates real-close from far.
+    # area_frac is a weak "closeness" proxy for a low/tilted sign — tune on-robot.
+    turn_peak_min_area:       0.03   # running-max must reach this (genuinely close) to arm a fire
+    # Fire when EITHER current area < turn_peak_drop_frac × running-max (clean peak-drop) OR
+    # the arrow leaves view after reaching turn_peak_min_area (exited frame past closest).
+    turn_peak_drop_frac:      0.7    # fire when current area < this × running-max (past closest)
+    # Curve lockout: don't let a sign arc preempt a real corner the robot is taking on the
+    # solid line — hold the latch while |error| is past curve_lockout_error_px on solid for
+    # curve_lockout_frames consecutive frames; fire only after the corner settles.
+    curve_lockout_error_px:   70.0
+    curve_lockout_frames:     3
     angular_slew_max_sharp: 0.45
     # Curve dashed-suppression: ignore a "dashed" classification while |steering error|
     # exceeds this — a real crossing is approached head-on (small error) while a sharp

@@ -8,7 +8,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <fstream>
 #include <numeric>
+#include <sstream>
 #include <vector>
 
 namespace pzb {
@@ -33,6 +35,32 @@ FollowerCore::FollowerCore(const FollowerParams& p, std::function<double()> cloc
     : detector(clock_fn ? clock_fn : steady_now), p_(p),
       clock_(clock_fn ? std::move(clock_fn) : steady_now) {}
 
+int FollowerCore::load_sign_actions() {
+  // Load sign_action_dir/<sign>.csv (rows: t,vx,wz; header line skipped) for each turn sign.
+  sign_actions_.clear();
+  if (p_.sign_action_dir.empty()) return 0;
+  int n = 0;
+  for (const std::string& sign : {std::string("left"), std::string("right"), std::string("straight")}) {
+    std::string path = p_.sign_action_dir + "/" + sign + ".csv";
+    std::ifstream f(path);
+    if (!f.is_open()) continue;
+    std::vector<ActionSample> samples;
+    std::string line;
+    while (std::getline(f, line)) {
+      if (line.empty() || line[0] == 't' || line[0] == '#') continue;  // header/comment
+      std::stringstream ss(line);
+      std::string a, b, c;
+      if (!std::getline(ss, a, ',') || !std::getline(ss, b, ',') || !std::getline(ss, c, ','))
+        continue;
+      try {
+        samples.push_back({std::stod(a), std::stod(b), std::stod(c)});
+      } catch (...) { continue; }
+    }
+    if (!samples.empty()) { sign_actions_[sign] = std::move(samples); ++n; }
+  }
+  return n;
+}
+
 void FollowerCore::set_yolo_sign(const std::string& cls_in, double now_s) {
   // Accept "<class>" or "<class>:<area_frac>" (the detector appends the bbox area
   // fraction so we can tell when the sign is IN FRONT). Parse the optional suffix.
@@ -45,9 +73,20 @@ void FollowerCore::set_yolo_sign(const std::string& cls_in, double now_s) {
   }
   // Freshness floor: a too-small (far) arrow doesn't (re)latch a direction. 0 = off.
   if (p_.turn_sign_min_area_frac > 0.0 && area < p_.turn_sign_min_area_frac) return;
+  // Reset the running-max if the arrow had left view (a NEW approach starts).
+  if (std::isnan(turn_sign_last_seen_t_) ||
+      (now_s - turn_sign_last_seen_t_) > p_.turn_sign_rearm_gap_s) {
+    turn_peak_max_ = 0.0;
+    turn_peak_reached_ = false;
+  }
   if (cls == p_.turn_sign_left_class)      { turn_sign_ = "left";     turn_sign_t_ = now_s; turn_sign_area_ = area; turn_sign_last_seen_t_ = now_s; }
   else if (cls == p_.turn_sign_right_class){ turn_sign_ = "right";    turn_sign_t_ = now_s; turn_sign_area_ = area; turn_sign_last_seen_t_ = now_s; }
   else if (cls == p_.turn_sign_straight_class) { turn_sign_ = "straight"; turn_sign_t_ = now_s; turn_sign_area_ = area; turn_sign_last_seen_t_ = now_s; }
+  else return;
+  turn_peak_max_ = std::max(turn_peak_max_, area);
+  // Latch "got genuinely close" once the running-max crosses the min area (peak block
+  // fires on the subsequent drop OR when the arrow leaves view — both require this).
+  if (turn_peak_max_ >= p_.turn_peak_min_area) turn_peak_reached_ = true;
 }
 
 std::string FollowerCore::fresh_turn_sign(double now) const {
@@ -225,13 +264,130 @@ Twist2 FollowerCore::process_frame(const cv::Mat& small_bgr, double now_s,
   }
 
   Twist2 cmd;
+  so_open_loop_ = false;   // default: normal chain; set true only when an arc fires
 
-  // NOTE: the standalone "sign-only" (area-anywhere) turn block was REMOVED. Real
-  // autonomous runs showed it fires at the wrong time vs the dashed crossing (mid-straight
-  // / double-fires a re-seen sign). The turn is now OWNED by the dashed-crossing FSM below
-  // (turn-into-lane): arrow = DIRECTION, dashed crossing = WHEN, Phase C consumes the arrow
-  // so one crossing = one turn. Matches the Python node.
+  // ── Teach-by-demonstration ACTION REPLAY (ROUND 9, PRIMARY when enabled) ──────
+  // A fresh turn sign latched AT a dashed crossing replays that sign's recorded /cmd_vel
+  // OPEN-LOOP (held-last-value at the recorded timestamps), then hands off to the Phase-C
+  // coast. This is the demonstrated maneuver — replaces the synthetic cross_turn arc for
+  // signs that have a CSV. If disabled / no CSV for the sign, falls through to the arc.
+  if (action_replay_active_) {
+    const auto& samp = sign_actions_[action_replay_sign_];
+    double te = now - action_replay_start_;
+    if (te <= samp.back().t + 1e-6) {
+      // held-last-value: the last sample whose t <= te (samples are time-sorted)
+      const ActionSample* cur = &samp.front();
+      for (const auto& s : samp) { if (s.t <= te) cur = &s; else break; }
+      cmd.v = cur->vx * std::max(speed_scale_, 0.0);   // traffic stop still applies
+      cmd.w = cur->wz;
+      prev_az_ = cmd.w; error_hist_.clear();
+      so_open_loop_ = true;
+      cx_out = cx; error_out = static_cast<double>(cx - half); line_type_out = line_type;
+      return cmd;
+    }
+    // sequence done → hand off to Phase-C coast-reacquire (same as the arc-end handoff).
+    action_replay_active_ = false;
+    turn_sign_.clear(); turn_sign_t_ = kNaN; turn_peak_max_ = 0.0; turn_peak_reached_ = false;
+    detector.reset_tracker_anchors(); error_hist_.clear();
+    crossing_active_ = true; aligned_latch_ = true; align_done_t_ = now - 999.0;
+    cross_turn_start_ = now - 999.0; crossing_done_t_ = kNaN; real_line_streak_ = 0;
+  }
+  // Trigger: enabled + at a dashed crossing + a fresh turn sign with a recorded action +
+  // not in the one-turn cooldown. Starts the open-loop replay.
+  if (p_.sign_action_enabled && !action_replay_active_) {
+    bool at_dashed = (crossing_active_ || line_type == "dashed");
+    std::string fs = fresh_turn_sign(now);   // "left"/"right"/"straight"/""
+    bool in_cooldown = !std::isnan(last_turn_fire_t_) &&
+                       (now - last_turn_fire_t_) < p_.turn_fire_cooldown_s;
+    if (at_dashed && !in_cooldown && !fs.empty() &&
+        sign_actions_.count(fs) && !sign_actions_[fs].empty()) {
+      action_replay_active_ = true;
+      action_replay_sign_ = fs;
+      action_replay_start_ = now;
+      last_turn_fire_t_ = now;
+      // consume the sign so it can't re-trigger mid-replay
+      turn_sign_.clear(); turn_sign_t_ = kNaN;
+      const auto& s0 = sign_actions_[fs].front();
+      cmd.v = s0.vx * std::max(speed_scale_, 0.0);
+      cmd.w = s0.wz;
+      prev_az_ = cmd.w; error_hist_.clear();
+      so_open_loop_ = true;
+      cx_out = cx; error_out = static_cast<double>(cx - half); line_type_out = line_type;
+      return cmd;
+    }
+  }
 
+  // ── Peak-area turn (PRIMARY trigger) ──────────────────────────────────────────
+  // The arrow is an ACTIVATION FLAG. The turn fires at the sign's CLOSEST point ("max
+  // pixels = closest"): area rises to a peak then falls. Fire when EITHER (a) running-max
+  // reached turn_peak_min_area AND current area < turn_peak_drop_frac × max (clean
+  // peak-drop while in view), OR (b) the arrow LEAVES view having reached
+  // turn_peak_min_area (exited frame edge at close range — past closest). Direction is the
+  // last in-view latch. Previously firing ALSO required the arrow back in view, which it
+  // never is once the robot reaches the sign → no clean arc fired (new_run1/2/3). The
+  // dashed-crossing FSM below is the FALLBACK. While so_turn_active_ the command is
+  // OPEN-LOOP (so_open_loop_) and the node routes it direct to /cmd_vel. Matches the Python node.
+  if (p_.turn_sign_only_enabled) {
+    bool in_view = !std::isnan(turn_sign_last_seen_t_) &&
+                   (now - turn_sign_last_seen_t_) <= p_.turn_sign_rearm_gap_s;
+    // Curve lockout: if cornering on the REAL solid line (large sustained error), don't let
+    // a sign arc preempt it — finish the corner first. Uses last frame's accepted error.
+    if (line_type == "solid" && std::abs(last_good_error_) >= p_.curve_lockout_error_px)
+      curve_lockout_streak_ += 1;
+    else
+      curve_lockout_streak_ = 0;
+    bool curve_locked = curve_lockout_streak_ >= p_.curve_lockout_frames;
+
+    if (!so_turn_active_ && fresh_turn_sign(now) == "left") so_armed_ = true;
+    else if (!so_turn_active_ && fresh_turn_sign(now) == "right") so_armed_ = true;
+    if (so_turn_active_) {
+      if ((now - so_turn_start_) < p_.cross_turn_s) {
+        cmd.v = p_.cross_turn_speed * std::max(speed_scale_, 1.0);
+        cmd.w = so_turn_dir_ * p_.cross_turn_z;
+        prev_az_ = cmd.w; error_hist_.clear();
+        so_open_loop_ = true;
+        cx_out = cx; error_out = static_cast<double>(cx - half); line_type_out = line_type;
+        return cmd;
+      }
+      // Arc done → hand off to the dashed-FSM Phase-C COAST (straight, no PD steering,
+      // until >=2 line slots stable for crossing_exit_frames) instead of resuming PD
+      // immediately (which thrashes between fragments at the busy intersection → OOB,
+      // dashed_turn_v1_2 2nd turn). Enter crossing-state already past the turn/straight
+      // phases so the next frame lands in Phase C. Matches the Python node.
+      so_turn_active_ = false; so_armed_ = false;
+      turn_sign_.clear(); turn_sign_t_ = kNaN; turn_peak_max_ = 0.0; turn_peak_reached_ = false;
+      detector.reset_tracker_anchors(); error_hist_.clear();
+      crossing_active_ = true;
+      aligned_latch_   = true;
+      align_done_t_    = now - 999.0;
+      cross_turn_start_ = now - 999.0;
+      crossing_done_t_ = kNaN;
+      real_line_streak_ = 0;
+    }
+    bool in_cooldown = !std::isnan(last_turn_fire_t_) &&
+                       (now - last_turn_fire_t_) < p_.turn_fire_cooldown_s;
+    std::string td = (turn_sign_ == "left" || turn_sign_ == "right") ? turn_sign_ : "";
+    // (a) clean peak-drop while still in view, OR (b) arrow left view after getting close.
+    bool fire_peak  = in_view && !td.empty() && turn_peak_reached_ &&
+                      turn_sign_area_ <= p_.turn_peak_drop_frac * turn_peak_max_;
+    bool fire_leave = !in_view && !td.empty() && turn_peak_reached_;
+    if (!so_turn_active_ && so_armed_ && !curve_locked && !in_cooldown &&
+        (fire_peak || fire_leave)) {
+      so_turn_active_ = true;
+      so_turn_dir_ = (td == "left") ? 1.0 : -1.0;
+      so_turn_start_ = now;
+      last_turn_fire_t_ = now;   // start the one-turn-per-sign cooldown
+      cmd.v = p_.cross_turn_speed * std::max(speed_scale_, 1.0);
+      cmd.w = so_turn_dir_ * p_.cross_turn_z;
+      prev_az_ = cmd.w; error_hist_.clear();
+      so_open_loop_ = true;
+      cx_out = cx; error_out = static_cast<double>(cx - half); line_type_out = line_type;
+      return cmd;
+    }
+  }
+
+  // The dashed-crossing FSM is the FALLBACK turn path (turn-into-lane) when the peak
+  // trigger didn't fire. arrow = DIRECTION, dashed crossing = WHEN, Phase C consumes it.
   if (crossing_active_ || line_type == "dashed") {
     // Phase A — align perpendicular to the dash row, then turn-or-straight cross, then stop.
     double elapsed = !std::isnan(dashed_first_t_) ? (now - dashed_first_t_) : 0.0;
@@ -289,9 +445,50 @@ Twist2 FollowerCore::process_frame(const cv::Mat& small_bgr, double now_s,
     return cmd;
   }
 
-  // ── solid PD path ──
+  // ── solid line-follow path ──
   last_valid_t_ = now;
   search_until_ = kNaN;  // re-acquired
+
+  // miniretoS8 reference control (ROUND 8): smooth normalized-direction following.
+  // Runs the reference center-pick on the SAME ROI, then the soft-dir control law. The
+  // dashed/sign/open-loop paths above already returned, so this only governs solid following.
+  if (p_.control_mode == "ref") {
+    bool ref_found = false;
+    double direction = detector.ref_center_line(img, ref_prev_dir_, ref_found);
+    ref_prev_dir_ = ref_found ? direction : 0.0;
+    double dt = std::isnan(ref_last_ctrl_t_) ? 0.05 : clampd(now - ref_last_ctrl_t_, 0.015, 0.12);
+    double speed_scale = 1.0;
+    if (ref_found) {
+      ref_raw_dir_ = (1.0 - p_.ref_direction_alpha) * ref_raw_dir_ + p_.ref_direction_alpha * direction;
+      double target = ref_raw_dir_;
+      if (std::abs(target) < p_.ref_deadband) target = 0.0;
+      double max_dd = p_.ref_direction_slew_rate * dt;
+      ref_filtered_dir_ = clampd(target, ref_filtered_dir_ - max_dd, ref_filtered_dir_ + max_dd);
+      if (std::abs(ref_filtered_dir_) < p_.ref_deadband) ref_filtered_dir_ = 0.0;
+    } else {
+      ref_filtered_dir_ = 0.0; ref_prev_filtered_dir_ = 0.0;
+      speed_scale = p_.ref_lost_speed_scale;
+    }
+    ref_last_ctrl_t_ = now;
+    ref_prev_filtered_dir_ = ref_filtered_dir_;
+    double soft = ref_filtered_dir_ * std::pow(std::abs(ref_filtered_dir_), p_.ref_soft_dir_exp);
+    double w_t = clampd(-p_.ref_kp * soft, -p_.ref_max_w, p_.ref_max_w);
+    double w_sm = (1.0 - p_.ref_omega_alpha) * ref_omega_filtered_ + p_.ref_omega_alpha * w_t;
+    double maxd = p_.ref_omega_slew_rate * dt;
+    double w = clampd(w_sm, ref_omega_filtered_ - maxd, ref_omega_filtered_ + maxd);
+    w = clampd(w, -p_.ref_max_w, p_.ref_max_w);
+    ref_omega_filtered_ = w;
+    double curve_s = 1.0 - p_.ref_curve_scale_k * std::min(1.0, std::abs(ref_filtered_dir_));
+    double ang_s = 1.0 - p_.ref_angular_scale_k * std::min(1.0, std::abs(w) / std::max(1e-6, p_.ref_max_w));
+    double v = p_.linear_speed * speed_scale * curve_s * ang_s;
+    if (speed_scale_ <= 0.0) v = 0.0; else v *= speed_scale_;
+    prev_az_ = w;
+    last_good_error_ = direction * half;  // keep curve-lockout / dashed-suppress fed (px-ish)
+    cmd.v = v; cmd.w = w;
+    cx_out = (int)std::lround((direction + 1.0) * half);
+    error_out = direction * half; line_type_out = line_type;
+    return cmd;
+  }
 
   double raw_error = static_cast<double>(cx - half);
   error_hist_.push_back(raw_error);

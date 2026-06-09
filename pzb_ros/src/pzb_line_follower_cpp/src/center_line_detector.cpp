@@ -71,6 +71,155 @@ void CenterLineDetector::reset_tracker_anchors() {
   centering = false;
 }
 
+// ── miniretoS8 reference center-pick (ROUND 8) ───────────────────────────────
+// Faithful port of line_detector2.py: _threshold_dark + _scan_band_centers +
+// _fallback_contour_center. The _zebra_score guard is intentionally OMITTED.
+namespace {
+int odd_ge(int v) { v = std::max(3, v); return (v % 2 == 1) ? v : v + 1; }
+
+cv::Mat ref_threshold_dark(const cv::Mat& roi) {
+  cv::Mat gray, blur;
+  cv::cvtColor(roi, gray, cv::COLOR_BGR2GRAY);
+  cv::GaussianBlur(gray, blur, cv::Size(5, 5), 0);
+  int block = odd_ge(std::min(151, std::max(41, roi.cols / 5)));
+  cv::Mat adaptive;
+  cv::adaptiveThreshold(blur, adaptive, 255, cv::ADAPTIVE_THRESH_GAUSSIAN_C,
+                        cv::THRESH_BINARY_INV, block, 8);
+  cv::Mat hsv; cv::cvtColor(roi, hsv, cv::COLOR_BGR2HSV);
+  std::vector<cv::Mat> ch; cv::split(hsv, ch);
+  cv::Mat dark_v; cv::inRange(ch[2], 0, 115, dark_v);
+  cv::Mat mask; cv::bitwise_or(adaptive, dark_v, mask);
+  cv::Mat ek = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
+  cv::erode(mask, mask, ek, cv::Point(-1, -1), 1);
+  cv::Mat ck = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(7, 7));
+  cv::Mat ok = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
+  cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, ck, cv::Point(-1, -1), 1);
+  cv::morphologyEx(mask, mask, cv::MORPH_OPEN, ok, cv::Point(-1, -1), 1);
+  return mask;
+}
+
+// Runs (start,end) where v[i] is true.
+std::vector<std::pair<int, int>> find_runs(const std::vector<uint8_t>& v) {
+  std::vector<std::pair<int, int>> runs; bool in = false; int s = 0;
+  for (int i = 0; i < (int)v.size(); ++i) {
+    if (v[i] && !in) { s = i; in = true; }
+    else if (!v[i] && in) { runs.emplace_back(s, i - 1); in = false; }
+  }
+  if (in) runs.emplace_back(s, (int)v.size() - 1);
+  return runs;
+}
+
+struct BandCenter { double cx, score; };
+
+// _scan_band_centers: 5 bottom-weighted bands; middle-of-3 (≥3 runs) else nearest-to-prev.
+std::vector<BandCenter> ref_scan_bands(const cv::Mat& mask, double prev_cx_roi) {
+  int roi_h = mask.rows, roi_w = mask.cols;
+  std::vector<BandCenter> centers;
+  double expected = (prev_cx_roi >= 0) ? prev_cx_roi : roi_w / 2.0;
+  const double bands[5][3] = {{0.82, 1.00, 1.00}, {0.68, 0.84, 0.85},
+                              {0.54, 0.70, 0.65}, {0.40, 0.56, 0.45},
+                              {0.26, 0.42, 0.30}};
+  for (auto& b : bands) {
+    int y0 = (int)(b[0] * roi_h), y1 = (int)(b[1] * roi_h);
+    if (y1 <= y0) continue;
+    cv::Mat band = mask(cv::Range(y0, y1), cv::Range::all());
+    if (band.empty()) continue;
+    double coverage = cv::countNonZero(band) / (double)band.total();
+    if (coverage > 0.55) continue;
+    // column sum of (band>0)
+    std::vector<float> col(roi_w, 0.f);
+    for (int x = 0; x < roi_w; ++x) col[x] = (float)cv::countNonZero(band.col(x));
+    float colmax = *std::max_element(col.begin(), col.end());
+    if (colmax < 3.f) continue;
+    cv::Mat colm(1, roi_w, CV_32F, col.data());
+    cv::GaussianBlur(colm, colm, cv::Size(31, 1), 0);
+    std::vector<float> cs(colm.ptr<float>(), colm.ptr<float>() + roi_w);
+    float csmax = *std::max_element(cs.begin(), cs.end());
+    double thr = std::max(3.0, 0.32 * csmax);
+    std::vector<uint8_t> above(roi_w);
+    for (int x = 0; x < roi_w; ++x) above[x] = cs[x] > thr;
+    auto runs = find_runs(above);
+    std::vector<std::array<double, 3>> valid;  // cx, peak, width
+    for (auto& r : runs) {
+      int width = r.second - r.first + 1;
+      if (width < 5 || width > 0.58 * roi_w) continue;
+      double cx = 0.5 * (r.first + r.second);
+      double peak = 0; for (int x = r.first; x <= r.second; ++x) peak = std::max(peak, (double)cs[x]);
+      valid.push_back({cx, peak, (double)width});
+    }
+    if (valid.empty()) continue;
+    std::sort(valid.begin(), valid.end(), [](auto& a, auto& b2) { return a[0] < b2[0]; });
+    std::array<double, 3> chosen;
+    if (valid.size() >= 3) chosen = valid[valid.size() / 2];
+    else chosen = *std::min_element(valid.begin(), valid.end(),
+                  [&](auto& a, auto& b2) { return std::abs(a[0] - expected) < std::abs(b2[0] - expected); });
+    expected = chosen[0];
+    double wq = 1.0 - std::min(1.0, chosen[2] / (0.58 * roi_w));
+    double score = b[2] * chosen[1] * (1.0 + 0.1 * wq);
+    centers.push_back({chosen[0], score});
+  }
+  return centers;
+}
+
+// _fallback_contour_center: best dark contour by bottom+proximity. Returns cx (<0 = none).
+double ref_fallback_center(const cv::Mat& mask, double prev_cx_roi) {
+  int roi_h = mask.rows, roi_w = mask.cols;
+  std::vector<std::vector<cv::Point>> contours;
+  cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+  if (contours.empty()) return -1.0;
+  double expected = (prev_cx_roi >= 0) ? prev_cx_roi : roi_w / 2.0;
+  double best = -1.0, best_score = -1.0;
+  for (auto& cnt : contours) {
+    double area = cv::contourArea(cnt);
+    if (area < 120) continue;
+    cv::Rect r = cv::boundingRect(cnt);
+    if (r.width > 0.65 * roi_w && r.height < 0.30 * roi_h) continue;
+    if (r.height < 6) continue;
+    cv::Moments M = cv::moments(cnt);
+    if (M.m00 == 0) continue;
+    double cx = M.m10 / M.m00;
+    double bottom_bonus = (r.y + r.height) / (double)roi_h;
+    double proximity = 1.0 - std::min(1.0, std::abs(cx - expected) / (0.5 * roi_w));
+    double score = area * (0.55 * bottom_bonus + 0.45 * proximity);
+    if (score > best_score) { best_score = score; best = cx; }
+  }
+  return best;
+}
+}  // namespace
+
+double CenterLineDetector::ref_center_line(const cv::Mat& roi_bgr, double prev_direction,
+                                           bool& found) {
+  int w = roi_bgr.cols;
+  int crop_x0 = (int)(w * 0.05), crop_x1 = (int)(w * 0.95);
+  cv::Mat roi = roi_bgr(cv::Range::all(), cv::Range(crop_x0, crop_x1)).clone();
+  cv::Mat mask = ref_threshold_dark(roi);
+  int roi_w = mask.cols;
+
+  double prev_cx_roi = -1.0;
+  if (!std::isnan(prev_direction)) {
+    double prev_cx_full = (prev_direction + 1.0) * (w / 2.0);
+    prev_cx_roi = std::max(0.0, std::min((double)roi_w - 1, prev_cx_full - crop_x0));
+  }
+
+  auto centers = ref_scan_bands(mask, prev_cx_roi);
+  double cx_roi = roi_w / 2.0;
+  found = false;
+  if (!centers.empty()) {
+    double ws = 0, wt = 0;
+    for (auto& c : centers) { ws += c.cx * c.score; wt += c.score; }
+    cx_roi = ws / std::max(1e-6, wt);
+    double conf = std::min(1.0, centers.size() / 4.0);  // (drop the small weight term; gate is loose)
+    found = conf > 0.15 || centers.size() >= 1;
+  } else {
+    double fb = ref_fallback_center(mask, prev_cx_roi);
+    if (fb >= 0) { cx_roi = fb; found = true; }
+  }
+
+  double cx_full = std::max(0.0, std::min((double)w - 1, cx_roi + crop_x0));
+  double direction = (cx_full / (w / 2.0)) - 1.0;
+  return std::max(-1.0, std::min(1.0, direction));
+}
+
 // ── persistent adaptive threshold ────────────────────────────────────────────
 cv::Mat CenterLineDetector::adaptive_threshold(const cv::Mat& gray) {
   int T = T_state_;
