@@ -54,7 +54,8 @@ def generate_launch_description():
     arg_dead_band_px            = DeclareLaunchArgument('dead_band_px',            default_value='12',    description='Pixel dead band for steering (widened for anti-stutter)')
     arg_publish_debug           = DeclareLaunchArgument('publish_debug',           default_value='false', description='Publish /camera/image_debug topic')
     arg_impl                    = DeclareLaunchArgument('impl',                    default_value='cpp',   description="Line-follower implementation: 'py' (pzb_line_follower) or 'cpp' (pzb_line_follower_cpp). Defaults to C++ for lower Jetson CPU/memory; it is a drop-in (same node name/topics/params). Pass impl:=py to use the Python node.")
-    arg_use_traffic             = DeclareLaunchArgument('use_traffic',             default_value='true',  description='Launch traffic light detector and FSM. It subscribes to the FULL-res /camera/image_raw (now raw/undistorted-off). It frame-skips (every 3rd frame) to limit CPU; if the Jetson is still tight, it can be repointed to /camera/image_small (it downscales its crop to 320x160 either way) or undistort re-enabled for it.')
+    arg_use_traffic             = DeclareLaunchArgument('use_traffic',             default_value='false', description='Launch the HSV color detector ON THE JETSON. Default FALSE — the color detector MOVED TO THE PC (it reads /camera/image_compressed; runs in pzb_traffic/yolo_detector.launch.py via run_yolo.sh). Set true only to run it on the Jetson instead.')
+    arg_use_traffic_fsm         = DeclareLaunchArgument('use_traffic_fsm',         default_value='true',  description='Launch the traffic_light_fsm_node on the Jetson (light: /traffic_light_color + /yolo/sign → /traffic_speed_scale). Stays on the Jetson even though the color detector moved to the PC.')
     arg_launch_follower         = DeclareLaunchArgument('launch_follower',         default_value='true',  description='Launch the line-follower node. Set FALSE to bring up camera + control chain + traffic WITHOUT the follower — e.g. for TELEOP recording, where the follower must not command motion (it would fight teleop on the cmd_vel chain). With it false the robot only moves from your teleop /cmd_vel.')
     arg_launch_control          = DeclareLaunchArgument('launch_control',          default_value='true',  description='Launch the control chain (odometry, velocity_controller, slew_limiter). The velocity_controller WRITES /cmd_vel — the same topic teleop_twist_keyboard writes. For TELEOP recording set launch_control:=false (and launch_follower:=false) so teleop owns /cmd_vel directly to the MCU with no second writer fighting it. Leaves only the camera (+ traffic/detector) running to publish image topics for the bag.')
     arg_undistort_enabled       = DeclareLaunchArgument('undistort_enabled',       default_value='true',  description='Apply lens undistortion to the small (line-follower) stream. Set false to A/B test the CPU saving (the follower is closed-loop and tolerates mild distortion).')
@@ -212,28 +213,32 @@ def generate_launch_description():
         ],
     )
 
-    # ── 7. Traffic light color detector ──────────────────────────────────────
-    # HSV-based detector on /camera/image_raw, publishes /traffic_light_color.
-    # Comment out (or pass use_traffic:=false) when running without traffic lights.
+    # ── 7. Traffic light color detector — MOVED TO THE PC ─────────────────────
+    # The HSV color detector now runs OFF-BOARD on the laptop (in
+    # pzb_traffic/yolo_detector.launch.py, started by scripts/run_yolo.sh), because it reads
+    # /camera/image_compressed (the same JPEG stream as YOLO) with a tight top-center ROI.
+    # It publishes /traffic_light_color over the shared ROS domain → consumed by the FSM
+    # below (still on the Jetson). It is NOT launched here. (use_traffic defaults FALSE.)
     node_color_detector = Node(
         package='pzb_traffic',
         executable='color_detector_node',
         name='color_detector_node',
         output='screen',
-        condition=IfCondition(LaunchConfiguration('use_traffic')),
+        condition=IfCondition(LaunchConfiguration('use_traffic')),  # default false — see above
         parameters=[traffic_params],
     )
 
-    # ── 8. Traffic light FSM ──────────────────────────────────────────────────
-    # Subscribes to /traffic_light_color and outputs a speed scale on /traffic_speed_scale
-    # that the line follower multiplies into its linear speed.
-    # Comment out (or pass use_traffic:=false) together with node_color_detector above.
+    # ── 8. Traffic light FSM — STAYS ON THE JETSON ────────────────────────────
+    # Light node: subscribes /traffic_light_color (from the PC color detector) + /yolo/sign +
+    # /line_follower/error, outputs /traffic_speed_scale that the follower multiplies into its
+    # speed. Kept on the Jetson (cheap) under its OWN flag use_traffic_fsm (default true) so
+    # it runs even though the color detector moved to the PC.
     node_traffic_fsm = Node(
         package='pzb_traffic',
         executable='traffic_light_fsm_node',
         name='traffic_light_fsm_node',
         output='screen',
-        condition=IfCondition(LaunchConfiguration('use_traffic')),
+        condition=IfCondition(LaunchConfiguration('use_traffic_fsm')),
         parameters=[traffic_params],
     )
 
@@ -247,6 +252,7 @@ def generate_launch_description():
         arg_publish_debug,
         arg_impl,
         arg_use_traffic,
+        arg_use_traffic_fsm,
         arg_launch_follower,
         arg_launch_control,
         arg_undistort_enabled,

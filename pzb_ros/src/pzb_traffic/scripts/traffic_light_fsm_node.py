@@ -49,6 +49,12 @@ class TrafficLightFSMNode(Node):
         self.declare_parameter('yellow_speed_scale', 0.4)
         self.declare_parameter('color_lost_timeout', 1.5)
         self.declare_parameter('loop_hz',            20.0)
+        # Traffic-LIGHT obedience. Default FALSE: this course has no real traffic light, and
+        # the HSV detector false-fired 'red' under changed lighting → the FSM latched STOPPED
+        # forever (pzb_stale bag). When false, /traffic_light_color is IGNORED (the light
+        # never drives the speed scale) — the YOLO SIGN behaviors (stop/giveway/construccion
+        # off /yolo/sign) are UNAFFECTED and keep working. Set true only with a real light.
+        self.declare_parameter('traffic_light_enabled', False)
         # YOLO sign behaviors (the non-turn signs; turn signs are handled by the line
         # follower at a dashed crossing). Three distinct actions:
         #   construccion → SLOW (reduce speed like yellow) while seen.
@@ -81,6 +87,7 @@ class TrafficLightFSMNode(Node):
 
         self._yellow_scale = float(self.get_parameter('yellow_speed_scale').value)
         self._lost_timeout = float(self.get_parameter('color_lost_timeout').value)
+        self._traffic_light_enabled = bool(self.get_parameter('traffic_light_enabled').value)
         self._slow_signs   = set(self.get_parameter('slow_sign_classes').value)
         self._stop_signs   = set(self.get_parameter('stop_sign_classes').value)
         self._give_way_signs = set(self.get_parameter('give_way_classes').value)
@@ -136,6 +143,11 @@ class TrafficLightFSMNode(Node):
     # ------------------------------------------------------------------ FSM
 
     def _color_callback(self, msg: String):
+        # Traffic-light obedience is OFF by default (no real light on this course; the HSV
+        # detector false-fires red under changed lighting). When disabled, ignore the light
+        # entirely — the FSM stays RUNNING and only the YOLO sign behaviors affect the scale.
+        if not self._traffic_light_enabled:
+            return
         color = msg.data.lower().strip()
         now = time.monotonic()
         self._last_color_time = now
@@ -158,8 +170,12 @@ class TrafficLightFSMNode(Node):
             self._set_state(TrafficState.RUNNING)
 
         elif color == 'none':
-            if not self._waiting_for_green:
-                self._set_state(TrafficState.RUNNING)
+            # Resume when the light CLEARS, even if we were waiting for green. A red that
+            # disappears (real light passed, or a false red under bad lighting) must not
+            # strand the robot forever waiting for a green that never comes. Only a
+            # *sustained* red holds the stop (re-asserted each red frame below).
+            self._waiting_for_green = False
+            self._set_state(TrafficState.RUNNING)
 
         elif color == 'red':
             self._waiting_for_green = True

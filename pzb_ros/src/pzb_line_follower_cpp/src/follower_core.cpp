@@ -79,10 +79,12 @@ void FollowerCore::set_yolo_sign(const std::string& cls_in, double now_s) {
     turn_peak_max_ = 0.0;
     turn_peak_reached_ = false;
   }
+  // letRecto / "straight" is IGNORED (ROUND 11): treat it as if no sign was seen — it must
+  // NOT latch a turn intent, so the commit-turn FSM never fires on it and the robot just
+  // keeps line-following (the dashed FSM crosses straight on its own anyway).
   if (cls == p_.turn_sign_left_class)      { turn_sign_ = "left";     turn_sign_t_ = now_s; turn_sign_area_ = area; turn_sign_last_seen_t_ = now_s; }
   else if (cls == p_.turn_sign_right_class){ turn_sign_ = "right";    turn_sign_t_ = now_s; turn_sign_area_ = area; turn_sign_last_seen_t_ = now_s; }
-  else if (cls == p_.turn_sign_straight_class) { turn_sign_ = "straight"; turn_sign_t_ = now_s; turn_sign_area_ = area; turn_sign_last_seen_t_ = now_s; }
-  else return;
+  else return;  // straight / none / other → no-op
   turn_peak_max_ = std::max(turn_peak_max_, area);
   // Latch "got genuinely close" once the running-max crosses the min area (peak block
   // fires on the subsequent drop OR when the arrow leaves view — both require this).

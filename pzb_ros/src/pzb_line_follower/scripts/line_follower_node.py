@@ -817,7 +817,7 @@ class LineFollowerNode(Node):
             _fs = self._fresh_turn_sign()
             _in_cooldown = (self._last_turn_fire_t is not None
                             and (now - self._last_turn_fire_t) < self._turn_fire_cooldown_s)
-            if _at_dashed and not _in_cooldown and _fs in ('left', 'right', 'straight'):
+            if _at_dashed and not _in_cooldown and _fs in ('left', 'right'):
                 self._commit_phase = 1;  self._commit_phase_t = now;  self._commit_dir = _fs
                 self._last_turn_fire_t = now
                 self._turn_sign = None;  self._turn_sign_t = None     # consume
@@ -1538,14 +1538,15 @@ class LineFollowerNode(Node):
                 or (now - self._turn_sign_last_seen) > self._turn_sign_rearm_gap_s):
             self._turn_peak_max = 0.0
             self._turn_peak_reached = False
+        # letRecto / "straight" is IGNORED (ROUND 11): treat it as if no sign was seen — do
+        # NOT latch a turn intent, so the commit-turn FSM never fires on it (the robot just
+        # keeps line-following; the dashed FSM crosses straight on its own).
         if c == self._sign_left:
             self._turn_sign, self._turn_sign_t = 'left', now
         elif c == self._sign_right:
             self._turn_sign, self._turn_sign_t = 'right', now
-        elif c == self._sign_straight:
-            self._turn_sign, self._turn_sign_t = 'straight', now
         else:
-            return  # slow signs / none don't change the latched turn intent
+            return  # straight / slow signs / none don't change the latched turn intent
         self._turn_sign_area = area
         self._turn_peak_max = max(self._turn_peak_max, area)
         # Latch "got genuinely close" once the running-max crosses the min area. The
