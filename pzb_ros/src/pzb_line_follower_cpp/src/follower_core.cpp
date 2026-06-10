@@ -266,128 +266,69 @@ Twist2 FollowerCore::process_frame(const cv::Mat& small_bgr, double now_s,
   Twist2 cmd;
   so_open_loop_ = false;   // default: normal chain; set true only when an arc fires
 
-  // ── Teach-by-demonstration ACTION REPLAY (ROUND 9, PRIMARY when enabled) ──────
-  // A fresh turn sign latched AT a dashed crossing replays that sign's recorded /cmd_vel
-  // OPEN-LOOP (held-last-value at the recorded timestamps), then hands off to the Phase-C
-  // coast. This is the demonstrated maneuver — replaces the synthetic cross_turn arc for
-  // signs that have a CSV. If disabled / no CSV for the sign, falls through to the arc.
-  if (action_replay_active_) {
-    const auto& samp = sign_actions_[action_replay_sign_];
-    double te = now - action_replay_start_;
-    if (te <= samp.back().t + 1e-6) {
-      // held-last-value: the last sample whose t <= te (samples are time-sorted)
-      const ActionSample* cur = &samp.front();
-      for (const auto& s : samp) { if (s.t <= te) cur = &s; else break; }
-      cmd.v = cur->vx * std::max(speed_scale_, 0.0);   // traffic stop still applies
-      cmd.w = cur->wz;
+  // ── COMMIT-NUDGE sign turn (ROUND 9.2) ──────────────────────────────────────
+  // Reference (puzzlebot-line-follower) turn model: at a dashed crossing with a fresh sign
+  // latched, STOP+center briefly, then a SHORT slow directional NUDGE (v=commit_speed,
+  // w=±commit_w / 0 for straight) for commit_s, then HAND BACK to normal line-following,
+  // which latches the perpendicular branch and completes the turn closed-loop. Replaces the
+  // fragile open-loop CSV replay + synthetic arc. Published via the NORMAL chain (gentle).
+  //   commit_phase_: 0 idle | 1 center | 2 forward-enter | 3 arc-nudge (forward while turning)
+  if (commit_phase_ == 1) {  // STOP-AND-CENTER: hold still, steer to center the dashed entry
+    if ((now - commit_phase_t_) < p_.commit_center_s) {
+      double err = static_cast<double>(cx - half);
+      cmd.v = 0.0;
+      cmd.w = clampd(-p_.Kp_angular * err, -p_.commit_w, p_.commit_w);
       prev_az_ = cmd.w; error_hist_.clear();
-      so_open_loop_ = true;
+      cx_out = cx; error_out = err; line_type_out = line_type;
+      return cmd;
+    }
+    commit_phase_ = 2; commit_phase_t_ = now;   // → forward enter
+  }
+  if (commit_phase_ == 2) {  // FORWARD ENTER: advance into the intersection before turning
+    if ((now - commit_phase_t_) < p_.commit_forward_s) {
+      cmd.v = p_.commit_speed * std::max(speed_scale_, 0.0);
+      cmd.w = 0.0;
+      prev_az_ = cmd.w; error_hist_.clear();
       cx_out = cx; error_out = static_cast<double>(cx - half); line_type_out = line_type;
       return cmd;
     }
-    // sequence done → hand off to Phase-C coast-reacquire (same as the arc-end handoff).
-    action_replay_active_ = false;
-    turn_sign_.clear(); turn_sign_t_ = kNaN; turn_peak_max_ = 0.0; turn_peak_reached_ = false;
-    detector.reset_tracker_anchors(); error_hist_.clear();
-    crossing_active_ = true; aligned_latch_ = true; align_done_t_ = now - 999.0;
-    cross_turn_start_ = now - 999.0; crossing_done_t_ = kNaN; real_line_streak_ = 0;
+    commit_phase_ = 3; commit_phase_t_ = now;   // → arc nudge
   }
-  // Trigger: enabled + at a dashed crossing + a fresh turn sign with a recorded action +
-  // not in the one-turn cooldown. Starts the open-loop replay.
-  if (p_.sign_action_enabled && !action_replay_active_) {
+  if (commit_phase_ == 3) {  // ARC NUDGE: forward WHILE turning into the chosen branch
+    if ((now - commit_phase_t_) < p_.commit_s) {
+      cmd.v = p_.commit_speed * std::max(speed_scale_, 0.0);
+      cmd.w = (commit_dir_ == "left") ? p_.commit_w
+            : (commit_dir_ == "right") ? -p_.commit_w : 0.0;
+      prev_az_ = cmd.w; error_hist_.clear();
+      cx_out = cx; error_out = static_cast<double>(cx - half); line_type_out = line_type;
+      return cmd;
+    }
+    // done → resume normal line-following (it latches the new branch). Reset trackers + take
+    // a short acquisition guard so the first frames don't snap to a crossing dash.
+    commit_phase_ = 0; commit_dir_.clear();
+    detector.reset_tracker_anchors(); error_hist_.clear();
+    acq_until_ = now + p_.acquire_guard_s;
+    crossing_active_ = false;
+  }
+  // TRIGGER: at a dashed crossing + a FRESH turn sign + not in the one-turn cooldown →
+  // begin the stop-and-center (phase 1). Consumes the sign (one turn per crossing).
+  if (commit_phase_ == 0 && p_.turn_sign_only_enabled) {
     bool at_dashed = (crossing_active_ || line_type == "dashed");
     std::string fs = fresh_turn_sign(now);   // "left"/"right"/"straight"/""
     bool in_cooldown = !std::isnan(last_turn_fire_t_) &&
                        (now - last_turn_fire_t_) < p_.turn_fire_cooldown_s;
-    if (at_dashed && !in_cooldown && !fs.empty() &&
-        sign_actions_.count(fs) && !sign_actions_[fs].empty()) {
-      action_replay_active_ = true;
-      action_replay_sign_ = fs;
-      action_replay_start_ = now;
+    if (at_dashed && !in_cooldown && !fs.empty()) {
+      commit_phase_ = 1; commit_phase_t_ = now; commit_dir_ = fs;
       last_turn_fire_t_ = now;
-      // consume the sign so it can't re-trigger mid-replay
-      turn_sign_.clear(); turn_sign_t_ = kNaN;
-      const auto& s0 = sign_actions_[fs].front();
-      cmd.v = s0.vx * std::max(speed_scale_, 0.0);
-      cmd.w = s0.wz;
-      prev_az_ = cmd.w; error_hist_.clear();
-      so_open_loop_ = true;
+      turn_sign_.clear(); turn_sign_t_ = kNaN;   // consume
+      cmd.v = 0.0; cmd.w = 0.0; prev_az_ = 0.0; error_hist_.clear();
       cx_out = cx; error_out = static_cast<double>(cx - half); line_type_out = line_type;
       return cmd;
     }
   }
 
-  // ── Peak-area turn (PRIMARY trigger) ──────────────────────────────────────────
-  // The arrow is an ACTIVATION FLAG. The turn fires at the sign's CLOSEST point ("max
-  // pixels = closest"): area rises to a peak then falls. Fire when EITHER (a) running-max
-  // reached turn_peak_min_area AND current area < turn_peak_drop_frac × max (clean
-  // peak-drop while in view), OR (b) the arrow LEAVES view having reached
-  // turn_peak_min_area (exited frame edge at close range — past closest). Direction is the
-  // last in-view latch. Previously firing ALSO required the arrow back in view, which it
-  // never is once the robot reaches the sign → no clean arc fired (new_run1/2/3). The
-  // dashed-crossing FSM below is the FALLBACK. While so_turn_active_ the command is
-  // OPEN-LOOP (so_open_loop_) and the node routes it direct to /cmd_vel. Matches the Python node.
-  if (p_.turn_sign_only_enabled) {
-    bool in_view = !std::isnan(turn_sign_last_seen_t_) &&
-                   (now - turn_sign_last_seen_t_) <= p_.turn_sign_rearm_gap_s;
-    // Curve lockout: if cornering on the REAL solid line (large sustained error), don't let
-    // a sign arc preempt it — finish the corner first. Uses last frame's accepted error.
-    if (line_type == "solid" && std::abs(last_good_error_) >= p_.curve_lockout_error_px)
-      curve_lockout_streak_ += 1;
-    else
-      curve_lockout_streak_ = 0;
-    bool curve_locked = curve_lockout_streak_ >= p_.curve_lockout_frames;
-
-    if (!so_turn_active_ && fresh_turn_sign(now) == "left") so_armed_ = true;
-    else if (!so_turn_active_ && fresh_turn_sign(now) == "right") so_armed_ = true;
-    if (so_turn_active_) {
-      if ((now - so_turn_start_) < p_.cross_turn_s) {
-        cmd.v = p_.cross_turn_speed * std::max(speed_scale_, 1.0);
-        cmd.w = so_turn_dir_ * p_.cross_turn_z;
-        prev_az_ = cmd.w; error_hist_.clear();
-        so_open_loop_ = true;
-        cx_out = cx; error_out = static_cast<double>(cx - half); line_type_out = line_type;
-        return cmd;
-      }
-      // Arc done → hand off to the dashed-FSM Phase-C COAST (straight, no PD steering,
-      // until >=2 line slots stable for crossing_exit_frames) instead of resuming PD
-      // immediately (which thrashes between fragments at the busy intersection → OOB,
-      // dashed_turn_v1_2 2nd turn). Enter crossing-state already past the turn/straight
-      // phases so the next frame lands in Phase C. Matches the Python node.
-      so_turn_active_ = false; so_armed_ = false;
-      turn_sign_.clear(); turn_sign_t_ = kNaN; turn_peak_max_ = 0.0; turn_peak_reached_ = false;
-      detector.reset_tracker_anchors(); error_hist_.clear();
-      crossing_active_ = true;
-      aligned_latch_   = true;
-      align_done_t_    = now - 999.0;
-      cross_turn_start_ = now - 999.0;
-      crossing_done_t_ = kNaN;
-      real_line_streak_ = 0;
-    }
-    bool in_cooldown = !std::isnan(last_turn_fire_t_) &&
-                       (now - last_turn_fire_t_) < p_.turn_fire_cooldown_s;
-    std::string td = (turn_sign_ == "left" || turn_sign_ == "right") ? turn_sign_ : "";
-    // (a) clean peak-drop while still in view, OR (b) arrow left view after getting close.
-    bool fire_peak  = in_view && !td.empty() && turn_peak_reached_ &&
-                      turn_sign_area_ <= p_.turn_peak_drop_frac * turn_peak_max_;
-    bool fire_leave = !in_view && !td.empty() && turn_peak_reached_;
-    if (!so_turn_active_ && so_armed_ && !curve_locked && !in_cooldown &&
-        (fire_peak || fire_leave)) {
-      so_turn_active_ = true;
-      so_turn_dir_ = (td == "left") ? 1.0 : -1.0;
-      so_turn_start_ = now;
-      last_turn_fire_t_ = now;   // start the one-turn-per-sign cooldown
-      cmd.v = p_.cross_turn_speed * std::max(speed_scale_, 1.0);
-      cmd.w = so_turn_dir_ * p_.cross_turn_z;
-      prev_az_ = cmd.w; error_hist_.clear();
-      so_open_loop_ = true;
-      cx_out = cx; error_out = static_cast<double>(cx - half); line_type_out = line_type;
-      return cmd;
-    }
-  }
-
-  // The dashed-crossing FSM is the FALLBACK turn path (turn-into-lane) when the peak
-  // trigger didn't fire. arrow = DIRECTION, dashed crossing = WHEN, Phase C consumes it.
+  // The dashed-crossing FSM (now WITHOUT a turn — the commit-nudge owns turns) still handles
+  // a plain straight crossing / crossing-state coast when no sign turn fired.
   if (crossing_active_ || line_type == "dashed") {
     // Phase A — align perpendicular to the dash row, then turn-or-straight cross, then stop.
     double elapsed = !std::isnan(dashed_first_t_) ? (now - dashed_first_t_) : 0.0;
@@ -402,21 +343,14 @@ Twist2 FollowerCore::process_frame(const cv::Mat& small_bgr, double now_s,
     }
     if (!aligned_latch_ && elapsed >= p_.align_window_s) { aligned_latch_ = true; align_done_t_ = now; }
 
-    // Turn AT the dashed crossing: once aligned, a FRESH left/right arrow turns into that
-    // lane ("turn AFTER the dashed lines"); letRecto / no arrow → cross straight. Phase C
-    // consumes the arrow so one crossing = one turn. Matches the Python node.
-    std::string tdir = (aligned_latch_ && p_.turn_sign_only_enabled) ? fresh_turn_sign(now) : "";
-    bool do_turn = (tdir == "left" || tdir == "right");
-
+    // NOTE (ROUND 9.2): the dashed FSM no longer turns — the COMMIT-NUDGE block above owns
+    // all sign turns. Here we only ALIGN → cross STRAIGHT → coast (a no-sign crossing, or a
+    // straight/letRecto). A turn sign is handled before this block ever runs.
     if (!aligned_latch_) {
       // Phase A — forward at approach speed + perpendicular alignment steering.
       cmd.v = cross_speed * std::max(speed_scale_, 1.0);
       cmd.w = align_z;
-    } else if (do_turn && (std::isnan(cross_turn_start_) || (now - cross_turn_start_) < p_.cross_turn_s)) {
-      if (std::isnan(cross_turn_start_)) cross_turn_start_ = now;
-      cmd.v = p_.cross_turn_speed * std::max(speed_scale_, 1.0);
-      cmd.w = (tdir == "left") ? p_.cross_turn_z : -p_.cross_turn_z;
-    } else if (!do_turn && (now - align_done_t_) < openloop_dur) {
+    } else if ((now - align_done_t_) < openloop_dur) {
       cmd.v = cross_speed * std::max(speed_scale_, 1.0);
       cmd.w = 0.0;
     } else {

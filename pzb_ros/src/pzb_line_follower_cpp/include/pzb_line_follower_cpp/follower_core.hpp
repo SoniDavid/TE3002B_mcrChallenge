@@ -105,6 +105,16 @@ struct FollowerParams {
   // FSM is used (backward compatible).
   bool   sign_action_enabled = true;
   std::string sign_action_dir = "";   // set by the node from the package share dir
+
+  // ── COMMIT turn FSM (ROUND 9.2b): center → forward(enter) → ARC nudge → resume follow ──
+  // At a dashed crossing with a fresh sign: stop+center (commit_center_s), drive forward to
+  // enter the intersection (commit_forward_s), then a short ARC nudge (v=commit_speed,
+  // w=±commit_w / 0 straight, for commit_s; swept ≈ commit_w×commit_s) into the branch, then
+  // resume normal line-following which completes the corner closed-loop.
+  //   Tune: commit_forward_s = enter distance; commit_w×commit_s = nudge angle (raise the
+  //   product to turn more; lower commit_w + raise commit_s for slower-same-angle).
+  double commit_speed = 0.04, commit_w = 0.30, commit_s = 2.9, commit_center_s = 0.4;
+  double commit_forward_s = 3.0;
 };
 
 class FollowerCore {
@@ -170,12 +180,17 @@ class FollowerCore {
   bool so_armed_ = true;
   bool so_open_loop_ = false;              // last frame returned an open-loop arc command
 
-  // ── teach-by-demonstration replay (ROUND 9) ──
+  // ── teach-by-demonstration replay (ROUND 9 — dormant, superseded by commit-nudge) ──
   struct ActionSample { double t, vx, wz; };
   std::map<std::string, std::vector<ActionSample>> sign_actions_;  // "left"/"right"/"straight"
   bool action_replay_active_ = false;
   double action_replay_start_ = NAN;       // monotonic time the replay began
   std::string action_replay_sign_;         // which sign is replaying
+
+  // ── commit-nudge turn FSM (ROUND 9.2) ──
+  int commit_phase_ = 0;                   // 0 idle | 1 centering | 2 committing
+  double commit_phase_t_ = NAN;            // time the current phase began
+  std::string commit_dir_;                 // "left"/"right"/"straight"
 
   // ── miniretoS8 reference control-law state (ROUND 8) ──
   double ref_raw_dir_ = 0.0, ref_filtered_dir_ = 0.0, ref_prev_filtered_dir_ = 0.0;

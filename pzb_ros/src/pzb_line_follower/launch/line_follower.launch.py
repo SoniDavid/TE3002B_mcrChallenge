@@ -72,7 +72,12 @@ def generate_launch_description():
     arg_ref_direction_alpha     = DeclareLaunchArgument('ref_direction_alpha',     default_value='0.35',  description='Reference control: raw-direction EMA factor.')
     arg_ref_direction_slew_rate = DeclareLaunchArgument('ref_direction_slew_rate', default_value='10.0',  description='Reference control: max direction change per second (slew).')
     arg_ref_soft_dir_exp        = DeclareLaunchArgument('ref_soft_dir_exp',        default_value='0.75',  description='Reference control: soft-direction exponent — dir·|dir|^exp (gentle near center, firm at large offset).')
-    arg_sign_action_enabled     = DeclareLaunchArgument('sign_action_enabled',     default_value='true',  description='Teach-by-demonstration sign actions: when a fresh turn sign is latched AT a dashed crossing, replay the recorded /cmd_vel maneuver (config/sign_actions/<sign>.csv) open-loop instead of the synthetic arc, then resume line-following. Set false to use the old synthetic cross_turn arc.')
+    arg_sign_action_enabled     = DeclareLaunchArgument('sign_action_enabled',     default_value='false', description='ROUND-9 open-loop /cmd_vel replay — SUPERSEDED by the commit-nudge turn (commit_*). Leave false.')
+    arg_commit_speed            = DeclareLaunchArgument('commit_speed',             default_value='0.04',  description='Commit-nudge turn: forward speed (m/s) during the short directional nudge.')
+    arg_commit_w                = DeclareLaunchArgument('commit_w',                 default_value='0.30',  description='Turn nudge yaw rate (rad/s); left=+, right=-. commit_w×commit_s = swept nudge angle. Lower this + raise commit_s for "slower, same angle".')
+    arg_commit_s                = DeclareLaunchArgument('commit_s',                 default_value='2.9',   description='Arc-nudge duration (s). commit_w×commit_s = swept angle — raise the product to turn MORE. Line-following completes the rest of the corner.')
+    arg_commit_center_s         = DeclareLaunchArgument('commit_center_s',          default_value='0.4',   description='Stop-and-center hold (s) at the dashed entry before advancing, for a repeatable start pose.')
+    arg_commit_forward_s        = DeclareLaunchArgument('commit_forward_s',         default_value='3.0',   description='Forward-ENTER: drive forward (commit_speed) after centering, BEFORE the arc nudge, to enter the intersection. ~commit_speed×this m (0.04×3.0≈12cm). Raise to advance more.')
     arg_publish_compressed      = DeclareLaunchArgument('publish_compressed',      default_value='true',  description='Publish a JPEG /camera/image_compressed off the full frame for off-board YOLO (laptop GPU). Built from the same GStreamer full appsink — no extra camera handle. Only encodes when a subscriber is present, so it costs ~0 until YOLO connects. Default TRUE so YOLO has its feed without the heavy raw stream.')
     arg_jpeg_quality            = DeclareLaunchArgument('jpeg_quality',            default_value='75',    description='JPEG quality (1-100) for /camera/image_compressed')
     arg_publish_raw             = DeclareLaunchArgument('publish_raw',             default_value='false', description='Publish the FULL-res 2.76 MB /camera/image_raw Image. Default FALSE: this heavy publish + its DDS transport + bag recording back-pressured the GStreamer pipeline and froze the WHOLE graph for 1-18 s on the yolo bags (robot drove blind off curves). Off-board YOLO uses /camera/image_compressed instead, so raw is not needed on the robot. Set true only if a subscriber genuinely needs the uncompressed frame.')
@@ -193,6 +198,11 @@ def generate_launch_description():
                 'sign_action_enabled':     LaunchConfiguration('sign_action_enabled'),
                 # Per-sign demonstrated /cmd_vel actions (config/sign_actions/<sign>.csv).
                 'sign_action_dir':         os.path.join(lf_share, 'config', 'sign_actions'),
+                'commit_speed':            LaunchConfiguration('commit_speed'),
+                'commit_w':                LaunchConfiguration('commit_w'),
+                'commit_s':                LaunchConfiguration('commit_s'),
+                'commit_center_s':         LaunchConfiguration('commit_center_s'),
+                'commit_forward_s':        LaunchConfiguration('commit_forward_s'),
                 'topic_cmd_vel':           '/cmd_vel_desired_raw',
                 # Consume the hardware-downscaled stream (CPU fix) — the follower resizes
                 # any input to its 320x80 ROI, and the uniform downscale preserves the
@@ -255,6 +265,11 @@ def generate_launch_description():
         arg_ref_direction_slew_rate,
         arg_ref_soft_dir_exp,
         arg_sign_action_enabled,
+        arg_commit_speed,
+        arg_commit_w,
+        arg_commit_s,
+        arg_commit_center_s,
+        arg_commit_forward_s,
         arg_publish_compressed,
         arg_jpeg_quality,
         arg_publish_raw,

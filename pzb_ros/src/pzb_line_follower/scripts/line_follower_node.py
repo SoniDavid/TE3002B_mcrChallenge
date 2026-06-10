@@ -190,6 +190,19 @@ class LineFollowerNode(Node):
         # (regardless of detections). One sign = one turn — the robot commits to the arc +
         # coast + reacquire and won't re-fire on the SAME sign re-seen while it manoeuvres.
         self.declare_parameter('turn_fire_cooldown_s',    8.0)
+        # Teach-by-demonstration sign actions (ROUND 9): replay a recorded /cmd_vel maneuver
+        # (config/sign_actions/<sign>.csv) open-loop when a fresh turn sign is latched AT a
+        # dashed crossing, then resume line-following. Falls back to the synthetic arc if
+        # disabled or no CSV for the latched sign.
+        self.declare_parameter('sign_action_enabled',     True)
+        self.declare_parameter('sign_action_dir',         '')
+        # Commit-nudge sign turn (ROUND 9.2): at a dashed crossing + fresh sign, stop+center
+        # then a short slow nudge, then resume line-following (it latches the new branch).
+        self.declare_parameter('commit_speed',            0.04)
+        self.declare_parameter('commit_w',                0.30)
+        self.declare_parameter('commit_s',                2.9)
+        self.declare_parameter('commit_center_s',         0.4)
+        self.declare_parameter('commit_forward_s',        3.0)
         # Curve lockout: don't let a sign arc preempt a REAL corner the robot is already
         # taking on the solid line. While the robot is actively cornering (solid line +
         # |median steering error| past curve_lockout_error_px for curve_lockout_frames
@@ -332,6 +345,22 @@ class LineFollowerNode(Node):
         self._turn_sign_rearm_gap_s = float(self.get_parameter('turn_sign_rearm_gap_s').value)
         self._turn_peak_min_area = float(self.get_parameter('turn_peak_min_area').value)
         self._turn_peak_drop_frac = float(self.get_parameter('turn_peak_drop_frac').value)
+        # Teach-by-demonstration sign actions (ROUND 9)
+        self._sign_action_enabled = bool(self.get_parameter('sign_action_enabled').value)
+        self._sign_action_dir = str(self.get_parameter('sign_action_dir').value)
+        self._sign_actions = self._load_sign_actions() if self._sign_action_enabled else {}
+        self._action_replay_active = False
+        self._action_replay_start = None
+        self._action_replay_sign = None
+        # Commit-nudge sign turn (ROUND 9.2) — the active turn model
+        self._commit_speed = float(self.get_parameter('commit_speed').value)
+        self._commit_w = float(self.get_parameter('commit_w').value)
+        self._commit_s = float(self.get_parameter('commit_s').value)
+        self._commit_center_s = float(self.get_parameter('commit_center_s').value)
+        self._commit_forward_s = float(self.get_parameter('commit_forward_s').value)
+        self._commit_phase = 0       # 0 idle | 1 center | 2 fwd-enter | 3 arc-nudge
+        self._commit_phase_t = None
+        self._commit_dir = None
         self._curve_lockout_error_px = float(self.get_parameter('curve_lockout_error_px').value)
         self._curve_lockout_frames = int(self.get_parameter('curve_lockout_frames').value)
         self._turn_sign_area = 0.0       # latest bbox area fraction of the latched turn arrow
@@ -740,7 +769,67 @@ class LineFollowerNode(Node):
         # is OPEN-LOOP and bypasses the control chain (see _so_open_loop + _cmd_publish_cb).
         _so_cmd = None
         self._so_open_loop = False   # default: normal chain; set True only when an arc fires
-        if self._turn_sign_only:
+
+        # ── COMMIT-NUDGE sign turn (ROUND 9.2, the active turn model) ──────────────
+        # Reference (puzzlebot-line-follower) turn: at a dashed crossing with a fresh sign,
+        # STOP+center for commit_center_s, then a SHORT slow nudge (v=commit_speed,
+        # w=±commit_w / 0 straight) for commit_s, then resume normal line-following (it
+        # latches the perpendicular branch). Published via the NORMAL chain (gentle). Mirrors
+        # FollowerCore (C++). _commit_phase: 0 idle | 1 centering | 2 forward-creep | 3 nudge.
+        def _publish_diag():
+            cx_msg = Int32();  cx_msg.data = cx;  self._pub_cx.publish(cx_msg)
+            err_msg = Float32();  err_msg.data = float(cx - self._img_w // 2);  self._pub_error.publish(err_msg)
+            type_msg = String();  type_msg.data = line_type;  self._pub_line_type.publish(type_msg)
+
+        if self._commit_phase == 1:   # STOP-AND-CENTER
+            if (now - self._commit_phase_t) < self._commit_center_s:
+                err = float(cx - self._img_w // 2)
+                cmd = Twist()
+                cmd.linear.x = 0.0
+                cmd.angular.z = max(-self._commit_w, min(self._commit_w, -self._kp * err))
+                self._latest_cmd = cmd;  self._prev_az = cmd.angular.z;  self._error_hist.clear()
+                _publish_diag();  return
+            self._commit_phase = 2;  self._commit_phase_t = now
+        if self._commit_phase == 2:   # FORWARD ENTER — advance into the intersection
+            if (now - self._commit_phase_t) < self._commit_forward_s:
+                cmd = Twist()
+                cmd.linear.x  = self._commit_speed * max(self._speed_scale, 0.0)
+                cmd.angular.z = 0.0
+                self._latest_cmd = cmd;  self._prev_az = 0.0;  self._error_hist.clear()
+                _publish_diag();  return
+            self._commit_phase = 3;  self._commit_phase_t = now
+        if self._commit_phase == 3:   # ARC NUDGE — forward WHILE turning into the branch
+            if (now - self._commit_phase_t) < self._commit_s:
+                cmd = Twist()
+                cmd.linear.x  = self._commit_speed * max(self._speed_scale, 0.0)
+                cmd.angular.z = (self._commit_w if self._commit_dir == 'left'
+                                 else -self._commit_w if self._commit_dir == 'right' else 0.0)
+                self._latest_cmd = cmd;  self._prev_az = cmd.angular.z;  self._error_hist.clear()
+                _publish_diag();  return
+            # done → resume normal line-following (latches the new branch)
+            self._commit_phase = 0;  self._commit_dir = None
+            self._detector.reset_tracker_anchors();  self._err_hist.clear()
+            self._acq_until = now + self._acquire_guard_s
+            self._crossing_active = False
+        # TRIGGER: dashed crossing + fresh sign + not in cooldown → begin stop-and-center
+        if self._commit_phase == 0 and self._turn_sign_only:
+            _at_dashed = (self._crossing_active or line_type == 'dashed')
+            _fs = self._fresh_turn_sign()
+            _in_cooldown = (self._last_turn_fire_t is not None
+                            and (now - self._last_turn_fire_t) < self._turn_fire_cooldown_s)
+            if _at_dashed and not _in_cooldown and _fs in ('left', 'right', 'straight'):
+                self._commit_phase = 1;  self._commit_phase_t = now;  self._commit_dir = _fs
+                self._last_turn_fire_t = now
+                self._turn_sign = None;  self._turn_sign_t = None     # consume
+                self.get_logger().info(f'Commit-nudge turn {_fs.upper()}.')
+                cmd = Twist()
+                self._latest_cmd = cmd;  self._prev_az = 0.0;  self._error_hist.clear()
+                _publish_diag();  return
+
+        # ROUND 9.2: the synthetic peak-area arc below is SUPERSEDED by the commit-nudge
+        # turn (above). Disabled (gated False) — kept parked for reference. The commit-nudge
+        # owns all sign turns now.
+        if False and self._turn_sign_only:
             _in_view = (self._turn_sign_last_seen is not None
                         and (now - self._turn_sign_last_seen) <= self._turn_sign_rearm_gap_s)
             # Curve lockout: if the robot is actively cornering on the REAL solid line
@@ -879,26 +968,15 @@ class LineFollowerNode(Node):
             # arrow → straight cross (unchanged). The arc runs for cross_turn_s, then Phase
             # C consumes the arrow (one crossing = one turn). The arrow's AREA is not the
             # trigger here — being AT the crossing with a fresh arrow is.
-            _turn_dir = (self._fresh_turn_sign()
-                         if (self._aligned_latch and self._turn_sign_only) else None)
-            _do_turn  = _turn_dir in ('left', 'right')
+            # NOTE (ROUND 9.2): the dashed FSM no longer turns — the COMMIT-NUDGE block above
+            # owns all sign turns. Here we only ALIGN → cross STRAIGHT → coast.
+            _do_turn = False
 
             if not self._aligned_latch:
                 # Phase A — align/coast: forward + perpendicular alignment steering.
                 cmd = Twist()
                 cmd.linear.x  = cross_speed * max(self._speed_scale, 1.0)
                 cmd.angular.z = align_z
-            elif _do_turn and (self._cross_turn_start is None
-                               or (now - self._cross_turn_start) < self._cross_turn_s):
-                # Phase B' — open-loop TURN into the indicated lane (YOLO letDerecha/Izquierda).
-                if self._cross_turn_start is None:
-                    self._cross_turn_start = now
-                    self.get_logger().info(
-                        f'Dashed crossing: turning {_turn_dir.upper()} (YOLO turn sign).')
-                cmd = Twist()
-                cmd.linear.x  = self._cross_turn_speed * max(self._speed_scale, 1.0)
-                # left lane = positive yaw (CCW); right lane = negative yaw.
-                cmd.angular.z = self._cross_turn_z if _turn_dir == 'left' else -self._cross_turn_z
             elif not _do_turn and (now - self._align_done_t) < openloop_dur:
                 # Phase B — straight crossing at the approach speed (letRecto / no sign).
                 cmd = Twist()
@@ -1483,6 +1561,39 @@ class LineFollowerNode(Node):
                 and (time.monotonic() - self._turn_sign_t) <= self._sign_stale_s):
             return self._turn_sign
         return None
+
+    def _load_sign_actions(self):
+        """Load sign_action_dir/<sign>.csv (rows t,vx,wz) for left/right/straight.
+
+        Mirrors FollowerCore::load_sign_actions (C++). Missing files are skipped.
+        Returns {sign: [(t, vx, wz), ...]}.
+        """
+        import os
+        actions = {}
+        d = self._sign_action_dir
+        if not d:
+            self.get_logger().warn('sign_action_dir empty — sign-action replay disabled')
+            return actions
+        for sign in ('left', 'right', 'straight'):
+            path = os.path.join(d, f'{sign}.csv')
+            try:
+                rows = []
+                with open(path) as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line[0] in ('t', '#'):
+                            continue
+                        a, b, c = line.split(',')[:3]
+                        rows.append((float(a), float(b), float(c)))
+                if rows:
+                    actions[sign] = rows
+            except FileNotFoundError:
+                continue
+            except Exception as e:
+                self.get_logger().warn(f'sign action {path}: {e}')
+        self.get_logger().info(
+            f'sign actions: loaded {sorted(actions)} from {d}')
+        return actions
 
 
 def main(args=None):

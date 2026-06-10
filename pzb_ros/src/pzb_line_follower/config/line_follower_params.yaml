@@ -151,6 +151,25 @@ line_follower_node:
     # Post-fire cooldown: after a turn fires, block any new sign turn for this long so the
     # same sign re-seen during the arc/coast/reacquire can't re-fire (new_run2 saw it 3×).
     turn_fire_cooldown_s:     8.0
+    # Teach-by-demonstration sign actions (ROUND 9): when a fresh turn sign is latched AT a
+    # dashed crossing, replay the recorded /cmd_vel maneuver (config/sign_actions/<sign>.csv)
+    # open-loop, then resume line-following. sign_action_dir is set by the launch to the
+    # package share config/sign_actions dir. false → use the synthetic cross_turn arc.
+    # ROUND 9.2: the open-loop replay is SUPERSEDED by the commit-nudge turn (below) — off.
+    sign_action_enabled:      false
+    # Commit-nudge sign turn: at a dashed crossing with a fresh sign, stop+center for
+    # commit_center_s, then a short slow nudge (commit_speed, commit_w; 0 for straight) for
+    # commit_s, then resume line-following (it latches the new branch). Reference values
+    # (puzzlebot-line-follower); tune on-robot if it under/over-rotates before latching.
+    # Turn pipeline: center → forward-enter (commit_forward_s) → ARC nudge (forward while
+    # turning, commit_w×commit_s swept) → resume line-following (completes the corner).
+    # commit_w×commit_s = nudge angle (raise product to turn more; lower commit_w + raise
+    # commit_s for slower-same-angle). commit_speed = forward speed during enter + nudge.
+    commit_speed:             0.04
+    commit_w:                 0.30
+    commit_s:                 2.9
+    commit_center_s:          0.4
+    commit_forward_s:         3.0
     # turn_peak_min_area lowered 0.08 -> 0.03 (ROUND 7): new_run3's right-arrow lay TILTED on
     # the mat, so its bbox area_frac peaked at only 0.039 even at the closest point — 0.08
     # would never fire. new_run1/2 (upright signs) peak 0.23/0.35, so 0.03 still fires there.

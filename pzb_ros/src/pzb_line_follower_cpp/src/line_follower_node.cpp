@@ -130,6 +130,12 @@ class LineFollowerNode : public rclcpp::Node {
     // Teach-by-demonstration sign actions (ROUND 9)
     p.sign_action_enabled = gd("sign_action_enabled", p.sign_action_enabled);
     p.sign_action_dir = gd("sign_action_dir", std::string(""));
+    // Commit-nudge sign turn (ROUND 9.2)
+    p.commit_speed = gd("commit_speed", p.commit_speed);
+    p.commit_w = gd("commit_w", p.commit_w);
+    p.commit_s = gd("commit_s", p.commit_s);
+    p.commit_center_s = gd("commit_center_s", p.commit_center_s);
+    p.commit_forward_s = gd("commit_forward_s", p.commit_forward_s);
     std::string turn_sign_topic = gd("turn_sign_topic", std::string("/yolo/turn_sign"));
     std::string topic_in = gd("topic_image_in", std::string("/camera/image_small"));
     std::string topic_cmd = gd("topic_cmd_vel", std::string("/cmd_vel_desired_raw"));
@@ -161,7 +167,14 @@ class LineFollowerNode : public rclcpp::Node {
         [this](std_msgs::msg::Float32::SharedPtr m) { core_->set_speed_scale(m->data); });
     sub_sign_ = create_subscription<std_msgs::msg::String>(
         turn_sign_topic, rclcpp::QoS(10),
-        [this](std_msgs::msg::String::SharedPtr m) { core_->set_yolo_sign(m->data, now_s()); });
+        // Stamp the sign with cur_t_ (the IMAGE HEADER clock that process_frame uses), NOT
+        // now_s() (steady_clock). They are different epochs (header ≈ wall/ROS ~1.78e9 vs
+        // steady ~1e5), so stamping with now_s() made fresh_turn_sign() always see the sign
+        // as stale → the replay / peak-turn / dashed-FSM sign triggers NEVER fired (the
+        // ROUND-9 on-robot failure). cur_t_ is 0 until the first frame — skip until then.
+        [this](std_msgs::msg::String::SharedPtr m) {
+          if (cur_t_ > 0.0) core_->set_yolo_sign(m->data, cur_t_);
+        });
 
     timer_ = create_wall_timer(std::chrono::milliseconds(50),
                                std::bind(&LineFollowerNode::on_timer, this));
