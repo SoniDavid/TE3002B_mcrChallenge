@@ -6,6 +6,105 @@ import numpy as np
 import cv2
 
 
+# ── miniretoS8 reference center-pick helpers (ROUND 8) ────────────────────────
+# Faithful ports of line_detector2.py (_threshold_dark / _scan_band_centers /
+# _fallback_contour_center). The zebra guard is intentionally omitted.
+def _odd_ge(v):
+    v = max(3, int(v))
+    return v if v % 2 == 1 else v + 1
+
+
+def _ref_threshold_dark(roi):
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    block = _odd_ge(min(151, max(41, roi.shape[1] // 5)))
+    adaptive = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                     cv2.THRESH_BINARY_INV, block, 8)
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    dark_v = cv2.inRange(hsv[:, :, 2], 0, 115)
+    mask = cv2.bitwise_or(adaptive, dark_v)
+    mask = cv2.erode(mask, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE,
+                            cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)), iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
+                            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
+    return mask
+
+
+def _ref_find_runs(b):
+    runs, in_run, s = [], False, 0
+    for i, v in enumerate(b):
+        if v and not in_run:
+            s, in_run = i, True
+        elif not v and in_run:
+            runs.append((s, i - 1)); in_run = False
+    if in_run:
+        runs.append((s, len(b) - 1))
+    return runs
+
+
+def _ref_scan_bands(mask, prev_cx_roi):
+    roi_h, roi_w = mask.shape[:2]
+    centers = []
+    expected = prev_cx_roi if prev_cx_roi is not None else roi_w / 2.0
+    for r0, r1, bw in [(0.82, 1.00, 1.00), (0.68, 0.84, 0.85), (0.54, 0.70, 0.65),
+                       (0.40, 0.56, 0.45), (0.26, 0.42, 0.30)]:
+        y0, y1 = int(r0 * roi_h), int(r1 * roi_h)
+        band = mask[y0:y1, :]
+        if band.size == 0:
+            continue
+        if cv2.countNonZero(band) / float(band.size) > 0.55:
+            continue
+        col = np.sum(band > 0, axis=0).astype(np.float32)
+        if float(np.max(col)) < 3.0:
+            continue
+        col = cv2.GaussianBlur(col.reshape(1, -1), (1, 31), 0).flatten()
+        thr = max(3.0, 0.32 * float(np.max(col)))
+        valid = []
+        for x0, x1 in _ref_find_runs(col > thr):
+            width = x1 - x0 + 1
+            if width < 5 or width > 0.58 * roi_w:
+                continue
+            valid.append((0.5 * (x0 + x1), float(np.max(col[x0:x1 + 1])), width))
+        if not valid:
+            continue
+        valid.sort(key=lambda r: r[0])
+        if len(valid) >= 3:
+            cx, peak, width = valid[len(valid) // 2]
+        else:
+            cx, peak, width = min(valid, key=lambda r: abs(r[0] - expected))
+        expected = cx
+        wq = 1.0 - min(1.0, width / (0.58 * roi_w))
+        centers.append((cx, bw * peak * (1.0 + 0.1 * wq)))
+    return centers
+
+
+def _ref_fallback_center(mask, prev_cx_roi):
+    roi_h, roi_w = mask.shape[:2]
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    expected = prev_cx_roi if prev_cx_roi is not None else roi_w / 2.0
+    best, best_score = None, -1.0
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < 120:
+            continue
+        x, y, w, h = cv2.boundingRect(cnt)
+        if w > 0.65 * roi_w and h < 0.30 * roi_h:
+            continue
+        if h < 6:
+            continue
+        M = cv2.moments(cnt)
+        if M['m00'] == 0:
+            continue
+        cx = float(M['m10'] / M['m00'])
+        score = area * (0.55 * (y + h) / roi_h + 0.45 * (1.0 - min(1.0, abs(cx - expected) / (0.5 * roi_w))))
+        if score > best_score:
+            best_score, best = score, cx
+    return best
+
+
 class CenterLineDetector:
     """
     v4 — three-line tracker + dashed-line (intersection) detection.
@@ -64,42 +163,15 @@ class CenterLineDetector:
     TRACK_MIN_SEP  = 40     # px — minimum gap enforced *during* triplet/pair search
     STALE_THRESH   = 15     # frames lost before clearing a line's anchor
 
-    # ── lane-center tracking (bad_ignment5 curve fix) ─────────────────────────
-    # The robot follows the LANE CENTER (midpoint of the left/right boundary lines),
-    # which stays stable through a curve, instead of the 'center' SLOT, which can
-    # swap identity on a curve and teleport the target. A half-width memory lets us
-    # infer the lane center when only one boundary is visible, and a rate-based jump
-    # guard rejects a teleport (hold the previous lane center instead).
-    LANE_CENTER_JUMP_PS    = 1000  # px/s — max plausible lane-center motion on a curve
-                                   # (lowered 1500→1000, opt-bags center-loss fix: at
-                                   # 17 fps the old bound was ≈88 px/frame so the ~45 px
-                                   # opt9 slot-swap flicker passed undamped)
+    # ── lane-center tracking (lean rewrite) ───────────────────────────────────
+    # The robot follows the LANE CENTER = midpoint of the left/right boundaries.
+    # half-width memory infers where center is when only one boundary is visible.
     LANE_HALFWIDTH_MEDIAN_N = 7    # frames of (R−L)/2 to median for half-width memory
-    LANE_CENTER_MEDIAN_N    = 3    # frames of lane-center to median (kills a 1-frame swap
-                                   # that slips under the jump guard, opt-bags fix)
-
-    # ── fork branch selection (pzb_not_workingcorrectly4) ─────────────────────
-    # At a Y-fork the lane-center (L+R)/2 averages the two diverging branches into a
-    # straight-ahead target and the robot misses the turn. Detect the fork from
-    # DIVERGING HEADINGS (two branches whose heading angles splay apart, unlike
-    # parallel lane boundaries which run near-parallel) and SELECT the branch that
-    # best continues the approach heading (track continuity), instead of averaging.
-    # All thresholds in ROI px (320×80).
-    # Discriminator: a normal lane-boundary PAIR converges toward the top of the ROI
-    # under perspective (top separation < base separation, ratio ≈ 0.55–0.63 measured).
-    # A real FORK splays its branches OUTWARD, cancelling perspective convergence, so
-    # the top stays as wide as the base (ratio ≈ 0.72–0.86 measured). Trigger only
-    # when top_sep ≥ FORK_TOP_BASE_RATIO × base_sep — apparent slope-angle difference
-    # ALONE does NOT work here (the oblique camera makes a normal right boundary lean
-    # ~50° vs a vertical left boundary, so every lane pair would look like a fork).
-    FORK_TOP_MIN_SEP    = 90    # px — branch top-x's apart by this ⇒ truly distinct lines
-    FORK_TOP_BASE_RATIO = 0.70  # top_sep/base_sep ≥ this ⇒ splaying (fork), not converging pair
-    FORK_MIN_BASE_SEP   = 80    # px — branches must be a real pair, not one line counted twice
-    FORK_MIN_AREA       = 600   # px² — both branches must be substantial lines, not stubs
-    FORK_MIN_YSPAN_FRAC = 0.60  # each branch must span ≥ this fraction of ROI height
-    FORK_TIE_DEG        = 8.0   # deg — continuity tie window ⇒ fall back to least-turn
-    FORK_BAND_FRAC      = 0.40  # fraction of ROI height for the lower/upper sampling bands
-    APPROACH_SLOPE_EMA  = 0.4   # EMA weight for the tracked approach heading slope
+    # When only ONE boundary is visible, move the center target only this fraction of
+    # the way from the prior center toward the inferred (one-line+half-width) target.
+    # <1 keeps the robot near center and pulls the lane back into view instead of
+    # committing to a far single-line offset and drifting off (no_turning_well fix).
+    SINGLE_LINE_PULL = 0.5
 
     # ── intersection detection ────────────────────────────────────────────────
     # Relaxed from original (3, 2000, 40, 0.50) to handle this track's dash geometry:
@@ -188,17 +260,14 @@ class CenterLineDetector:
                                 for k in ('left', 'center', 'right')}
         self._line_lost_frames = {'left': 0, 'center': 0, 'right': 0}
 
-        # Lane-center tracking state (bad_ignment5 curve fix)
-        self._lane_center      = None                          # last lane-center cx
-        self._halfwidth_hist   = deque(maxlen=self.LANE_HALFWIDTH_MEDIAN_N)
-        self._lane_center_hist = deque(maxlen=self.LANE_CENTER_MEDIAN_N)
-
-        # Fork branch-selection state (pzb_not_workingcorrectly4)
-        self._approach_slope       = 0.0    # EMA of the followed line's heading slope (Δx/Δy)
-        self.branch_select_enabled = False  # node enables per-frame via fork_select_enabled param
-        self.fork_active           = False  # True on a frame where a fork was selected
-        self.fork_choice           = None   # 'left'/'right' branch picked (debug)
-        self._fork_branches        = None   # [(cx_bot, cx_top, slope, contour), ...] (debug)
+        # Lane-center tracking state (lean rewrite)
+        self.prev_center     = None                            # last lane-center cx
+        self._halfwidth_hist = deque(maxlen=self.LANE_HALFWIDTH_MEDIAN_N)
+        # True when this frame's center came from BOTH boundaries (a confident lane
+        # center). False ⇒ <2 boundaries → the node should slow to regain the lane.
+        self.centering       = False
+        # Retained no-op for node compatibility (fork selection removed in lean rewrite).
+        self.branch_select_enabled = False
 
         # Intersection / exit state
         self.line_type     = "solid"
@@ -240,14 +309,48 @@ class CenterLineDetector:
         self.history.clear()
         self.prev_cx = float(self.cameraWidth // 2)
         # Reset lane-center state so a post-intersection curve starts fresh.
-        self._lane_center = None
+        self.prev_center = None
         self._halfwidth_hist.clear()
-        self._lane_center_hist.clear()
-        # Reset fork/approach state — a post-intersection branch starts fresh.
-        self._approach_slope = 0.0
-        self.fork_active     = False
-        self.fork_choice     = None
-        self._fork_branches  = None
+        self.centering   = False
+
+    # ── miniretoS8 reference center-pick (ROUND 8) ────────────────────────────
+    def ref_center_line(self, roi_bgr, prev_direction):
+        """Reference 5-band center-pick → normalized direction ∈ [-1,1] (negative=left).
+
+        Faithful port of line_detector2.py (_threshold_dark + _scan_band_centers +
+        _fallback_contour_center); the zebra guard is OMITTED (the dashed-FSM + YOLO
+        handle crossings). Independent of the slot tracker, used as the LINE-FOLLOW
+        steering source when the node runs in reference-control mode. Returns
+        (direction, found).
+        """
+        h, w = roi_bgr.shape[:2]
+        crop_x0, crop_x1 = int(w * 0.05), int(w * 0.95)
+        roi = roi_bgr[:, crop_x0:crop_x1]
+        mask = _ref_threshold_dark(roi)
+        roi_w = mask.shape[1]
+
+        prev_cx_roi = None
+        if prev_direction is not None:
+            prev_cx_full = (prev_direction + 1.0) * (w / 2.0)
+            prev_cx_roi = max(0.0, min(float(roi_w - 1), prev_cx_full - crop_x0))
+
+        centers = _ref_scan_bands(mask, prev_cx_roi)
+        cx_roi = roi_w / 2.0
+        found = False
+        if centers:
+            ws = sum(c * s for c, s in centers)
+            wt = sum(s for _, s in centers)
+            cx_roi = ws / max(1e-6, wt)
+            found = (min(1.0, len(centers) / 4.0) > 0.15) or len(centers) >= 1
+        else:
+            fb = _ref_fallback_center(mask, prev_cx_roi)
+            if fb is not None:
+                cx_roi = fb
+                found = True
+
+        cx_full = max(0.0, min(float(w - 1), cx_roi + crop_x0))
+        direction = (cx_full / (w / 2.0)) - 1.0
+        return max(-1.0, min(1.0, float(direction))), found
 
     # ── main entry point ──────────────────────────────────────────────────────
 
@@ -345,13 +448,18 @@ class CenterLineDetector:
             cx, cy     = self._track_three_lines(valid, w, roi_h, y_start, _max_jump)
             self.exits = []
 
-        # Brown lane-interior constraint: detect lane centroid and blend cx if needed
+        # Brown lane-interior constraint: detect lane centroid and blend cx if needed.
+        # SKIPPED entirely when the blend is disabled (LANE_BLEND_THR == 9999): the
+        # detector ran an HSV cvtColor + inRange + moments every frame and then threw the
+        # result away (CPU-fix). Reuses the ROI-HSV already computed for the white mask.
         self.lane_correction = False
-        lane_cx, lane_valid = self._detect_lane_interior(roi)
-        self.lane_cx = lane_cx if lane_valid else None
-        if lane_valid and abs(cx - lane_cx) > self.LANE_BLEND_THR:
-            cx = int(round((cx + lane_cx) / 2.0))
-            self.lane_correction = True
+        self.lane_cx = None
+        if self.LANE_BLEND_THR < 9999:
+            lane_cx, lane_valid = self._detect_lane_interior(roi, roi_hsv)
+            self.lane_cx = lane_cx if lane_valid else None
+            if lane_valid and abs(cx - lane_cx) > self.LANE_BLEND_THR:
+                cx = int(round((cx + lane_cx) / 2.0))
+                self.lane_correction = True
 
         # Global history for classifier anchor
         self.history.append(cx)
@@ -367,7 +475,7 @@ class CenterLineDetector:
 
     # ── brown lane-interior helper ────────────────────────────────────────────
 
-    def _detect_lane_interior(self, roi):
+    def _detect_lane_interior(self, roi, roi_hsv=None):
         """
         Detect the brownish/tan lane surface in the ROI.
 
@@ -377,9 +485,12 @@ class CenterLineDetector:
 
         Calibrate LANE_HSV_LO / LANE_HSV_HI for the specific track mat color.
 
+        :param roi_hsv: optional precomputed BGR2HSV of `roi` (the caller already
+                        converts it for the white mask) — reused to avoid a second
+                        cvtColor per frame.
         :return: (lane_cx_int, valid_bool)
         """
-        hsv  = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        hsv  = roi_hsv if roi_hsv is not None else cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, self.LANE_HSV_LO, self.LANE_HSV_HI)
         pix  = int(mask.sum()) // 255
         if pix < self.LANE_MIN_PIX:
@@ -601,120 +712,6 @@ class CenterLineDetector:
                 exits.append(name)
         return exits
 
-    # ── fork branch selection (pzb_not_workingcorrectly4) ─────────────────────
-
-    def _branch_descriptor(self, cnt, h):
-        """For one contour, return (cx_bottom, cx_top, slope_px, yspan) in ROI px.
-
-        cx_bottom / cx_top = mean x of the contour points in the bottom / top band
-        (FORK_BAND_FRAC of ROI height). slope_px = Δx/Δy heading (x as a function of
-        y) fit over ALL contour points via least squares; sign = turn direction
-        (positive ⇒ line leans toward larger x as it goes UP the image). yspan = the
-        contour's vertical extent (used to reject short stubs as fork branches).
-        Returns None if the contour does not span both bands.
-        """
-        pts = cnt.reshape(-1, 2).astype(np.float64)
-        xs, ys = pts[:, 0], pts[:, 1]
-        band = self.FORK_BAND_FRAC * h
-        y_lo_max = h - band          # bottom band: y >= this (near the robot)
-        y_hi_min = band              # top band:    y <= this (far from the robot)
-        bot = pts[ys >= y_lo_max]
-        top = pts[ys <= y_hi_min]
-        if len(bot) == 0 or len(top) == 0:
-            return None
-        cx_bottom = float(bot[:, 0].mean())
-        cx_top    = float(top[:, 0].mean())
-        yspan = float(ys.max() - ys.min())
-        # slope = dx/dy (lines are near-vertical, so fit x on y). Guard tiny y-span.
-        if yspan < 1.0:
-            return None
-        slope_px = float(np.polyfit(ys, xs, 1)[0])
-        return (cx_bottom, cx_top, slope_px, yspan)
-
-    @staticmethod
-    def _slope_to_deg(slope_px):
-        # ROI is anisotropically resized; the dashed-alignment path divides by 0.889
-        # to recover a real angle. Here we only COMPARE branch slopes to each other
-        # and to the approach slope (all in the same ROI-px space), so a plain atan
-        # is a monotonic, sufficient angle proxy for the thresholds.
-        return math.degrees(math.atan(slope_px))
-
-    def _detect_fork(self, valid, w, h):
-        """Splaying-pair fork detector.
-
-        Discriminator (see FORK_TOP_BASE_RATIO): a normal lane-boundary PAIR converges
-        toward the top of the ROI under perspective (top_sep < base_sep), whereas a
-        FORK splays its branches outward so the top stays ~as wide as the base
-        (top_sep ≈ base_sep, even slightly wider). Apparent slope-angle difference is
-        NOT usable on this oblique camera — a vertical left boundary vs a perspective-
-        leaned right boundary already differ ~50° in a plain lane.
-
-        A fork requires two SUBSTANTIAL branches (area ≥ FORK_MIN_AREA, span ≥
-        FORK_MIN_YSPAN_FRAC of ROI height, distinct: base_sep ≥ FORK_MIN_BASE_SEP and
-        top_sep ≥ FORK_TOP_MIN_SEP) whose top/base separation ratio ≥
-        FORK_TOP_BASE_RATIO (they do not converge with perspective).
-
-        Returns (is_fork, [branchA, branchB]) — the widest-at-top qualifying pair.
-        Each branch is (cx_bottom, cx_top, slope_px, yspan). When not: (False, []).
-        """
-        min_yspan = self.FORK_MIN_YSPAN_FRAC * h
-        descs = []
-        for v in valid:
-            if v[2] < self.FORK_MIN_AREA:
-                continue
-            d = self._branch_descriptor(v[3], h)
-            if d is not None and d[3] >= min_yspan:
-                descs.append(d)
-        if len(descs) < 2:
-            return False, []
-
-        best = None  # (top_sep, A, B)
-        for i in range(len(descs)):
-            for j in range(i + 1, len(descs)):
-                A, B = descs[i], descs[j]
-                base_sep = abs(A[0] - B[0])
-                top_sep  = abs(A[1] - B[1])
-                if (base_sep >= self.FORK_MIN_BASE_SEP and
-                        top_sep >= self.FORK_TOP_MIN_SEP and
-                        top_sep >= self.FORK_TOP_BASE_RATIO * base_sep):
-                    if best is None or top_sep > best[0]:
-                        best = (top_sep, A, B)
-        if best is None:
-            return False, []
-        return True, [best[1], best[2]]
-
-    def _select_fork_branch(self, branches, ref_cx):
-        """Pick the branch that best continues the line the robot is ALREADY on.
-
-        Continuity is dominated by BASE PROXIMITY: the branch whose base (cx_bottom)
-        is nearest the reference center the robot was tracking (ref_cx = the prior
-        lane-center / prev_cx) is the branch the robot is physically on. This is far
-        more stable than matching the branch heading slope to a lagging approach-EMA
-        — once the robot is on the left curve, the left branch's slope steepens past
-        the EMA and a slope-only match wrongly flips to the straighter (wrong) branch
-        (observed in pzb_not_workingcorrectly4 at t≈22.65). The approach-heading slope
-        is used only as a TIEBREAK when both bases are near-equidistant.
-
-        Returns (cx_bottom, slope_px, choice_str) for the chosen branch.
-        """
-        appr = self._approach_slope
-        by_base = sorted(branches, key=lambda b: abs(b[0] - ref_cx))
-        best, second = by_base[0], by_base[1]
-        # Near-equidistant bases → tiebreak by heading continuity (slope vs approach),
-        # then by least-turn (straightest) if still tied.
-        if abs(abs(best[0] - ref_cx) - abs(second[0] - ref_cx)) <= self.FORK_TOP_MIN_SEP:
-            by_head = sorted(branches, key=lambda b: abs(b[2] - appr))
-            h0, h1 = by_head[0], by_head[1]
-            if abs(abs(h0[2] - appr) - abs(h1[2] - appr)) <= \
-                    abs(math.tan(math.radians(self.FORK_TIE_DEG))):
-                best = min(branches, key=lambda b: abs(b[2]))
-            else:
-                best = h0
-        # Label by which side the chosen branch leans (smaller cx_bottom ⇒ left).
-        other = max(branches, key=lambda b: abs(b[0] - best[0]))
-        choice = 'left' if best[0] <= other[0] else 'right'
-        return best[0], best[2], choice
-
     # ── three-line tracker ────────────────────────────────────────────────────
 
     def _best_assignment(self, xs, w):
@@ -802,26 +799,31 @@ class CenterLineDetector:
 
         detections = self._best_assignment(xs, w)
 
-        # ── Velocity gate + median filter ─────────────────────────────────────
+        # ── Velocity gate (CLAMP, don't discard) + median filter ──────────────
+        # Lean-rewrite (no_turning fix): the old gate DROPPED a line whenever its
+        # detection jumped > max_jump, and the ordering block flagged whole pairs lost.
+        # On bag2 that discarded detectable lines in 18-23% of frames (≥2 contours
+        # present but tracker reported ≤1), so the robot rode a single boundary and
+        # drifted off. Instead of discarding, CLAMP the accepted position to at most
+        # max_jump from the previous anchor: a real fast move still advances (capped)
+        # and the line stays TRACKED, while a one-frame teleport is bounded. The line
+        # is only "not visible" when there is genuinely no detection for that slot.
         for name in ('left', 'center', 'right'):
             new_cx = detections[name]
             prev   = self.line_positions[name]
 
             if new_cx is None:
                 self.line_flags[name] = False
-            elif prev is not None and abs(new_cx - prev) > max_jump:
-                self.line_flags[name] = False
+                continue
+            if prev is not None and abs(new_cx - prev) > max_jump:
+                new_cx = prev + (max_jump if new_cx > prev else -max_jump)
+            self._line_history[name].append(new_cx)
+            if len(self._line_history[name]) < self.MEDIAN_K:
+                smoothed = int(round(new_cx))
             else:
-                self._line_history[name].append(new_cx)
-                # Use the raw detection directly when the history is short
-                # (median of 1 or 2 values) so new acquisitions take effect
-                # immediately instead of being outvoted by stale history.
-                if len(self._line_history[name]) < self.MEDIAN_K:
-                    smoothed = int(round(new_cx))
-                else:
-                    smoothed = int(np.median(self._line_history[name]))
-                self.line_positions[name] = float(smoothed)
-                self.line_flags[name]     = True
+                smoothed = int(np.median(self._line_history[name]))
+            self.line_positions[name] = float(smoothed)
+            self.line_flags[name]     = True
 
         # ── Stale anchor reset ────────────────────────────────────────────────
         for name in ('left', 'center', 'right'):
@@ -834,139 +836,75 @@ class CenterLineDetector:
                     self._line_history[name].clear()
                     self._line_lost_frames[name] = 0
 
-        # ── Enforce ordering; flag violating pair lost but keep anchors ──────
-        # Positions and history are preserved so the next frame's assignment
-        # still has a realistic reference. Clearing them forces fallback to
-        # extreme defaults (0 / 160 / 319) causing wrong-slot assignments.
+        # ── Enforce ordering; drop only the LESS-trusted side of a bad pair ────
+        # Lean-rewrite: the old code flagged BOTH lines of an out-of-order pair lost,
+        # throwing away a good boundary on every transient overlap. Keep the line with
+        # the longer history (more trusted) visible and drop only the other, so we never
+        # lose both boundaries to a single ordering glitch. Anchors are preserved.
         lp = self.line_positions
         for a, b in (('left', 'center'), ('center', 'right')):
             if (lp[a] is not None and lp[b] is not None and
                     lp[a] >= lp[b] - self.LINE_MIN_SEP):
-                for name in (a, b):
-                    self.line_flags[name] = False
-                    # _line_lost_frames increments in the stale block above;
-                    # stale-reset will expire the anchor after STALE_THRESH frames.
+                drop = a if len(self._line_history[a]) <= len(self._line_history[b]) else b
+                self.line_flags[drop] = False
                 break
 
-        # ── Return lane-center (bad_ignment5 curve fix) ───────────────────────
-        # The robot follows the LANE CENTER (midpoint of the boundary lines), which
-        # stays stable through a curve, NOT the 'center' SLOT, which can swap
-        # identity on a curve and teleport the target (observed 117→244 on a bend).
+        # ── Lane center = midpoint of the two boundaries ──────────────────────
+        # LEAN REWRITE (no_turning_well fix). The robot follows the LANE CENTER, the
+        # midpoint of the left/right boundaries. The previous version stacked a learned
+        # half-width, a continuity-sign single-boundary inference, a fork branch
+        # selector, a dt-scaled jump guard and a lane-center median — ~100 lines that
+        # (a) cost memory/CPU and (b) made the robot ride one boundary off-center when
+        # the inference picked the wrong side. Replaced with three plain cases:
+        #   both boundaries  → (L+R)/2 and learn the half-width,
+        #   one boundary     → BIAS BACK TOWARD CENTER (do not commit to a far offset):
+        #                      step the target from the prior center toward the lane side
+        #                      by a bounded amount so the missing boundary comes back into
+        #                      frame, instead of locking onto a single line and drifting,
+        #   none             → hold the prior center.
+        # cx_pull (set here) tells the node to ALSO slow down while <2 boundaries are
+        # visible so the lane is regained rather than driven past.
         lp = self.line_positions
         L, C, R = lp['left'], lp['center'], lp['right']
-        L_ok = self.line_flags['left']   and L is not None
-        R_ok = self.line_flags['right']  and R is not None
+        L_ok = self.line_flags['left']  and L is not None
+        R_ok = self.line_flags['right'] and R is not None
 
-        # ── Fork branch selection (pzb_not_workingcorrectly4) ─────────────────
-        # At a Y-fork, (L+R)/2 averages the two diverging branches into a
-        # straight-ahead target and the robot misses the turn. Detect the fork from
-        # diverging-branch geometry and steer toward the branch that CONTINUES the
-        # approach heading. Gated off while the node is squaring up to a dashed
-        # crossing (branch_select_enabled=False) so it never fights the alignment.
-        self.fork_active    = False
-        self.fork_choice    = None
-        self._fork_branches = None
-        fork_cx = None
-        if self.branch_select_enabled:
-            is_fork, branches = self._detect_fork(valid, w, h)
-            if is_fork:
-                # Reference = the line the robot is already on (prior lane-center).
-                ref_cx = self._lane_center if self._lane_center is not None else (
-                    self.prev_cx if self.prev_cx is not None else w / 2.0)
-                fork_cx, _bslope, choice = self._select_fork_branch(branches, ref_cx)
-                self.fork_active    = True
-                self.fork_choice    = choice
-                self._fork_branches = branches
+        prev_center = (self.prev_center if self.prev_center is not None
+                       else (self.prev_cx if self.prev_cx is not None else w / 2.0))
 
-        # Continuity reference: where the lane-center was last frame (which side of the
-        # lane the robot is in). Used to lock the single-boundary offset SIGN below.
-        prev_center = self._lane_center if self._lane_center is not None else (
-            self.prev_cx if self.prev_cx is not None else w / 2.0)
-
-        if fork_cx is not None:
-            # Steer toward the chosen branch's base; do NOT learn half-width here
-            # (the branches are diverging, not a parallel lane pair).
-            cx_center = float(fork_cx)
-        elif L_ok and R_ok:
-            # Both boundaries: lane-center = midpoint; learn the lane half-width. This
-            # track's lane is WIDE (boundaries ~270 px apart in the 320 ROI), so the
-            # half-width is legitimately large — do NOT reject it.
+        if L_ok and R_ok:
             cx_center = (L + R) / 2.0
             self._halfwidth_hist.append((R - L) / 2.0)
-        elif (L_ok or R_ok) and len(self._halfwidth_hist) > 0:
-            # One boundary visible (the other left the frame on a curve): infer the
-            # lane-center from the learned half-width. OPT-BAGS WRONG-SIDE FIX — the offset
-            # SIGN is locked by CONTINUITY (offset from the visible line TOWARD the prior
-            # lane-center), NOT the per-frame L/R slot label. The old `(L+hw)/(R−hw)` used
-            # the slot label, which flips on a curve and threw the center to the EMPTY far
-            # side of the only line (opt12: the right boundary at 286 got labeled R →
-            # R−hw=152 when labeled right but +hw=420/off-screen when mislabeled; the
-            # continuity sign gives 286−hw=152 regardless of the label). This keeps the
-            # center on the lane side of the line and is continuous with the (L+R)/2 pair.
-            hw = float(np.median(self._halfwidth_hist))
+            self.centering = True
+        elif (L_ok or R_ok):
+            # One boundary: aim for where the center SHOULD be (visible line offset by the
+            # learned half-width toward the lane), but only move PART WAY from the prior
+            # center so a wrong/short-lived single-line reading can't throw the target to
+            # the far edge. This keeps us near center and pulls the lane back into view.
             X = float(L if L_ok else R)
-            side = 1.0 if X < prev_center else -1.0   # +1 ⇒ center is right of the line
-            cx_center = X + side * hw
+            hw = (float(np.median(self._halfwidth_hist))
+                  if len(self._halfwidth_hist) > 0 else w * 0.4)
+            side = 1.0 if X < prev_center else -1.0     # center is on the lane side of X
+            target = X + side * hw
+            cx_center = prev_center + self.SINGLE_LINE_PULL * (target - prev_center)
+            self.centering = False
         elif C is not None and self.line_flags['center']:
-            # No usable boundary — fall back to the center slot if it is real.
             cx_center = float(C)
-        elif self._lane_center is not None:
-            cx_center = self._lane_center
-        elif self.prev_cx is not None:
-            cx_center = self.prev_cx
+            self.centering = False
         else:
-            cx_center = w / 2.0
+            cx_center = prev_center
+            self.centering = False
 
-        # Continuity / jump guard: a slot-swap can still teleport the target. Reject
-        # a one-frame lane-center move larger than a curve-plausible bound and hold
-        # the previous lane-center instead. Bound scales with dt like the line gate
-        # (max_jump is LINE_MAX_JUMP_PS×dt px/frame; scale to the lane bound).
-        lane_bound = max_jump * (self.LANE_CENTER_JUMP_PS / self.LINE_MAX_JUMP_PS)
-        if (self._lane_center is not None
-                and abs(cx_center - self._lane_center) > lane_bound):
-            # Move at most lane_bound toward the new estimate (damp the teleport).
-            step = lane_bound if cx_center > self._lane_center else -lane_bound
-            cx_center = self._lane_center + step
+        # Light smoothing: one-frame median against the previous center kills a single
+        # slot-swap frame without the multi-frame lag the old median stack added.
+        if self.prev_center is not None:
+            cx_center = 0.5 * (cx_center + self.prev_center) if abs(cx_center - self.prev_center) > w * 0.25 else cx_center
 
-        # Lane-center median smoothing (opt-bags center-loss fix): a ~45 px slot-swap
-        # slips UNDER the jump guard above at low fps, so the 'center' still flickered
-        # frame-to-frame (opt9 cx 113↔160). Median the last LANE_CENTER_MEDIAN_N values
-        # so a single-frame swap is outvoted while a sustained curve (consistent move ≥
-        # ceil(n/2) frames) tracks through with ≤1 frame lag.
-        self._lane_center_hist.append(cx_center)
-        if len(self._lane_center_hist) >= 2:
-            cx_center = float(np.median(self._lane_center_hist))
-
-        self._lane_center = float(cx_center)
-        # Keep the center slot anchored at the lane-center so next-frame assignment
-        # has a realistic reference (prevents the swap from re-seeding badly).
+        self.prev_center = float(cx_center)
         self.line_positions['center'] = float(cx_center)
-
-        # Update the approach-heading EMA: slope of the contour the robot is now
-        # following (the one whose base is closest to the chosen lane-center). This
-        # is the "where I'm heading" estimate the fork selector matches branches to.
-        self._update_approach_slope(valid, cx_center, h)
 
         cy = y_start + (h - y_start) // 2
         return max(0, min(w - 1, int(round(cx_center)))), cy
-
-    def _update_approach_slope(self, valid, cx_center, h):
-        """EMA-track the heading slope (Δx/Δy) of the line nearest cx_center."""
-        best_d = None
-        best_slope = None
-        for v in valid:
-            if v[2] < self.FORK_MIN_AREA:
-                continue
-            d = self._branch_descriptor(v[3], h)
-            if d is None:
-                continue
-            dist = abs(d[0] - cx_center)
-            if best_d is None or dist < best_d:
-                best_d = dist
-                best_slope = d[2]
-        if best_slope is not None:
-            a = self.APPROACH_SLOPE_EMA
-            self._approach_slope = (1.0 - a) * self._approach_slope + a * best_slope
 
     # ── bilateral brightness (used by debug; no longer used for assignment) ───
 
@@ -1035,26 +973,6 @@ class CenterLineDetector:
                                color, cv2.MARKER_CROSS, 10, 2)
                 cv2.putText(cnt_vis, name[0].upper(), (px - 4, roi_h - 4),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.3, color, 1)
-
-            # Fork overlay (pzb_not_workingcorrectly4): draw the two diverging branch
-            # headings and highlight the CHOSEN one in magenta, plus a fork:L/R label.
-            if self.fork_active and self._fork_branches:
-                # Mark the chosen branch base (already decided this frame; recompute
-                # against the committed lane-center for the overlay).
-                ref_cx = self._lane_center if self._lane_center is not None else (
-                    self.prev_cx if self.prev_cx is not None else w / 2.0)
-                cb, cs, _choice = self._select_fork_branch(self._fork_branches, ref_cx)
-                chosen_bot = cb
-                for (cx_bot, cx_top, _slope) in self._fork_branches:
-                    p0 = (max(0, min(w - 1, int(round(cx_bot)))), roi_h - 1)
-                    p1 = (max(0, min(w - 1, int(round(cx_top)))), 0)
-                    is_chosen = abs(cx_bot - chosen_bot) < 1e-3
-                    col = (255, 0, 255) if is_chosen else (180, 180, 180)
-                    cv2.line(cnt_vis, p0, p1, col, 2 if is_chosen else 1)
-                cv2.putText(cnt_vis, f'fork:{self.fork_choice}', (2, roi_h - 14),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 0), 2)
-                cv2.putText(cnt_vis, f'fork:{self.fork_choice}', (2, roi_h - 14),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 0, 255), 1)
 
         n_sig   = sum(1 for c in contours
                       if self.MIN_AREA <= cv2.contourArea(c) <= self.MAX_AREA

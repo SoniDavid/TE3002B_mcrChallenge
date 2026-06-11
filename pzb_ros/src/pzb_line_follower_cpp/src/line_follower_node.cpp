@@ -1,0 +1,258 @@
+// rclcpp wrapper around FollowerCore. Drop-in for the Python line_follower_node:
+// same node name, topics, params. Uses the image header stamp as the clock so dt matches
+// a recorded run when replayed.
+#include <chrono>
+#include <memory>
+#include <string>
+
+#include <cv_bridge/cv_bridge.h>
+#include <rclcpp/rclcpp.hpp>
+#include <geometry_msgs/msg/twist.hpp>
+#include <sensor_msgs/msg/image.hpp>
+#include <std_msgs/msg/float32.hpp>
+#include <std_msgs/msg/int32.hpp>
+#include <std_msgs/msg/string.hpp>
+
+#include "pzb_line_follower_cpp/follower_core.hpp"
+
+using std::placeholders::_1;
+
+class LineFollowerNode : public rclcpp::Node {
+ public:
+  LineFollowerNode() : rclcpp::Node("line_follower_node") {
+    pzb::FollowerParams p;
+    auto gd = [&](const std::string& n, auto def) { return this->declare_parameter(n, def); };
+    // gdf: declare a DOUBLE parameter that tolerates a YAML integer literal (e.g. "20").
+    // rclcpp won't let a YAML int override a declared double, so declare with dynamic
+    // typing and coerce int→double. Used for all *_px / numeric doubles whose YAML value
+    // may be written without a decimal point.
+    auto gdf = [&](const std::string& n, double def) -> double {
+      rcl_interfaces::msg::ParameterDescriptor d; d.dynamic_typing = true;
+      this->declare_parameter(n, rclcpp::ParameterValue(def), d);
+      rclcpp::Parameter pv = this->get_parameter(n);
+      auto t = pv.get_type();
+      if (t == rclcpp::ParameterType::PARAMETER_INTEGER) return static_cast<double>(pv.as_int());
+      if (t == rclcpp::ParameterType::PARAMETER_DOUBLE) return pv.as_double();
+      return def;
+    };
+    p.image_width = gd("image_width", p.image_width);
+    p.image_height = gd("image_height", p.image_height);
+    p.Kp_angular = gd("Kp_angular", p.Kp_angular);
+    p.Kd_angular = gd("Kd_angular", p.Kd_angular);
+    p.dead_band_px = gd("dead_band_px", p.dead_band_px);
+    p.linear_speed = gd("linear_speed", p.linear_speed);
+    p.max_linear_speed = gd("max_linear_speed", p.max_linear_speed);
+    p.max_angular = gd("max_angular", p.max_angular);
+    p.curve_speed_reduction = gd("curve_speed_reduction", p.curve_speed_reduction);
+    p.min_linear_speed = gd("min_linear_speed", p.min_linear_speed);
+    p.sharp_turn_threshold_px = gd("sharp_turn_threshold_px", p.sharp_turn_threshold_px);
+    p.sharp_turn_speed = gd("sharp_turn_speed", p.sharp_turn_speed);
+    p.lost_timeout_s = gd("lost_timeout_s", p.lost_timeout_s);
+    p.lost_speed_scale = gd("lost_speed_scale", p.lost_speed_scale);
+    p.dashed_confirm_frames = gd("dashed_confirm_frames", p.dashed_confirm_frames);
+    p.dashed_coast_s = gd("dashed_coast_s", p.dashed_coast_s);
+    p.openloop_speed_mps = gd("openloop_speed_mps", p.openloop_speed_mps);
+    p.openloop_dist_m = gd("openloop_dist_m", p.openloop_dist_m);
+    p.recovery_angular_z = gd("recovery_angular_z", p.recovery_angular_z);
+    p.turn_approach_delay_s = gd("turn_approach_delay_s", p.turn_approach_delay_s);
+    p.acquire_guard_s = gd("acquire_guard_s", p.acquire_guard_s);
+    p.stuck_lock_s = gd("stuck_lock_s", p.stuck_lock_s);
+    p.stuck_lock_band_px = gdf("stuck_lock_band_px", p.stuck_lock_band_px);
+    p.stuck_lock_var_px = gdf("stuck_lock_var_px", p.stuck_lock_var_px);
+    p.dashed_recovery_enabled = gd("dashed_recovery_enabled", p.dashed_recovery_enabled);
+    p.max_error_jump_px = gdf("max_error_jump_px", p.max_error_jump_px);
+    p.error_median_n = gd("error_median_n", p.error_median_n);
+    p.search_timeout_s = gd("search_timeout_s", p.search_timeout_s);
+    p.search_speed_mps = gd("search_speed_mps", p.search_speed_mps);
+    p.search_angular_z = gd("search_angular_z", p.search_angular_z);
+    p.search_rotate_z = gd("search_rotate_z", p.search_rotate_z);
+    p.search_sweep_s = gd("search_sweep_s", p.search_sweep_s);
+    p.frame_blind_s = gd("frame_blind_s", p.frame_blind_s);
+    p.curve_min_speed = gd("curve_min_speed", p.curve_min_speed);
+    p.angular_slew_max = gd("angular_slew_max", p.angular_slew_max);
+    p.slew_bypass_error_px = gdf("slew_bypass_error_px", p.slew_bypass_error_px);
+    p.angular_slew_max_sharp = gd("angular_slew_max_sharp", p.angular_slew_max_sharp);
+    p.curve_gain = gd("curve_gain", p.curve_gain);
+    p.turn_latch_enabled = gd("turn_latch_enabled", p.turn_latch_enabled);
+    p.turn_latch_error_px = gdf("turn_latch_error_px", p.turn_latch_error_px);
+    p.turn_latch_frames = gd("turn_latch_frames", p.turn_latch_frames);
+    p.turn_latch_z = gd("turn_latch_z", p.turn_latch_z);
+    p.turn_latch_exit_px = gdf("turn_latch_exit_px", p.turn_latch_exit_px);
+    p.turn_latch_exit_frames = gd("turn_latch_exit_frames", p.turn_latch_exit_frames);
+    p.turn_latch_max_s = gd("turn_latch_max_s", p.turn_latch_max_s);
+    p.turn_latch_speed = gd("turn_latch_speed", p.turn_latch_speed);
+    p.dashed_suppress_error_px = gdf("dashed_suppress_error_px", p.dashed_suppress_error_px);
+    p.tight_turn_error_px = gdf("tight_turn_error_px", p.tight_turn_error_px);
+    p.curve_brake_error_px = gdf("curve_brake_error_px", p.curve_brake_error_px);
+    p.frame_stale_s = gd("frame_stale_s", p.frame_stale_s);
+    p.stale_speed_scale = gd("stale_speed_scale", p.stale_speed_scale);
+    p.steer_hysteresis_px = gdf("steer_hysteresis_px", p.steer_hysteresis_px);
+    p.error_sat_px = gdf("error_sat_px", p.error_sat_px);
+    p.error_sat_frames = gd("error_sat_frames", p.error_sat_frames);
+    p.dashed_align_enabled = gd("dashed_align_enabled", p.dashed_align_enabled);
+    p.align_deadband_deg = gdf("align_deadband_deg", p.align_deadband_deg);
+    p.k_align_z = gdf("k_align_z", p.k_align_z);
+    p.align_max_z = gdf("align_max_z", p.align_max_z);
+    p.align_sign = gdf("align_sign", p.align_sign);
+    p.align_slope_median_n = gd("align_slope_median_n", p.align_slope_median_n);
+    p.align_window_s = gd("align_window_s", p.align_window_s);
+    p.align_max_tilt_deg = gdf("align_max_tilt_deg", p.align_max_tilt_deg);
+    p.turn_sign_left_class = gd("turn_sign_left_class", p.turn_sign_left_class);
+    p.turn_sign_right_class = gd("turn_sign_right_class", p.turn_sign_right_class);
+    p.turn_sign_straight_class = gd("turn_sign_straight_class", p.turn_sign_straight_class);
+    p.turn_sign_stale_s = gd("turn_sign_stale_s", p.turn_sign_stale_s);
+    p.cross_turn_z = gd("cross_turn_z", p.cross_turn_z);
+    p.cross_turn_s = gd("cross_turn_s", p.cross_turn_s);
+    p.cross_turn_speed = gd("cross_turn_speed", p.cross_turn_speed);
+    p.crossing_coast_speed = gd("crossing_coast_speed", p.crossing_coast_speed);
+    p.crossing_exit_frames = gd("crossing_exit_frames", p.crossing_exit_frames);
+    p.turn_sign_only_enabled = gd("turn_sign_only_enabled", p.turn_sign_only_enabled);
+    p.turn_sign_min_area_frac = gd("turn_sign_min_area_frac", p.turn_sign_min_area_frac);
+    p.turn_sign_rearm_gap_s = gd("turn_sign_rearm_gap_s", p.turn_sign_rearm_gap_s);
+    p.turn_fire_cooldown_s = gd("turn_fire_cooldown_s", p.turn_fire_cooldown_s);
+    p.turn_peak_min_area = gd("turn_peak_min_area", p.turn_peak_min_area);
+    p.turn_peak_drop_frac = gd("turn_peak_drop_frac", p.turn_peak_drop_frac);
+    p.curve_lockout_error_px = gd("curve_lockout_error_px", p.curve_lockout_error_px);
+    p.curve_lockout_frames = gd("curve_lockout_frames", p.curve_lockout_frames);
+    // miniretoS8 reference line-follow control (ROUND 8)
+    p.control_mode = gd("control_mode", p.control_mode);
+    p.ref_kp = gd("ref_kp", p.ref_kp);
+    p.ref_max_w = gd("ref_max_w", p.ref_max_w);
+    p.ref_direction_alpha = gd("ref_direction_alpha", p.ref_direction_alpha);
+    p.ref_direction_slew_rate = gd("ref_direction_slew_rate", p.ref_direction_slew_rate);
+    p.ref_omega_alpha = gd("ref_omega_alpha", p.ref_omega_alpha);
+    p.ref_omega_slew_rate = gd("ref_omega_slew_rate", p.ref_omega_slew_rate);
+    p.ref_soft_dir_exp = gd("ref_soft_dir_exp", p.ref_soft_dir_exp);
+    p.ref_curve_scale_k = gd("ref_curve_scale_k", p.ref_curve_scale_k);
+    p.ref_angular_scale_k = gd("ref_angular_scale_k", p.ref_angular_scale_k);
+    p.ref_lost_speed_scale = gd("ref_lost_speed_scale", p.ref_lost_speed_scale);
+    p.ref_deadband = gd("ref_deadband", p.ref_deadband);
+    // Teach-by-demonstration sign actions (ROUND 9)
+    p.sign_action_enabled = gd("sign_action_enabled", p.sign_action_enabled);
+    p.sign_action_dir = gd("sign_action_dir", std::string(""));
+    // Commit-nudge sign turn (ROUND 9.2)
+    p.commit_speed = gd("commit_speed", p.commit_speed);
+    p.commit_w = gd("commit_w", p.commit_w);
+    p.commit_s = gd("commit_s", p.commit_s);
+    p.commit_center_s = gd("commit_center_s", p.commit_center_s);
+    p.commit_forward_s = gd("commit_forward_s", p.commit_forward_s);
+    std::string turn_sign_topic = gd("turn_sign_topic", std::string("/yolo/turn_sign"));
+    std::string topic_in = gd("topic_image_in", std::string("/camera/image_small"));
+    std::string topic_cmd = gd("topic_cmd_vel", std::string("/cmd_vel_desired_raw"));
+
+    // Clock: use the image header stamp for dt parity; fall back to steady_clock.
+    core_ = std::make_unique<pzb::FollowerCore>(p, [this]() { return cur_t_; });
+    if (p.sign_action_enabled) {
+      int nloaded = core_->load_sign_actions();
+      RCLCPP_INFO(get_logger(), "sign actions: loaded %d from '%s'", nloaded,
+                  p.sign_action_dir.c_str());
+    }
+
+    auto best_effort = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort();
+    auto reliable = rclcpp::QoS(rclcpp::KeepLast(10)).reliable();
+
+    pub_cx_ = create_publisher<std_msgs::msg::Int32>("/line_follower/cx", reliable);
+    pub_err_ = create_publisher<std_msgs::msg::Float32>("/line_follower/error", reliable);
+    pub_type_ = create_publisher<std_msgs::msg::String>("/line_follower/line_type", reliable);
+    pub_cmd_ = create_publisher<geometry_msgs::msg::Twist>(topic_cmd, reliable);
+    // TRUE open-loop turn bypass (ROUND 7): during the sign arc, publish ZERO down the
+    // normal chain (topic_cmd → slew_limiter → velocity_controller, which idles /cmd_vel to
+    // zero) and send the arc Twist STRAIGHT to /cmd_vel from this publisher — no slew, no PI.
+    pub_cmd_direct_ = create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", reliable);
+
+    sub_img_ = create_subscription<sensor_msgs::msg::Image>(
+        topic_in, best_effort, std::bind(&LineFollowerNode::on_image, this, _1));
+    sub_scale_ = create_subscription<std_msgs::msg::Float32>(
+        "/traffic_speed_scale", reliable,
+        [this](std_msgs::msg::Float32::SharedPtr m) { core_->set_speed_scale(m->data); });
+    sub_sign_ = create_subscription<std_msgs::msg::String>(
+        turn_sign_topic, rclcpp::QoS(10),
+        // Stamp the sign with cur_t_ (the IMAGE HEADER clock that process_frame uses), NOT
+        // now_s() (steady_clock). They are different epochs (header ≈ wall/ROS ~1.78e9 vs
+        // steady ~1e5), so stamping with now_s() made fresh_turn_sign() always see the sign
+        // as stale → the replay / peak-turn / dashed-FSM sign triggers NEVER fired (the
+        // ROUND-9 on-robot failure). cur_t_ is 0 until the first frame — skip until then.
+        [this](std_msgs::msg::String::SharedPtr m) {
+          if (cur_t_ > 0.0) core_->set_yolo_sign(m->data, cur_t_);
+        });
+
+    timer_ = create_wall_timer(std::chrono::milliseconds(50),
+                               std::bind(&LineFollowerNode::on_timer, this));
+    p_ = p;
+    RCLCPP_INFO(get_logger(), "C++ line_follower_node ready (img %dx%d, Kp=%.4f, curve_gain=%.2f)",
+                p.image_width, p.image_height, p.Kp_angular, p.curve_gain);
+  }
+
+ private:
+  double now_s() {
+    return std::chrono::duration<double>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
+
+  void on_image(sensor_msgs::msg::Image::SharedPtr msg) {
+    last_frame_t_ = now_s();
+    // header-stamp clock for dt parity
+    cur_t_ = msg->header.stamp.sec + msg->header.stamp.nanosec * 1e-9;
+    cv::Mat full;
+    try {
+      full = cv_bridge::toCvShare(msg, "bgr8")->image;
+    } catch (const std::exception& e) {
+      RCLCPP_WARN(get_logger(), "cv_bridge: %s", e.what());
+      return;
+    }
+    int cx; double err; std::string lt;
+    pzb::Twist2 cmd = core_->process_frame(full, cur_t_, cx, err, lt);
+    latest_v_ = cmd.v; latest_w_ = cmd.w;
+    latest_open_loop_ = core_->open_loop();
+
+    std_msgs::msg::Int32 cm; cm.data = cx; pub_cx_->publish(cm);
+    std_msgs::msg::Float32 em; em.data = static_cast<float>(err); pub_err_->publish(em);
+    std_msgs::msg::String tm; tm.data = lt; pub_type_->publish(tm);
+  }
+
+  void on_timer() {
+    geometry_msgs::msg::Twist cmd;
+    // OPEN-LOOP sign turn: timed, camera-independent. Kill the chain's output (zero down
+    // topic_cmd) and publish the arc STRAIGHT to /cmd_vel — no slew, no PI. Skip the
+    // stale/blind safety so the arc runs its full duration regardless of frame timing.
+    if (latest_open_loop_) {
+      cmd.linear.x = latest_v_; cmd.angular.z = latest_w_;
+      pub_cmd_->publish(geometry_msgs::msg::Twist());  // zero down the normal chain
+      pub_cmd_direct_->publish(cmd);                   // arc direct to /cmd_vel
+      return;
+    }
+    double blind_for = (last_frame_t_ > 0) ? (now_s() - last_frame_t_) : 0.0;
+    if (p_.frame_blind_s > 0 && last_frame_t_ > 0 && blind_for > p_.frame_blind_s) {
+      // multi-second freeze → full stop
+    } else if (p_.frame_stale_s > 0 && last_frame_t_ > 0 && blind_for > p_.frame_stale_s) {
+      cmd.linear.x = latest_v_ * p_.stale_speed_scale;
+      cmd.angular.z = latest_w_;
+    } else {
+      cmd.linear.x = latest_v_;
+      cmd.angular.z = latest_w_;
+    }
+    pub_cmd_->publish(cmd);
+  }
+
+  pzb::FollowerParams p_;
+  std::unique_ptr<pzb::FollowerCore> core_;
+  double cur_t_ = 0.0, last_frame_t_ = 0.0, latest_v_ = 0.0, latest_w_ = 0.0;
+  bool latest_open_loop_ = false;
+
+  rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr pub_cx_;
+  rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr pub_err_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pub_type_;
+  rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr pub_cmd_;
+  rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr pub_cmd_direct_;
+  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_img_;
+  rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr sub_scale_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr sub_sign_;
+  rclcpp::TimerBase::SharedPtr timer_;
+};
+
+int main(int argc, char** argv) {
+  rclcpp::init(argc, argv);
+  rclcpp::spin(std::make_shared<LineFollowerNode>());
+  rclcpp::shutdown();
+  return 0;
+}

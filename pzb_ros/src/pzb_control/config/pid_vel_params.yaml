@@ -13,7 +13,11 @@ velocity_controller:
     kp_v: 0.5
     ki_v: 0.1
     kd_v: 0.0
-    kp_w: 0.5
+    # Angular: FEEDFORWARD ONLY. The MCU's /robot_vel.angular.z feedback is too noisy
+    # (std ~0.18, swings ±1.0 rad/s) to close a loop on — a PI here flips the motor
+    # command ~11×/s on straights (the stutter / current draw seen in sign_implementation1).
+    # w_cmd = w_des passes the follower's already-smooth angular command straight through.
+    kp_w: 0.0    # was 0.5
     ki_w: 0.0
     kd_w: 0.0
     integral_clamp: 0.2

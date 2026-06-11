@@ -4,6 +4,26 @@ line_follower_node:
     image_width:  320
     image_height: 240
 
+    # ── Line-follow control mode (ROUND 8) ────────────────────────────────────────
+    # "ref" = miniretoS8 reference control: normalized-direction center-pick (5-band
+    # middle-of-3 + continuity, NO zebra guard) + soft-dir control law (EMA + slew +
+    # |dir|^exp + curve/angular speed-shaping). Smooth, no slot-swap thrash (validated
+    # offline: 0% false line-loss vs the slot tracker's junction teleports). "pd" = the
+    # original cx-PD + slot tracker. The dashed-crossing FSM + YOLO sign turns are
+    # UNCHANGED in both modes (they own the command before the solid-follow path).
+    control_mode: ref
+    ref_kp: 1.5                  # rad/s per unit soft-direction (reference default)
+    ref_max_w: 2.0
+    ref_direction_alpha: 0.35    # raw-direction EMA
+    ref_direction_slew_rate: 10.0
+    ref_omega_alpha: 1.0         # 1.0 = omega EMA off (slew still limits)
+    ref_omega_slew_rate: 10.0
+    ref_soft_dir_exp: 0.75       # dir·|dir|^0.75 — gentle near center, firm at large offset
+    ref_curve_scale_k: 0.75      # v *= 1 - k·|dir|
+    ref_angular_scale_k: 0.45    # v *= 1 - k·|w|/max_w
+    ref_lost_speed_scale: 0.65
+    ref_deadband: 0.0
+
     # Proportional steering gain (rad/s per pixel of error)
     # Raised 0.0035->0.0045 (adaptive_new fix): medium curves were under-steered
     # (50 px x 0.0035 = 0.175, too weak — the line drifted off). 0.0045 gives ~0.23 at
@@ -30,7 +50,12 @@ line_follower_node:
     # angular_smooth_alpha: LEGACY (output EMA) — superseded by angular_slew_max below.
     #   The EMA lagged a sustained curve ramp (caused understeer); the slew-rate limit
     #   bounds reversals without that lag. Kept declared for backward-compat; unused.
-    error_median_n: 3
+    # Lowered 3→2 (yolo-bags actual-fps fix): the median window was sized for a "~7 fps"
+    # camera, but the follower now runs 16-27 fps — a 3-frame window added ~100-130 ms of
+    # lag to the error the PD acts on, flattening the curve's error rise so turns didn't
+    # register (impl3 turn 0/1→1/1, impl4 6/7→7/7 in offline replay; straight az
+    # sign-flips stayed ~0). 2 still rejects a single cx-teleport frame.
+    error_median_n: 2
     angular_smooth_alpha: 0.4
 
     # ── Curve handling + steering rate-limit (new-bags curve-understeer fix) ──────
@@ -43,7 +68,12 @@ line_follower_node:
     # steer_hysteresis_px: once steering commits to a side, the error must exceed this
     #   on the opposite side before the command may reverse — kills center jitter.
     curve_min_speed: 0.05
-    angular_slew_max: 0.12
+    # Raised 0.12→0.20 (yolo-bags actual-fps fix): at the now-higher 16-27 fps the gentle
+    # 0.12/frame cap took too many frames to build steering on a medium (non-"sharp")
+    # curve, so the line drifted off before the command ramped. 0.20 lets medium curves
+    # commit faster; the downstream twist_slew_limiter (max_angular_accel=4.0) is still the
+    # real smoother and single-frame reversals stay bounded (anti-stutter).
+    angular_slew_max: 0.20
     steer_hysteresis_px: 6
     # Sharp-turn slew bypass: on a genuine sharp turn (|error| >= slew_bypass_error_px
     # AND consistent sign — not small-error jitter) steering ramps at the larger
@@ -58,7 +88,102 @@ line_follower_node:
     # (straights), only ~10-15% >50px (curves), so 50 cleanly separates curves from the
     # small-error jitter the slew damps. At >=50px + consistent sign the node now passes
     # full PD to the downstream slew node (which ramps fast at max_angular_accel=4.0).
-    slew_bypass_error_px: 50
+    # Lowered 50→40 (yolo-bags actual-fps fix): paired with the looser lane-center damping
+    # (which lets the curve's error actually rise), 40 recognizes the turn ~1 frame earlier
+    # so the fast steering ramp engages before the line leaves the squashed ROI. Still well
+    # above the small-error jitter band (dead_band 12 + hysteresis 6), so no stutter.
+    slew_bypass_error_px: 40
+
+    # ── Medium-curve gain boost (B1, new_implementation1 under-steer fix) ──────────
+    # Kp=0.0045 gave err 70 -> az only 0.32, so medium curves (|err| 50-110) under-steered
+    # and the error lingered 2-5 s (t=89.8/153.1/168.3). On a CONFIRMED turn (sharp_turn:
+    # sustained same-sign |err| >= slew_bypass_error_px) multiply Kp by curve_gain. Offline:
+    # raises peak az per turn ~0.32 -> ~0.49 (1.5x) with straight sign-flips unchanged.
+    # Gated on sharp_turn so it never amplifies small-error jitter into stutter.
+    curve_gain: 1.5
+
+    # ── Open-loop "turn until aligned" latch (B2) — OPT-IN, default OFF ────────────
+    # On a confirmed turn, rotate a fixed yaw toward the line at reduced speed and HOLD
+    # until the CAMERA says re-centered (|err| < exit for exit_frames) or max_s elapses.
+    # More decisive than PD on tight curves but open-loop — the offline harness CANNOT
+    # validate closed-loop steering, so enable + tune this only via on-robot A/B vs B1
+    # (B1's gain boost is the default and likely sufficient). Offline it added some az
+    # sign-flips (latch toggling near thresholds), so treat thresholds carefully on-robot.
+    turn_latch_enabled:     false
+    turn_latch_error_px:    55    # enter: |err| >= this (same sign) for turn_latch_frames
+    turn_latch_frames:      3
+    turn_latch_z:           0.55  # held yaw rate (rad/s) toward the line while latched
+    turn_latch_exit_px:     25    # exit: |err| < this (camera re-centered) for exit_frames
+    turn_latch_exit_frames: 3
+    turn_latch_max_s:       2.5   # safety cap: force-exit after this long
+    turn_latch_speed:       0.05  # linear speed (m/s) while turning in place-ish
+
+    # ── YOLO dashed-gated turn signs (Part 2) ─────────────────────────────────────
+    # At a CONFIRMED dashed crossing the robot consumes the most-recent /yolo/sign turn
+    # class: letRecto = cross straight (existing behavior); letDerecha/letIzquierda =
+    # open-loop turn arc INTO that lane, then re-acquire and resume centered following.
+    # Non-turn (slow) classes are handled by the traffic FSM, not here. The sign must be
+    # fresh (seen within turn_sign_stale_s) so an old detection can't fire at the wrong
+    # crossing. cross_turn_z/s tuned for ~90° + margin: 0.6 rad/s × 2.9 s ≈ 1.74 rad ≈ 100°
+    # so the robot comes fully around the right-angle elbow before re-acquiring.
+    turn_sign_left_class:     letIzquierda
+    turn_sign_right_class:    letDerecha
+    turn_sign_straight_class: letRecto
+    turn_sign_stale_s:        4.0   # ignore a latched sign older than this
+    cross_turn_z:             0.6   # yaw rate (rad/s) during the lane turn
+    cross_turn_s:             2.9   # turn duration (s) — ~90°+margin at cross_turn_z (was 1.6 ≈ 55°, too short)
+    cross_turn_speed:         0.06  # forward speed (m/s) during the turn
+    # YOLO turn arrow → turn at the sign's CLOSEST point (area peak-then-drop). The arrow
+    # (on its OWN /yolo/turn_sign channel, so a nearer GIVE WAY/construccion/stopSign can't
+    # mask it) is an ACTIVATION FLAG: latch a DIRECTION + track the running-MAX of its bbox
+    # area. Fire the open-loop turn when max >= turn_peak_min_area (genuinely close) AND the
+    # area has dropped below turn_peak_drop_frac × max (just past closest). Validated on
+    # dashed_turn_v1/v2 (letIzquierda peaks ~0.15-0.22 AT the turn; fires there, not early
+    # at the dashed crossing, not on first sight). The dashed-crossing FSM is the FALLBACK.
+    # letRecto / no arrow → cross straight. turn_sign_min_area_frac = tiny freshness floor.
+    turn_sign_only_enabled:   true
+    turn_sign_topic:          /yolo/turn_sign
+    turn_sign_min_area_frac:  0.0    # freshness floor only (0=off); NOT the trigger
+    # rearm gap 1.0 -> 4.0 (ROUND 7): the SAME sign is re-detected as separate episodes a few
+    # seconds apart as the robot manoeuvres (new_run1 gap 3.3s). 4.0 treats those as one
+    # approach (no peak reset / re-arm) so one sign = one turn.
+    turn_sign_rearm_gap_s:    4.0    # arrow gone this long → reset peak-max + re-arm (new approach)
+    # Post-fire cooldown: after a turn fires, block any new sign turn for this long so the
+    # same sign re-seen during the arc/coast/reacquire can't re-fire (new_run2 saw it 3×).
+    turn_fire_cooldown_s:     8.0
+    # Teach-by-demonstration sign actions (ROUND 9): when a fresh turn sign is latched AT a
+    # dashed crossing, replay the recorded /cmd_vel maneuver (config/sign_actions/<sign>.csv)
+    # open-loop, then resume line-following. sign_action_dir is set by the launch to the
+    # package share config/sign_actions dir. false → use the synthetic cross_turn arc.
+    # ROUND 9.2: the open-loop replay is SUPERSEDED by the commit-nudge turn (below) — off.
+    sign_action_enabled:      false
+    # Commit-nudge sign turn: at a dashed crossing with a fresh sign, stop+center for
+    # commit_center_s, then a short slow nudge (commit_speed, commit_w; 0 for straight) for
+    # commit_s, then resume line-following (it latches the new branch). Reference values
+    # (puzzlebot-line-follower); tune on-robot if it under/over-rotates before latching.
+    # Turn pipeline: center → forward-enter (commit_forward_s) → ARC nudge (forward while
+    # turning, commit_w×commit_s swept) → resume line-following (completes the corner).
+    # commit_w×commit_s = nudge angle (raise product to turn more; lower commit_w + raise
+    # commit_s for slower-same-angle). commit_speed = forward speed during enter + nudge.
+    commit_speed:             0.04
+    commit_w:                 0.30
+    commit_s:                 2.9
+    commit_center_s:          0.4
+    commit_forward_s:         3.0
+    # turn_peak_min_area lowered 0.08 -> 0.03 (ROUND 7): new_run3's right-arrow lay TILTED on
+    # the mat, so its bbox area_frac peaked at only 0.039 even at the closest point — 0.08
+    # would never fire. new_run1/2 (upright signs) peak 0.23/0.35, so 0.03 still fires there.
+    # Noise/far specks on these bags stay <=0.02, so 0.03 separates real-close from far.
+    # area_frac is a weak "closeness" proxy for a low/tilted sign — tune on-robot.
+    turn_peak_min_area:       0.03   # running-max must reach this (genuinely close) to arm a fire
+    # Fire when EITHER current area < turn_peak_drop_frac × running-max (clean peak-drop) OR
+    # the arrow leaves view after reaching turn_peak_min_area (exited frame past closest).
+    turn_peak_drop_frac:      0.7    # fire when current area < this × running-max (past closest)
+    # Curve lockout: don't let a sign arc preempt a real corner the robot is taking on the
+    # solid line — hold the latch while |error| is past curve_lockout_error_px on solid for
+    # curve_lockout_frames consecutive frames; fire only after the corner settles.
+    curve_lockout_error_px:   70.0
+    curve_lockout_frames:     3
     angular_slew_max_sharp: 0.45
     # Curve dashed-suppression: ignore a "dashed" classification while |steering error|
     # exceeds this — a real crossing is approached head-on (small error) while a sharp
@@ -167,16 +292,6 @@ line_follower_node:
     # the next frame. Set 0 to disable.
     max_error_jump_px: 60
 
-    # Fork branch selection (pzb_not_workingcorrectly4). At a Y-fork the lane-center
-    # (L+R)/2 averages the two diverging branches into a straight target and the
-    # robot misses the turn; this steers toward the branch that continues the line it
-    # is already on (base-proximity continuity). VERIFIED to steer the bag4 fork LEFT
-    # offline. Default FALSE: per-frame geometry cannot yet separate a real fork from
-    # a sharp single-lane curve (it regresses bad_ignment5 / bad_alginment2), so it is
-    # gated until a temporal/exits-based discriminator is added. Set true to A/B test
-    # the fork path on the bag4 route only.
-    fork_select_enabled: false
-
     # Perpendicular dashed-alignment (bad_alginment2 fix): before crossing, rotate
     # the robot to be perpendicular to the dashes using the median dash-slope (the
     # detector fits it from dash candidates only, so it's a clean signal). This is
@@ -197,12 +312,10 @@ line_follower_node:
     #                       "aligned" immediately and never re-steers.
     #   align_max_tilt_deg— reject slope frames implying a larger tilt than this as
     #                       physically implausible garbage (don't feed the median).
-    # DISABLED (10-attempt fix): the only required action at a dashed crossing right now
-    # is to cross STRAIGHT (signs/YOLO will choose the direction later). With alignment
-    # off the node latches "aligned" immediately on dashed entry and goes straight to the
-    # straight-crossing phase (angular.z=0) — removing the unverified align_sign rotation
-    # as a variable (attempts 5/6/7/9 went the wrong way at the junction).
-    dashed_align_enabled: false
+    # ENABLED (re-enabled per on-robot review): square up perpendicular to the dash row
+    # before crossing/turning, so the YOLO turn action starts from a known heading. The
+    # robot aligns within align_window_s, then the YOLO sign decides straight vs turn.
+    dashed_align_enabled: true
     align_deadband_deg:   6.0
     k_align_z:            0.015
     align_max_z:          0.30
@@ -238,9 +351,13 @@ line_follower_node:
     stuck_lock_band_px: 20
     stuck_lock_var_px:  4
 
-    # Publish pipeline debug visualization on /line_follower/debug_image
-    # Set to true only during tuning sessions — generates 7-tile image every frame
-    publish_debug: true
+    # Publish pipeline debug visualization on /line_follower/debug_image.
+    # OFF by default: the 7-tile image is ~0.5 MB/frame; building + publishing (and
+    # especially RECORDING) it on the Jetson caused multi-second whole-graph stalls
+    # (new_implementation1: 22 s freeze, 1.9 GB of debug frames). Enable ONLY for a
+    # tuning session, and prefer recording it on the laptop, not the robot.
+    # (The launch file's publish_debug arg also defaults false and overrides this.)
+    publish_debug: false
 
     # Loss coasting: when all 3 line slots are lost, hold last command at reduced speed
     # for up to lost_timeout_s before stopping (Team2 pattern: lost_timeout_s=0.3)

@@ -14,6 +14,9 @@ setup(
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'launch'), glob('launch/*launch.[pxy][yma]*')),
         (os.path.join('share', package_name, 'config'), glob('config/*.[yma]*')),
+        # Teach-by-demonstration sign actions (recorded /cmd_vel CSVs, ROUND 9).
+        (os.path.join('share', package_name, 'config', 'sign_actions'),
+         glob('config/sign_actions/*.csv')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
