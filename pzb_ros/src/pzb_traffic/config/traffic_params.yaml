@@ -1,35 +1,46 @@
 color_detector_node:
   ros__parameters:
     use_sim_time: false
+    # Consume the full-res JPEG (same feed as YOLO), then crop to a TIGHT TOP-CENTER ROI
+    # (the light module lives there) — NOT the old top-2/3, which dragged in the whole mat
+    # and caused false reds. ROI %: y[roi_y0_pct..roi_y1_pct], x[roi_x0_pct..roi_x1_pct].
+    input_topic: /camera/image_compressed
+    roi_y0_pct: 0
+    roi_y1_pct: 25
+    roi_x0_pct: 35
+    roi_x1_pct: 68
 
-    # --- HSV ranges (OpenCV: H in [0,180], S and V in [0,255]) ---
-    # Calibrated from camera images of the actual color sources:
-    #   Red    — backlit tablet screen (bright, very saturated)
-    #   Yellow — paper card #FFF200 / RGB(255,242,0) under room light
-    #   Green  — backlit tablet screen, lime/chartreuse (bright, very saturated)
+    # --- HSV ranges (OpenCV: H[0,180], S/V[0,255]) ---
+    # Re-calibrated 2026-06-10 from traffic_light_colors_0.db3 on the COMPRESSED-frame
+    # pipeline (JPEG decode → top-center ROI → 320×160 → GaussianBlur → BGR2HSV → CLAHE on V),
+    # via scripts/calibrate_traffic_colors.py (auto-located the lit dot, clustered by hue).
+    # Measured median per lit frame (213 red / 240 yellow / 256 green), H 2-98 pctile:
+    #   RED:    H 1 & 178 (wraps)  S 94-149  V 145-222  → H 0-12 & 165-180, S>=85, V>=120
+    #   YELLOW: H 20-34            S 99-235  V 144-226  → H 16-42,           S>=85, V>=120
+    #   GREEN:  H 62-70            S 98-158  V 135-218  → H 55-95,           S>=85, V>=115
+    # The dot is bright+saturated in the tight ROI, so S/V floors can be high → kills clutter.
 
-    # Red wraps around H=0/180, so two sub-ranges are needed.
-    red_h_low1:  0       # lower sub-range [0, 10]
-    red_h_high1: 10
-    red_h_low2:  170     # upper sub-range [170, 180]
+    red_h_low1:  0
+    red_h_high1: 12
+    red_h_low2:  165
     red_h_high2: 180
-    red_s_min:   175     # raised from 140 — skin S is ~50-140, iPad red S is ~200-255
-    red_v_min:   140     # raised from 120 — screen red is bright
+    red_s_min:   85
+    red_v_min:   120
 
-    # Yellow: #FFF200 → OpenCV H≈28; paper reflects so S is lower than a screen
-    green_h_low:  42
-    green_h_high: 75
-    green_s_min:  150    # lime screen green is highly saturated
-    green_v_min:  120    # screen green is bright
+    green_h_low:  55
+    green_h_high: 95
+    green_s_min:  85
+    green_v_min:  115
 
-    # Yellow: #FFF200 → OpenCV H≈28; paper under room light has lower saturation
-    yellow_h_low:  20
-    yellow_h_high: 38
-    yellow_s_min:  50    # paper diffuses light → lower S than screen colors
-    yellow_v_min:  160   # still bright white-ish paper
+    yellow_h_low:  16
+    yellow_h_high: 42
+    yellow_s_min:  85
+    yellow_v_min:  120
 
     # --- Detection robustness ---
-    min_blob_area:   120.0   # px² — circularity filter now rejects non-round blobs, so threshold can be lower
+    # The lit dot is ~600-740 px² at 320×160 in the tight ROI; 250 is safely below the dot
+    # but well above any residual clutter speck. circularity + S/V gates add rejection.
+    min_blob_area:   250.0
     confirm_frames:  4       # consecutive frames of same color before updating output
     loop_hz:         30.0
 
@@ -37,6 +48,31 @@ traffic_light_fsm_node:
   ros__parameters:
     use_sim_time: false
 
-    yellow_speed_scale: 0.4   # fixed v multiplier while yellow is visible
+    # Traffic-LIGHT obedience. FALSE: no real light on this course, and the HSV detector
+    # false-fired 'red' under changed lighting → robot latched STOPPED forever (pzb_stale).
+    # When false the light is IGNORED; YOLO sign behaviors (stop/giveway/construccion) still
+    # work. Re-enabled (ROUND 11): detector now runs on /camera/image_compressed with a tight
+    # top-center ROI + recalibrated HSV, so false reds are eliminated; the ROUND-10 latch fix
+    # (resume on 'none' after red) prevents a cleared red from stranding the robot.
+    traffic_light_enabled: true
+
+    yellow_speed_scale: 0.4   # fixed v multiplier while yellow is visible (also slow signs)
     color_lost_timeout: 1.5   # s — treat color as "none" if no detection this long
     loop_hz:             20.0
+
+    # YOLO sign behaviors (Part 2, non-turn signs; turn signs handled by the follower).
+    #   construccion → SLOW (yellow_speed_scale) while seen.
+    #   stopSign     → FULL STOP while seen; resume after it leaves view + confirm delay.
+    #   GIVE WAY     → ONE brief stop then continue; re-arms after it leaves view.
+    # stopSign / GIVE WAY only fire OUTSIDE a curve (deferred until |error| <= curve gate).
+    sign_topic:           /yolo/sign
+    slow_sign_classes:    ['construccion']
+    stop_sign_classes:    ['stopSign']
+    give_way_classes:     ['GIVE WAY']
+    sign_lost_timeout:    1.0   # s — construccion slow hold after last sighting
+    give_way_pause_s:     1.5   # s — brief GIVE WAY stop duration
+    stop_resume_confirm_s: 0.5  # s — wait after stopSign disappears before resuming
+    # 'Outside a curve' gate — act only when |steering error| <= this (px); else defer.
+    error_topic:          /line_follower/error
+    curve_gate_error_px:  35.0
+    sign_intent_stale_s:  3.0   # s — forget a deferred (never-fired) stop/give-way intent

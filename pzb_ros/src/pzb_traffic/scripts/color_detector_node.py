@@ -3,7 +3,8 @@
 Color detector node for traffic light detection.
 
 Subscribes:
-  /camera/image_raw  (sensor_msgs/Image)  raw 1280×720 BGR; node crops top 2/3 → 320×160
+  /camera/image_compressed (sensor_msgs/CompressedImage)  full-res JPEG (same as YOLO);
+      decoded, then cropped to a TIGHT TOP-CENTER ROI (the traffic light lives there) → 320×160.
 
 Publishes:
   /traffic_light_color         (std_msgs/String)  "red" | "green" | "yellow" | "none"
@@ -18,7 +19,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CompressedImage
 from std_msgs.msg import String
 
 _BEST_EFFORT_QOS = QoSProfile(
@@ -63,9 +64,22 @@ class ColorDetectorNode(Node):
         self.declare_parameter('min_blob_area',  800.0)
         self.declare_parameter('confirm_frames', 3)
         self.declare_parameter('loop_hz',        30.0)
+        self.declare_parameter('input_topic',    '/camera/image_compressed')
+        # TIGHT TOP-CENTER detection ROI (% of frame): the traffic light is a small module at
+        # the top-center; cropping to it (not the old top-2/3) keeps the mat/floor/jigsaw out
+        # of the HSV masks, which is what produced false reds. Tuned for the 1280×720 JPEG.
+        self.declare_parameter('roi_y0_pct',  0)
+        self.declare_parameter('roi_y1_pct',  25)
+        self.declare_parameter('roi_x0_pct',  35)
+        self.declare_parameter('roi_x1_pct',  68)
 
         self._min_area    = float(self.get_parameter('min_blob_area').value)
         self._confirm_n   = int(self.get_parameter('confirm_frames').value)
+        in_topic          = str(self.get_parameter('input_topic').value)
+        self._roi_y0 = int(self.get_parameter('roi_y0_pct').value)
+        self._roi_y1 = int(self.get_parameter('roi_y1_pct').value)
+        self._roi_x0 = int(self.get_parameter('roi_x0_pct').value)
+        self._roi_x1 = int(self.get_parameter('roi_x1_pct').value)
 
         # Confirmation filter state
         self._candidate       = 'none'   # color being accumulated
@@ -80,11 +94,12 @@ class ColorDetectorNode(Node):
         self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
         self.create_subscription(
-            Image,
-            '/camera/image_raw',
+            CompressedImage,
+            in_topic,
             self._image_callback,
             _BEST_EFFORT_QOS,
         )
+        self.get_logger().info(f'color_detector_node: subscribing to {in_topic}')
 
         self._color_pub = self.create_publisher(String, '/traffic_light_color', 10)
         self._debug_pub = self.create_publisher(Image, '/traffic_detector/debug_image', 1)
@@ -184,9 +199,19 @@ class ColorDetectorNode(Node):
         if self._frame_skip != 0:
             return
 
-        # Decode raw BGR — zero-copy view then crop to top 2/3 (traffic lights are never on the floor)
-        full  = np.frombuffer(msg.data, np.uint8).reshape(msg.height, msg.width, 3)
-        frame = cv2.resize(full[:msg.height * 2 // 3, :], (320, 160), interpolation=cv2.INTER_AREA)
+        # Decode the JPEG (CompressedImage, same feed as YOLO), then crop to the TIGHT
+        # TOP-CENTER ROI where the traffic light module is (keeps the mat/floor out → no
+        # false reds), and resize to the detector's working 320×160.
+        full = cv2.imdecode(np.frombuffer(msg.data, np.uint8), cv2.IMREAD_COLOR)
+        if full is None:
+            return
+        H, W = full.shape[:2]
+        y0 = max(0, H * self._roi_y0 // 100); y1 = min(H, H * self._roi_y1 // 100)
+        x0 = max(0, W * self._roi_x0 // 100); x1 = min(W, W * self._roi_x1 // 100)
+        roi = full[y0:y1, x0:x1]
+        if roi.size == 0:
+            return
+        frame = cv2.resize(roi, (320, 160), interpolation=cv2.INTER_AREA)
 
         # GaussianBlur replaces bilateralFilter(d=9) — equivalent noise suppression at ~20× lower cost
         blurred = cv2.GaussianBlur(frame, (5, 5), 0)

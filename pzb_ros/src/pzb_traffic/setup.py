@@ -26,6 +26,7 @@ setup(
         'console_scripts': [
             'color_detector_node = pzb_traffic_scripts.color_detector_node:main',
             'traffic_light_fsm_node = pzb_traffic_scripts.traffic_light_fsm_node:main',
+            'yolo_detector_node = pzb_traffic_scripts.yolo_detector_node:main',
         ],
     },
 )
