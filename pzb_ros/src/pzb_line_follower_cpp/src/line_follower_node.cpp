@@ -114,7 +114,7 @@ class LineFollowerNode : public rclcpp::Node {
     p.turn_peak_drop_frac = gd("turn_peak_drop_frac", p.turn_peak_drop_frac);
     p.curve_lockout_error_px = gd("curve_lockout_error_px", p.curve_lockout_error_px);
     p.curve_lockout_frames = gd("curve_lockout_frames", p.curve_lockout_frames);
-    // miniretoS8 reference line-follow control (ROUND 8)
+    // Reference line-follow control
     p.control_mode = gd("control_mode", p.control_mode);
     p.ref_kp = gd("ref_kp", p.ref_kp);
     p.ref_max_w = gd("ref_max_w", p.ref_max_w);
@@ -127,10 +127,10 @@ class LineFollowerNode : public rclcpp::Node {
     p.ref_angular_scale_k = gd("ref_angular_scale_k", p.ref_angular_scale_k);
     p.ref_lost_speed_scale = gd("ref_lost_speed_scale", p.ref_lost_speed_scale);
     p.ref_deadband = gd("ref_deadband", p.ref_deadband);
-    // Teach-by-demonstration sign actions (ROUND 9)
+    // Teach-by-demonstration sign actions
     p.sign_action_enabled = gd("sign_action_enabled", p.sign_action_enabled);
     p.sign_action_dir = gd("sign_action_dir", std::string(""));
-    // Commit-nudge sign turn (ROUND 9.2)
+    // Commit-nudge sign turn
     p.commit_speed = gd("commit_speed", p.commit_speed);
     p.commit_w = gd("commit_w", p.commit_w);
     p.commit_s = gd("commit_s", p.commit_s);
@@ -155,9 +155,9 @@ class LineFollowerNode : public rclcpp::Node {
     pub_err_ = create_publisher<std_msgs::msg::Float32>("/line_follower/error", reliable);
     pub_type_ = create_publisher<std_msgs::msg::String>("/line_follower/line_type", reliable);
     pub_cmd_ = create_publisher<geometry_msgs::msg::Twist>(topic_cmd, reliable);
-    // TRUE open-loop turn bypass (ROUND 7): during the sign arc, publish ZERO down the
-    // normal chain (topic_cmd → slew_limiter → velocity_controller, which idles /cmd_vel to
-    // zero) and send the arc Twist STRAIGHT to /cmd_vel from this publisher — no slew, no PI.
+    // Open-loop turn bypass: during the sign arc, publish zero down the normal chain
+    // (topic_cmd → slew_limiter → velocity_controller, which idles /cmd_vel to zero) and send
+    // the arc Twist straight to /cmd_vel from this publisher — no slew, no PI.
     pub_cmd_direct_ = create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", reliable);
 
     sub_img_ = create_subscription<sensor_msgs::msg::Image>(
@@ -167,11 +167,10 @@ class LineFollowerNode : public rclcpp::Node {
         [this](std_msgs::msg::Float32::SharedPtr m) { core_->set_speed_scale(m->data); });
     sub_sign_ = create_subscription<std_msgs::msg::String>(
         turn_sign_topic, rclcpp::QoS(10),
-        // Stamp the sign with cur_t_ (the IMAGE HEADER clock that process_frame uses), NOT
-        // now_s() (steady_clock). They are different epochs (header ≈ wall/ROS ~1.78e9 vs
-        // steady ~1e5), so stamping with now_s() made fresh_turn_sign() always see the sign
-        // as stale → the replay / peak-turn / dashed-FSM sign triggers NEVER fired (the
-        // ROUND-9 on-robot failure). cur_t_ is 0 until the first frame — skip until then.
+        // Stamp the sign with cur_t_ (the image-header clock that process_frame uses), not
+        // now_s() (steady_clock). They are different epochs, so stamping with now_s() made
+        // fresh_turn_sign() always see the sign as stale → the sign triggers never fired.
+        // cur_t_ is 0 until the first frame — skip until then.
         [this](std_msgs::msg::String::SharedPtr m) {
           if (cur_t_ > 0.0) core_->set_yolo_sign(m->data, cur_t_);
         });

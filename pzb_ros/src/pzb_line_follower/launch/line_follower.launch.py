@@ -48,40 +48,40 @@ def generate_launch_description():
     undistort_file = '/home/puzzlebot/streaming/camera_params.json'
 
     # ── Launch arguments ──────────────────────────────────────────────────────
-    arg_linear_speed            = DeclareLaunchArgument('linear_speed',            default_value='0.10',  description='Forward speed (m/s). Raised 0.06->0.10 (ROUND-5): the autonomous run/dashed_turn bags drove at a ~0.039 m/s median (base 0.06 halved by curve braking) — too slow, "looks bad". 0.10 + softened curve_speed_reduction restores natural speed while the open-loop sign turns + curve floors keep sharp bends safe. Lower again if sharp turns overrun.')
-    arg_Kp_angular              = DeclareLaunchArgument('Kp_angular',              default_value='0.0045', description='Proportional steering gain (rad/s per px). Raised 0.0035->0.0045: medium curves (40-80px) were under-steered and the line drifted off.')
-    arg_Kd_angular              = DeclareLaunchArgument('Kd_angular',              default_value='0.0',    description='Derivative steering gain (rad/s per px/frame); DISABLED (anti-stutter) — output EMA + error median do the damping')
-    arg_dead_band_px            = DeclareLaunchArgument('dead_band_px',            default_value='12',    description='Pixel dead band for steering (widened for anti-stutter)')
-    arg_publish_debug           = DeclareLaunchArgument('publish_debug',           default_value='false', description='Publish /camera/image_debug topic')
-    arg_impl                    = DeclareLaunchArgument('impl',                    default_value='cpp',   description="Line-follower implementation: 'py' (pzb_line_follower) or 'cpp' (pzb_line_follower_cpp). Defaults to C++ for lower Jetson CPU/memory; it is a drop-in (same node name/topics/params). Pass impl:=py to use the Python node.")
-    arg_use_traffic             = DeclareLaunchArgument('use_traffic',             default_value='false', description='Launch the HSV color detector ON THE JETSON. Default FALSE — the color detector MOVED TO THE PC (it reads /camera/image_compressed; runs in pzb_traffic/yolo_detector.launch.py via run_yolo.sh). Set true only to run it on the Jetson instead.')
-    arg_use_traffic_fsm         = DeclareLaunchArgument('use_traffic_fsm',         default_value='true',  description='Launch the traffic_light_fsm_node on the Jetson (light: /traffic_light_color + /yolo/sign → /traffic_speed_scale). Stays on the Jetson even though the color detector moved to the PC.')
-    arg_launch_follower         = DeclareLaunchArgument('launch_follower',         default_value='true',  description='Launch the line-follower node. Set FALSE to bring up camera + control chain + traffic WITHOUT the follower — e.g. for TELEOP recording, where the follower must not command motion (it would fight teleop on the cmd_vel chain). With it false the robot only moves from your teleop /cmd_vel.')
-    arg_launch_control          = DeclareLaunchArgument('launch_control',          default_value='true',  description='Launch the control chain (odometry, velocity_controller, slew_limiter). The velocity_controller WRITES /cmd_vel — the same topic teleop_twist_keyboard writes. For TELEOP recording set launch_control:=false (and launch_follower:=false) so teleop owns /cmd_vel directly to the MCU with no second writer fighting it. Leaves only the camera (+ traffic/detector) running to publish image topics for the bag.')
-    arg_undistort_enabled       = DeclareLaunchArgument('undistort_enabled',       default_value='true',  description='Apply lens undistortion to the small (line-follower) stream. Set false to A/B test the CPU saving (the follower is closed-loop and tolerates mild distortion).')
+    arg_linear_speed            = DeclareLaunchArgument('linear_speed',            default_value='0.10',  description='Forward speed (m/s). Lower if sharp turns overrun.')
+    arg_Kp_angular              = DeclareLaunchArgument('Kp_angular',              default_value='0.0045', description='Proportional steering gain (rad/s per px).')
+    arg_Kd_angular              = DeclareLaunchArgument('Kd_angular',              default_value='0.0',    description='Derivative steering gain (rad/s per px/frame); disabled — output EMA + error median do the damping.')
+    arg_dead_band_px            = DeclareLaunchArgument('dead_band_px',            default_value='12',    description='Pixel dead band for steering.')
+    arg_publish_debug           = DeclareLaunchArgument('publish_debug',           default_value='false', description='Publish /camera/image_debug topic.')
+    arg_impl                    = DeclareLaunchArgument('impl',                    default_value='cpp',   description="Line-follower implementation: 'py' (pzb_line_follower) or 'cpp' (pzb_line_follower_cpp). Drop-in: same node name/topics/params. Defaults to C++ for lower Jetson CPU/memory.")
+    arg_use_traffic             = DeclareLaunchArgument('use_traffic',             default_value='false', description='Launch the HSV color detector on the Jetson. Default false — it normally runs off-board on the PC (pzb_traffic/yolo_detector.launch.py).')
+    arg_use_traffic_fsm         = DeclareLaunchArgument('use_traffic_fsm',         default_value='true',  description='Launch the traffic_light_fsm_node on the Jetson (/traffic_light_color + /yolo/sign → /traffic_speed_scale).')
+    arg_launch_follower         = DeclareLaunchArgument('launch_follower',         default_value='true',  description='Launch the line-follower node. Set false to bring up camera + control chain + traffic without the follower (e.g. for teleop recording).')
+    arg_launch_control          = DeclareLaunchArgument('launch_control',          default_value='true',  description='Launch the control chain (odometry, velocity_controller, slew_limiter). Set false for teleop recording so teleop owns /cmd_vel directly.')
+    arg_undistort_enabled       = DeclareLaunchArgument('undistort_enabled',       default_value='true',  description='Apply lens undistortion to the small (line-follower) stream.')
     arg_small_width             = DeclareLaunchArgument('small_width',             default_value='480',   description='Hardware-downscaled width for the line-follower stream (/camera/image_small)')
     arg_small_height            = DeclareLaunchArgument('small_height',            default_value='270',   description='Hardware-downscaled height for the line-follower stream (/camera/image_small)')
-    arg_curve_speed_reduction   = DeclareLaunchArgument('curve_speed_reduction',   default_value='0.4',   description='Speed reduction on turns: 0=off, 1=stop at max angular. Lowered 0.75->0.4 (ROUND-5): 0.75 + curve braking crawled the robot to ~0.039 m/s on the curvy track. 0.4 keeps a safety slowdown on real bends without the crawl. Pair with linear_speed 0.10.')
-    arg_min_linear_speed        = DeclareLaunchArgument('min_linear_speed',        default_value='0.05',  description='Floor linear speed (m/s) — keep above motor deadband')
-    arg_max_linear_accel        = DeclareLaunchArgument('max_linear_accel',        default_value='5.0',   description='Max linear acceleration for slew limiter (m/s²)')
-    arg_max_angular_accel       = DeclareLaunchArgument('max_angular_accel',       default_value='4.0',   description='Max angular acceleration for slew limiter (rad/s²). Raised 1.20->4.0: at 1.20 the downstream slew node needed ~0.47s (~3 cam frames @7fps) to ramp steering to 0.56 rad/s, so the robot left the mat before full steering reached the motors on sharp turns. 4.0 ramps in ~0.15s (~1 frame). Linear accel is left untouched (the brown-out concern is linear steps, not angular).')
-    arg_sharp_turn_threshold_px = DeclareLaunchArgument('sharp_turn_threshold_px', default_value='60',    description='|error| px above which sharp-turn slow mode activates. Lowered 80->60 (opt-bags turn fix) so the hard curve-speed floor engages earlier, paired with the new error-driven early braking (curve_brake_error_px).')
-    arg_sharp_turn_speed        = DeclareLaunchArgument('sharp_turn_speed',        default_value='0.03',  description='Linear speed (m/s) during sharp turns')
-    arg_control_mode            = DeclareLaunchArgument('control_mode',            default_value='ref',   description="Line-follow control: 'ref' (miniretoS8 reference center-pick + soft-dir control law; the smooth on-robot-validated default) or 'pd' (the original cx-PD + slot tracker). The dashed-FSM + YOLO sign actions are unchanged either way. Pass control_mode:=pd to A/B the old controller.")
-    arg_ref_kp                  = DeclareLaunchArgument('ref_kp',                  default_value='1.5',   description='Reference control: rad/s per unit soft-direction (the gain that felt right on-robot).')
+    arg_curve_speed_reduction   = DeclareLaunchArgument('curve_speed_reduction',   default_value='0.4',   description='Speed reduction on turns: 0=off, 1=stop at max angular. Pair with linear_speed.')
+    arg_min_linear_speed        = DeclareLaunchArgument('min_linear_speed',        default_value='0.05',  description='Floor linear speed (m/s) — keep above motor deadband.')
+    arg_max_linear_accel        = DeclareLaunchArgument('max_linear_accel',        default_value='5.0',   description='Max linear acceleration for slew limiter (m/s²).')
+    arg_max_angular_accel       = DeclareLaunchArgument('max_angular_accel',       default_value='4.0',   description='Max angular acceleration for slew limiter (rad/s²). Higher = steering reaches the motors faster on sharp turns.')
+    arg_sharp_turn_threshold_px = DeclareLaunchArgument('sharp_turn_threshold_px', default_value='60',    description='|error| px above which sharp-turn slow mode activates.')
+    arg_sharp_turn_speed        = DeclareLaunchArgument('sharp_turn_speed',        default_value='0.03',  description='Linear speed (m/s) during sharp turns.')
+    arg_control_mode            = DeclareLaunchArgument('control_mode',            default_value='ref',   description="Line-follow control: 'ref' (reference center-pick + soft-dir control law) or 'pd' (cx-PD + slot tracker). The dashed-FSM + YOLO sign actions are unchanged either way.")
+    arg_ref_kp                  = DeclareLaunchArgument('ref_kp',                  default_value='1.5',   description='Reference control: rad/s per unit soft-direction.')
     arg_ref_max_w               = DeclareLaunchArgument('ref_max_w',               default_value='2.0',   description='Reference control: max |angular.z| (rad/s).')
     arg_ref_direction_alpha     = DeclareLaunchArgument('ref_direction_alpha',     default_value='0.35',  description='Reference control: raw-direction EMA factor.')
     arg_ref_direction_slew_rate = DeclareLaunchArgument('ref_direction_slew_rate', default_value='10.0',  description='Reference control: max direction change per second (slew).')
     arg_ref_soft_dir_exp        = DeclareLaunchArgument('ref_soft_dir_exp',        default_value='0.75',  description='Reference control: soft-direction exponent — dir·|dir|^exp (gentle near center, firm at large offset).')
-    arg_sign_action_enabled     = DeclareLaunchArgument('sign_action_enabled',     default_value='false', description='ROUND-9 open-loop /cmd_vel replay — SUPERSEDED by the commit-nudge turn (commit_*). Leave false.')
+    arg_sign_action_enabled     = DeclareLaunchArgument('sign_action_enabled',     default_value='false', description='Open-loop /cmd_vel replay — superseded by the commit-nudge turn (commit_*). Leave false.')
     arg_commit_speed            = DeclareLaunchArgument('commit_speed',             default_value='0.04',  description='Commit-nudge turn: forward speed (m/s) during the short directional nudge.')
-    arg_commit_w                = DeclareLaunchArgument('commit_w',                 default_value='0.30',  description='Turn nudge yaw rate (rad/s); left=+, right=-. commit_w×commit_s = swept nudge angle. Lower this + raise commit_s for "slower, same angle".')
-    arg_commit_s                = DeclareLaunchArgument('commit_s',                 default_value='2.9',   description='Arc-nudge duration (s). commit_w×commit_s = swept angle — raise the product to turn MORE. Line-following completes the rest of the corner.')
-    arg_commit_center_s         = DeclareLaunchArgument('commit_center_s',          default_value='0.4',   description='Stop-and-center hold (s) at the dashed entry before advancing, for a repeatable start pose.')
-    arg_commit_forward_s        = DeclareLaunchArgument('commit_forward_s',         default_value='3.0',   description='Forward-ENTER: drive forward (commit_speed) after centering, BEFORE the arc nudge, to enter the intersection. ~commit_speed×this m (0.04×3.0≈12cm). Raise to advance more.')
-    arg_publish_compressed      = DeclareLaunchArgument('publish_compressed',      default_value='true',  description='Publish a JPEG /camera/image_compressed off the full frame for off-board YOLO (laptop GPU). Built from the same GStreamer full appsink — no extra camera handle. Only encodes when a subscriber is present, so it costs ~0 until YOLO connects. Default TRUE so YOLO has its feed without the heavy raw stream.')
-    arg_jpeg_quality            = DeclareLaunchArgument('jpeg_quality',            default_value='75',    description='JPEG quality (1-100) for /camera/image_compressed')
-    arg_publish_raw             = DeclareLaunchArgument('publish_raw',             default_value='false', description='Publish the FULL-res 2.76 MB /camera/image_raw Image. Default FALSE: this heavy publish + its DDS transport + bag recording back-pressured the GStreamer pipeline and froze the WHOLE graph for 1-18 s on the yolo bags (robot drove blind off curves). Off-board YOLO uses /camera/image_compressed instead, so raw is not needed on the robot. Set true only if a subscriber genuinely needs the uncompressed frame.')
+    arg_commit_w                = DeclareLaunchArgument('commit_w',                 default_value='0.30',  description='Turn nudge yaw rate (rad/s); left=+, right=-. commit_w×commit_s = swept nudge angle.')
+    arg_commit_s                = DeclareLaunchArgument('commit_s',                 default_value='2.9',   description='Arc-nudge duration (s). commit_w×commit_s = swept angle. Line-following completes the rest of the corner.')
+    arg_commit_center_s         = DeclareLaunchArgument('commit_center_s',          default_value='0.4',   description='Stop-and-center hold (s) at the dashed entry before advancing.')
+    arg_commit_forward_s        = DeclareLaunchArgument('commit_forward_s',         default_value='3.0',   description='Drive forward (commit_speed) after centering, before the arc nudge, to enter the intersection.')
+    arg_publish_compressed      = DeclareLaunchArgument('publish_compressed',      default_value='true',  description='Publish a JPEG /camera/image_compressed off the full frame for off-board YOLO. Only encodes when a subscriber is present.')
+    arg_jpeg_quality            = DeclareLaunchArgument('jpeg_quality',            default_value='75',    description='JPEG quality (1-100) for /camera/image_compressed.')
+    arg_publish_raw             = DeclareLaunchArgument('publish_raw',             default_value='false', description='Publish the full-res /camera/image_raw Image. Default false: the heavy publish back-pressures the GStreamer pipeline. Off-board YOLO uses /camera/image_compressed instead.')
 
     # ── 1. MCU bridge ─────────────────────────────────────────────────────────
     # Bridges the STM32 over UART to ROS 2 — publishes /wheel_speeds, subscribes /cmd_vel.
@@ -95,8 +95,8 @@ def generate_launch_description():
     # )
 
     # ── 2. Camera ─────────────────────────────────────────────────────────────
-    # Opens the IMX219 CSI camera and publishes DUAL hardware-scaled streams (CPU fix):
-    #   /camera/image_raw   — FULL 1280x720, raw (for off-board YOLO / recording)
+    # Opens the IMX219 CSI camera and publishes dual hardware-scaled streams:
+    #   /camera/image_raw   — full 1280x720, raw (for off-board YOLO / recording)
     #   /camera/image_small — 480x270 hardware-downscaled (for the line follower)
     # Undistortion is applied only to the small stream (toggle: undistort_enabled).
     # Comment out when replaying a bag or using an external camera node.
@@ -205,20 +205,19 @@ def generate_launch_description():
                 'commit_center_s':         LaunchConfiguration('commit_center_s'),
                 'commit_forward_s':        LaunchConfiguration('commit_forward_s'),
                 'topic_cmd_vel':           '/cmd_vel_desired_raw',
-                # Consume the hardware-downscaled stream (CPU fix) — the follower resizes
-                # any input to its 320x80 ROI, and the uniform downscale preserves the
-                # ROI anisotropy ratio (0.889), so no detector change is needed.
+                # Consume the hardware-downscaled stream — the follower resizes any input to
+                # its 320x80 ROI, and the uniform downscale preserves the ROI anisotropy
+                # ratio (0.889), so no detector change is needed.
                 'topic_image_in':          '/camera/image_small',
             },
         ],
     )
 
-    # ── 7. Traffic light color detector — MOVED TO THE PC ─────────────────────
-    # The HSV color detector now runs OFF-BOARD on the laptop (in
-    # pzb_traffic/yolo_detector.launch.py, started by scripts/run_yolo.sh), because it reads
-    # /camera/image_compressed (the same JPEG stream as YOLO) with a tight top-center ROI.
-    # It publishes /traffic_light_color over the shared ROS domain → consumed by the FSM
-    # below (still on the Jetson). It is NOT launched here. (use_traffic defaults FALSE.)
+    # ── 7. Traffic light color detector (off-board by default) ────────────────
+    # The HSV color detector normally runs off-board on the laptop (in
+    # pzb_traffic/yolo_detector.launch.py), reading /camera/image_compressed with a tight
+    # top-center ROI, and publishes /traffic_light_color consumed by the FSM below. Launched
+    # here only when use_traffic:=true (default false).
     node_color_detector = Node(
         package='pzb_traffic',
         executable='color_detector_node',
@@ -228,11 +227,10 @@ def generate_launch_description():
         parameters=[traffic_params],
     )
 
-    # ── 8. Traffic light FSM — STAYS ON THE JETSON ────────────────────────────
-    # Light node: subscribes /traffic_light_color (from the PC color detector) + /yolo/sign +
-    # /line_follower/error, outputs /traffic_speed_scale that the follower multiplies into its
-    # speed. Kept on the Jetson (cheap) under its OWN flag use_traffic_fsm (default true) so
-    # it runs even though the color detector moved to the PC.
+    # ── 8. Traffic light FSM (on the Jetson) ──────────────────────────────────
+    # Subscribes /traffic_light_color + /yolo/sign + /line_follower/error, outputs
+    # /traffic_speed_scale that the follower multiplies into its speed. Runs under its own
+    # flag use_traffic_fsm (default true).
     node_traffic_fsm = Node(
         package='pzb_traffic',
         executable='traffic_light_fsm_node',

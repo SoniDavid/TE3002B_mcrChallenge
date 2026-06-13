@@ -71,8 +71,8 @@ void CenterLineDetector::reset_tracker_anchors() {
   centering = false;
 }
 
-// ── miniretoS8 reference center-pick (ROUND 8) ───────────────────────────────
-// Faithful port of line_detector2.py: _threshold_dark + _scan_band_centers +
+// ── Reference center-pick ────────────────────────────────────────────────────
+// Port of line_detector2.py: _threshold_dark + _scan_band_centers +
 // _fallback_contour_center. The _zebra_score guard is intentionally OMITTED.
 namespace {
 int odd_ge(int v) { v = std::max(3, v); return (v % 2 == 1) ? v : v + 1; }

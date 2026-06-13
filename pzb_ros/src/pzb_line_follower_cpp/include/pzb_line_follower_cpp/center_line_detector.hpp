@@ -76,7 +76,7 @@ class CenterLineDetector {
 
   void reset_tracker_anchors();
 
-  // ── miniretoS8 reference center-pick (ROUND 8) ─────────────────────────────
+  // ── Reference center-pick ──────────────────────────────────────────────────
   // Independent of the slot tracker: runs the reference's 5-band center scan on the ROI
   // (adaptive-dark threshold + bottom-weighted middle-of-3 / nearest-to-prev continuity)
   // and returns the normalized line offset `direction` ∈ [-1,1] (negative=left) plus a

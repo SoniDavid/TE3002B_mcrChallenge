@@ -79,9 +79,9 @@ void FollowerCore::set_yolo_sign(const std::string& cls_in, double now_s) {
     turn_peak_max_ = 0.0;
     turn_peak_reached_ = false;
   }
-  // letRecto / "straight" is IGNORED (ROUND 11): treat it as if no sign was seen — it must
-  // NOT latch a turn intent, so the commit-turn FSM never fires on it and the robot just
-  // keeps line-following (the dashed FSM crosses straight on its own anyway).
+  // letRecto / "straight" is ignored: treat it as if no sign was seen — don't latch a turn
+  // intent, so the commit-turn FSM never fires on it and the robot keeps line-following
+  // (the dashed FSM crosses straight on its own anyway).
   if (cls == p_.turn_sign_left_class)      { turn_sign_ = "left";     turn_sign_t_ = now_s; turn_sign_area_ = area; turn_sign_last_seen_t_ = now_s; }
   else if (cls == p_.turn_sign_right_class){ turn_sign_ = "right";    turn_sign_t_ = now_s; turn_sign_area_ = area; turn_sign_last_seen_t_ = now_s; }
   else return;  // straight / none / other → no-op
@@ -268,12 +268,11 @@ Twist2 FollowerCore::process_frame(const cv::Mat& small_bgr, double now_s,
   Twist2 cmd;
   so_open_loop_ = false;   // default: normal chain; set true only when an arc fires
 
-  // ── COMMIT-NUDGE sign turn (ROUND 9.2) ──────────────────────────────────────
-  // Reference (puzzlebot-line-follower) turn model: at a dashed crossing with a fresh sign
-  // latched, STOP+center briefly, then a SHORT slow directional NUDGE (v=commit_speed,
-  // w=±commit_w / 0 for straight) for commit_s, then HAND BACK to normal line-following,
-  // which latches the perpendicular branch and completes the turn closed-loop. Replaces the
-  // fragile open-loop CSV replay + synthetic arc. Published via the NORMAL chain (gentle).
+  // ── Commit-nudge sign turn ──────────────────────────────────────────────────
+  // At a dashed crossing with a fresh sign latched: stop+center briefly, then a short slow
+  // directional nudge (v=commit_speed, w=±commit_w / 0 for straight) for commit_s, then hand
+  // back to normal line-following, which latches the perpendicular branch and completes the
+  // turn closed-loop. Published via the normal chain.
   //   commit_phase_: 0 idle | 1 center | 2 forward-enter | 3 arc-nudge (forward while turning)
   if (commit_phase_ == 1) {  // STOP-AND-CENTER: hold still, steer to center the dashed entry
     if ((now - commit_phase_t_) < p_.commit_center_s) {
@@ -345,9 +344,9 @@ Twist2 FollowerCore::process_frame(const cv::Mat& small_bgr, double now_s,
     }
     if (!aligned_latch_ && elapsed >= p_.align_window_s) { aligned_latch_ = true; align_done_t_ = now; }
 
-    // NOTE (ROUND 9.2): the dashed FSM no longer turns — the COMMIT-NUDGE block above owns
-    // all sign turns. Here we only ALIGN → cross STRAIGHT → coast (a no-sign crossing, or a
-    // straight/letRecto). A turn sign is handled before this block ever runs.
+    // The dashed FSM no longer turns — the commit-nudge block above owns all sign turns.
+    // Here we only align → cross straight → coast (a no-sign or straight/letRecto crossing).
+    // A turn sign is handled before this block ever runs.
     if (!aligned_latch_) {
       // Phase A — forward at approach speed + perpendicular alignment steering.
       cmd.v = cross_speed * std::max(speed_scale_, 1.0);
@@ -385,8 +384,8 @@ Twist2 FollowerCore::process_frame(const cv::Mat& small_bgr, double now_s,
   last_valid_t_ = now;
   search_until_ = kNaN;  // re-acquired
 
-  // miniretoS8 reference control (ROUND 8): smooth normalized-direction following.
-  // Runs the reference center-pick on the SAME ROI, then the soft-dir control law. The
+  // Reference control: smooth normalized-direction following.
+  // Runs the reference center-pick on the same ROI, then the soft-dir control law. The
   // dashed/sign/open-loop paths above already returned, so this only governs solid following.
   if (p_.control_mode == "ref") {
     bool ref_found = false;
@@ -436,7 +435,7 @@ Twist2 FollowerCore::process_frame(const cv::Mat& small_bgr, double now_s,
   for (double e : error_hist_) if (std::abs(e) > p_.dead_band_px) same_sign &= ((e > 0) == (error > 0));
   bool sharp_turn = (std::abs(error) >= p_.slew_bypass_error_px && same_sign);
 
-  // B2 turn latch
+  // turn latch
   if (p_.turn_latch_enabled) {
     if (tl_active_) {
       if (std::abs(error) < p_.turn_latch_exit_px) tl_exit_c_++; else tl_exit_c_ = 0;

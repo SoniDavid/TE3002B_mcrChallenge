@@ -11,10 +11,10 @@ Traffic light:
 
 YOLO signs (non-turn; turn signs handled by the line follower at a dashed crossing):
   - construccion → reduce speed (yellow_speed_scale) while seen
-  - stopSign     → FULL STOP while seen; resume after it leaves view + a confirm delay
-  - GIVE WAY     → ONE brief stop (give_way_pause_s) then continue; re-arms after it
+  - stopSign     → full stop while seen; resume after it leaves view + a confirm delay
+  - GIVE WAY     → one brief stop (give_way_pause_s) then continue; re-arms after it
                    leaves view (once per sighting)
-  stopSign / GIVE WAY only fire OUTSIDE a curve (|/line_follower/error| <= curve gate);
+  stopSign / GIVE WAY only fire outside a curve (|/line_follower/error| <= curve gate);
   if seen mid-curve the action is deferred until the robot is straight again.
 
 Subscribes:
@@ -49,21 +49,20 @@ class TrafficLightFSMNode(Node):
         self.declare_parameter('yellow_speed_scale', 0.4)
         self.declare_parameter('color_lost_timeout', 1.5)
         self.declare_parameter('loop_hz',            20.0)
-        # Traffic-LIGHT obedience. Default FALSE: this course has no real traffic light, and
-        # the HSV detector false-fired 'red' under changed lighting → the FSM latched STOPPED
-        # forever (pzb_stale bag). When false, /traffic_light_color is IGNORED (the light
-        # never drives the speed scale) — the YOLO SIGN behaviors (stop/giveway/construccion
-        # off /yolo/sign) are UNAFFECTED and keep working. Set true only with a real light.
+        # Traffic-light obedience. Default false: this course has no real light, and the HSV
+        # detector false-fires 'red' under changed lighting, latching STOPPED forever. When
+        # false, /traffic_light_color is ignored — the YOLO sign behaviors keep working. Set
+        # true only with a real light.
         self.declare_parameter('traffic_light_enabled', False)
-        # YOLO sign behaviors (the non-turn signs; turn signs are handled by the line
-        # follower at a dashed crossing). Three distinct actions:
-        #   construccion → SLOW (reduce speed like yellow) while seen.
-        #   stopSign     → FULL STOP while seen; resume after it leaves view + a confirm
+        # YOLO sign behaviors (non-turn signs; turn signs are handled by the line follower at
+        # a dashed crossing):
+        #   construccion → slow (like yellow) while seen.
+        #   stopSign     → full stop while seen; resume after it leaves view + a confirm
         #                  delay (stop_resume_confirm_s).
-        #   GIVE WAY     → ONE brief stop (give_way_pause_s) then continue; re-arms only
-        #                  after the sign leaves view (once per sighting).
-        # stopSign / GIVE WAY only fire OUTSIDE a curve (|steering error| <= curve gate);
-        # if seen mid-curve the action is DEFERRED until the robot is straight again.
+        #   GIVE WAY     → one brief stop (give_way_pause_s) then continue; re-arms after the
+        #                  sign leaves view (once per sighting).
+        # stopSign / GIVE WAY only fire outside a curve (|steering error| <= curve gate);
+        # if seen mid-curve the action is deferred until straight again.
         self.declare_parameter('sign_topic',          '/yolo/sign')
         self.declare_parameter('slow_sign_classes',   ['construccion'])
         self.declare_parameter('stop_sign_classes',   ['stopSign'])
@@ -76,11 +75,10 @@ class TrafficLightFSMNode(Node):
         self.declare_parameter('error_topic',         '/line_follower/error')
         self.declare_parameter('curve_gate_error_px', 35.0)
         self.declare_parameter('sign_intent_stale_s', 3.0)   # forget a deferred intent older than this
-        # Peak-area trigger (ROUND 5): construccion / GIVE WAY act at the sign's CLOSEST
-        # point — when the bbox area (parsed off /yolo/sign) has PEAKED then dropped below
-        # peak_drop_frac × running-max, past peak_min_area. This matches the user's
-        # "trigger at maximum pixel count or just after (closest)". stopSign is EXEMPT
-        # (it acts while seen — set sign_peak_enabled false to revert all to seen-based).
+        # Peak-area trigger: construccion / GIVE WAY act at the sign's closest point — when
+        # the bbox area (parsed off /yolo/sign) has peaked then dropped below peak_drop_frac ×
+        # running-max, past peak_min_area. stopSign is exempt (it acts while seen — set
+        # sign_peak_enabled false to revert all to seen-based).
         self.declare_parameter('sign_peak_enabled',   True)
         self.declare_parameter('sign_peak_min_area',  0.05)  # area must reach this before acting
         self.declare_parameter('sign_peak_drop_frac', 0.7)   # act when area < this × running-max
@@ -143,7 +141,7 @@ class TrafficLightFSMNode(Node):
     # ------------------------------------------------------------------ FSM
 
     def _color_callback(self, msg: String):
-        # Traffic-light obedience is OFF by default (no real light on this course; the HSV
+        # Traffic-light obedience is off by default (no real light on this course; the HSV
         # detector false-fires red under changed lighting). When disabled, ignore the light
         # entirely — the FSM stays RUNNING and only the YOLO sign behaviors affect the scale.
         if not self._traffic_light_enabled:
@@ -170,10 +168,10 @@ class TrafficLightFSMNode(Node):
             self._set_state(TrafficState.RUNNING)
 
         elif color == 'none':
-            # Resume when the light CLEARS, even if we were waiting for green. A red that
-            # disappears (real light passed, or a false red under bad lighting) must not
-            # strand the robot forever waiting for a green that never comes. Only a
-            # *sustained* red holds the stop (re-asserted each red frame below).
+            # Resume when the light clears, even if we were waiting for green. A red that
+            # disappears (light passed, or a false red under bad lighting) must not strand the
+            # robot waiting for a green that never comes. Only a sustained red holds the stop
+            # (re-asserted each red frame below).
             self._waiting_for_green = False
             self._set_state(TrafficState.RUNNING)
 
@@ -201,11 +199,11 @@ class TrafficLightFSMNode(Node):
     def _sign_callback(self, msg: String):
         """Route a YOLO sign to slow / stop / give-way intent.
 
-        construccion / GIVE WAY act at the sign's CLOSEST point: their area is tracked as a
-        per-class running-max and the intent is latched only when the area has PEAKED then
-        dropped below sign_peak_drop_frac × max (past closest), past sign_peak_min_area —
-        the user's "trigger at maximum pixel count or just after". stopSign is EXEMPT (acts
-        while seen). With sign_peak_enabled=false all revert to the prior seen-based latch.
+        construccion / GIVE WAY act at the sign's closest point: their area is tracked as a
+        per-class running-max and the intent is latched only when the area has peaked then
+        dropped below sign_peak_drop_frac × max (past closest), past sign_peak_min_area.
+        stopSign is exempt (acts while seen). With sign_peak_enabled=false all revert to the
+        prior seen-based latch.
         """
         # /yolo/sign carries "<class>:<area_frac>". Parse both.
         raw = msg.data.strip()

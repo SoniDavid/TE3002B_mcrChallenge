@@ -41,7 +41,7 @@ struct FollowerParams {
   double curve_min_speed = 0.05, angular_slew_max = 0.20;
   double slew_bypass_error_px = 40, angular_slew_max_sharp = 0.45;
   double curve_gain = 1.5;
-  // B2 turn latch (opt-in)
+  // Turn latch (opt-in)
   bool   turn_latch_enabled = false;
   double turn_latch_error_px = 55; int turn_latch_frames = 3;
   double turn_latch_z = 0.55, turn_latch_exit_px = 25; int turn_latch_exit_frames = 3;
@@ -59,12 +59,11 @@ struct FollowerParams {
   std::string turn_sign_left_class = "letIzquierda", turn_sign_right_class = "letDerecha",
               turn_sign_straight_class = "letRecto";
   double turn_sign_stale_s = 4.0, cross_turn_z = 0.6, cross_turn_s = 2.9, cross_turn_speed = 0.06;
-  // Sign turn — turn at the arrow's CLOSEST point (area peak-then-drop). The arrow (own
-  // /yolo/turn_sign channel) is an ACTIVATION FLAG: latch a direction + track running-max
-  // area. FIRE when running-max >= turn_peak_min_area (genuinely close) AND current area
-  // < turn_peak_drop_frac × max (past closest). Validated on dashed_turn_v1/v2 (fires at
-  // the area peak, not early). The dashed-crossing FSM is the FALLBACK. turn_sign_min_area_frac
-  // is a tiny freshness floor (0=off), NOT the trigger.
+  // Sign turn — turn at the arrow's closest point (area peak-then-drop). The arrow (own
+  // /yolo/turn_sign channel) latches a direction + tracks running-max area. Fires when
+  // running-max >= turn_peak_min_area (close) and current area < turn_peak_drop_frac × max
+  // (past closest). The dashed-crossing FSM is the fallback. turn_sign_min_area_frac is a
+  // freshness floor (0=off), not the trigger.
   bool   turn_sign_only_enabled = true;
   double turn_sign_min_area_frac = 0.0;     // freshness floor only (0=off)
   // Arrow gone this long → reset running-max + re-arm (a new approach).
@@ -81,11 +80,11 @@ struct FollowerParams {
   // line (>=2 slots for crossing_exit_frames frames) returns, instead of stopping.
   double crossing_coast_speed = 0.06; int crossing_exit_frames = 3;
 
-  // ── miniretoS8 reference line-follow control (ROUND 8) ────────────────────────
-  // control_mode: "ref" = use the reference detector center-pick + soft-dir control law
-  // for solid-line following (smooth, no slot-swap thrash; validated offline); "pd" = the
-  // original cx-PD path. The dashed-FSM / sign-turn / open-loop paths are unchanged either
-  // way. The reference normalizes the line offset to `direction` ∈ [-1,1]:
+  // ── Reference line-follow control ─────────────────────────────────────────────
+  // control_mode: "ref" = reference detector center-pick + soft-dir control law for
+  // solid-line following (smooth, no slot-swap thrash); "pd" = the original cx-PD path. The
+  // dashed-FSM / sign-turn / open-loop paths are unchanged either way. The reference
+  // normalizes the line offset to `direction` ∈ [-1,1]:
   //   raw EMA(α) → direction slew(±rate·dt) → soft = dir·|dir|^exp → ω = -kp·soft (clamp
   //   ±max_w) → ω EMA + ω slew → v = linear·(1-cs_k·|dir|)·(1-as_k·|ω|/max_w).
   std::string control_mode = "ref";
@@ -96,19 +95,18 @@ struct FollowerParams {
   double ref_curve_scale_k = 0.75, ref_angular_scale_k = 0.45;
   double ref_lost_speed_scale = 0.65, ref_deadband = 0.0;
 
-  // ── Teach-by-demonstration sign actions (ROUND 9) ─────────────────────────────
-  // When enabled, a fresh turn sign latched AT a dashed crossing triggers an OPEN-LOOP
+  // ── Teach-by-demonstration sign actions ───────────────────────────────────────
+  // When enabled, a fresh turn sign latched at a dashed crossing triggers an open-loop
   // replay of a recorded /cmd_vel sequence (one CSV per sign: left/right/straight) instead
-  // of the synthetic cross_turn arc — the maneuver the user demonstrated. After the
-  // sequence ends, hand off to the Phase-C coast-reacquire. sign_action_dir holds the CSVs
-  // (t,vx,wz rows). If disabled or no CSV for the latched sign, the synthetic arc / dashed
-  // FSM is used (backward compatible).
+  // of the synthetic cross_turn arc. After the sequence ends, hand off to the Phase-C
+  // coast-reacquire. sign_action_dir holds the CSVs (t,vx,wz rows). If disabled or no CSV for
+  // the latched sign, the synthetic arc / dashed FSM is used.
   bool   sign_action_enabled = true;
   std::string sign_action_dir = "";   // set by the node from the package share dir
 
-  // ── COMMIT turn FSM (ROUND 9.2b): center → forward(enter) → ARC nudge → resume follow ──
+  // ── Commit turn FSM: center → forward(enter) → arc nudge → resume follow ──────
   // At a dashed crossing with a fresh sign: stop+center (commit_center_s), drive forward to
-  // enter the intersection (commit_forward_s), then a short ARC nudge (v=commit_speed,
+  // enter the intersection (commit_forward_s), then a short arc nudge (v=commit_speed,
   // w=±commit_w / 0 straight, for commit_s; swept ≈ commit_w×commit_s) into the branch, then
   // resume normal line-following which completes the corner closed-loop.
   //   Tune: commit_forward_s = enter distance; commit_w×commit_s = nudge angle (raise the
@@ -136,8 +134,8 @@ class FollowerCore {
   // for sign ∈ {left,right,straight}. Missing files are simply skipped. Returns #loaded.
   int load_sign_actions();
 
-  // True while the last process_frame returned an OPEN-LOOP sign-turn arc command — the
-  // node routes it DIRECTLY to /cmd_vel (zero down the normal chain) so the slew_limiter +
+  // True while the last process_frame returned an open-loop sign-turn arc command — the
+  // node routes it directly to /cmd_vel (zero down the normal chain) so the slew_limiter +
   // velocity_controller PI can't fight the timed arc. Matches the Python node's _so_open_loop.
   bool open_loop() const { return so_open_loop_; }
 
@@ -155,7 +153,7 @@ class FollowerCore {
   double last_good_error_ = 0.0, last_valid_t_ = NAN;
   double approach_speed_ = 0.0;
 
-  // ── B2 turn latch ──
+  // ── turn latch ──
   bool tl_active_ = false; double tl_sign_ = 0.0, tl_start_ = NAN; int tl_arm_ = 0, tl_exit_c_ = 0;
 
   // ── dashed crossing ──
@@ -180,19 +178,19 @@ class FollowerCore {
   bool so_armed_ = true;
   bool so_open_loop_ = false;              // last frame returned an open-loop arc command
 
-  // ── teach-by-demonstration replay (ROUND 9 — dormant, superseded by commit-nudge) ──
+  // ── teach-by-demonstration replay (dormant, superseded by commit-nudge) ──
   struct ActionSample { double t, vx, wz; };
   std::map<std::string, std::vector<ActionSample>> sign_actions_;  // "left"/"right"/"straight"
   bool action_replay_active_ = false;
   double action_replay_start_ = NAN;       // monotonic time the replay began
   std::string action_replay_sign_;         // which sign is replaying
 
-  // ── commit-nudge turn FSM (ROUND 9.2) ──
+  // ── commit-nudge turn FSM ──
   int commit_phase_ = 0;                   // 0 idle | 1 centering | 2 committing
   double commit_phase_t_ = NAN;            // time the current phase began
   std::string commit_dir_;                 // "left"/"right"/"straight"
 
-  // ── miniretoS8 reference control-law state (ROUND 8) ──
+  // ── reference control-law state ──
   double ref_raw_dir_ = 0.0, ref_filtered_dir_ = 0.0, ref_prev_filtered_dir_ = 0.0;
   double ref_omega_filtered_ = 0.0, ref_prev_dir_ = 0.0;
   double ref_last_ctrl_t_ = NAN;

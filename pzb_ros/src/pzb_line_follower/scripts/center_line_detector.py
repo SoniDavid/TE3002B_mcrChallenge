@@ -6,8 +6,8 @@ import numpy as np
 import cv2
 
 
-# ── miniretoS8 reference center-pick helpers (ROUND 8) ────────────────────────
-# Faithful ports of line_detector2.py (_threshold_dark / _scan_band_centers /
+# ── Reference center-pick helpers ─────────────────────────────────────────────
+# Ports of line_detector2.py (_threshold_dark / _scan_band_centers /
 # _fallback_contour_center). The zebra guard is intentionally omitted.
 def _odd_ge(v):
     v = max(3, int(v))
@@ -137,17 +137,14 @@ class CenterLineDetector:
 
     MIN_AREA        = 50    # px² — ignore blobs smaller than this
     MAX_AREA        = 4000  # px² — ignore merged blobs (from v3)
-    SIGNIFICANT_AREA= 500   # px² — real track lines are >= this (from v3)
+    SIGNIFICANT_AREA= 500   # px² — real track lines are >= this
 
-    # ── jigsaw puzzle-seam rejection (opt-bags center-loss fix) ────────────────
-    # The white puzzle-piece cutout seams on the mat appear as thin, wiggly, closed
-    # loops in the binary and were being assigned to L/C/R line slots — on a sharp
-    # curve they competed with the real boundary and made the 'center' flicker
-    # (opt9 cx 113↔160). A real track line / crossing dash is an elongated, well-
-    # FILLED stripe (high extent AND high solidity); a seam squiggle doubles back so
-    # BOTH are low. Reject only SMALL contours (real boundaries are larger and never
-    # touched) and only when BOTH metrics are low — conservative, so real curved line
-    # fragments and solid dashes survive. Tuned from opt9 t40-41 seam contours.
+    # ── Jigsaw puzzle-seam rejection ───────────────────────────────────────────
+    # The white puzzle-piece cutout seams on the mat appear as thin, wiggly, closed loops
+    # in the binary and were assigned to L/C/R line slots, competing with the real boundary
+    # on a sharp curve. A real line / crossing dash is an elongated, well-filled stripe
+    # (high extent and solidity); a seam squiggle doubles back so both are low. Reject only
+    # small contours, and only when both metrics are low, so real line fragments survive.
     SEAM_MAX_AREA     = 500   # px² — only test sub-significant blobs
     SEAM_MAX_EXTENT   = 0.32  # area/(bbox area) below this = thin & wiggly, not a stripe
     SEAM_MAX_SOLIDITY = 0.45  # area/(hull area) below this = doubles back, not a line
@@ -298,8 +295,7 @@ class CenterLineDetector:
         from stale pre-intersection positions. Without this, the minimum-cost
         assignment in `_track_three_lines` can snap the center slot onto a
         crossing-dash / boundary-seam left over from the junction, producing a
-        large spurious error (observed in wide_angle_bag8: cx→41, err→−119 px,
-        causing a ~90° pivot on exit).
+        large spurious error and a ~90° pivot on exit.
         """
         for k in ('left', 'center', 'right'):
             self.line_positions[k]    = None
@@ -313,7 +309,7 @@ class CenterLineDetector:
         self._halfwidth_hist.clear()
         self.centering   = False
 
-    # ── miniretoS8 reference center-pick (ROUND 8) ────────────────────────────
+    # ── Reference center-pick ─────────────────────────────────────────────────
     def ref_center_line(self, roi_bgr, prev_direction):
         """Reference 5-band center-pick → normalized direction ∈ [-1,1] (negative=left).
 
@@ -433,9 +429,8 @@ class CenterLineDetector:
 
         self.line_type = self._classify_line(valid, w)
 
-        # Compute time-based velocity gate (Team2 pattern): pixels/s × dt_seconds.
-        # This makes the gate FPS-invariant: 2100 px/s ÷ 30 fps = 70 px/frame,
-        # 2100 px/s ÷ 5.7 fps = 368 px/frame — valid turns are no longer rejected.
+        # Time-based velocity gate (pixels/s × dt_seconds), so the gate is FPS-invariant:
+        # 2100 px/s ÷ 30 fps = 70 px/frame, 2100 px/s ÷ 5.7 fps = 368 px/frame.
         _now = time.monotonic()
         _dt  = (_now - self._last_detect_t) if self._last_detect_t is not None else 1.0 / 30.0
         self._last_detect_t = _now
@@ -563,8 +558,8 @@ class CenterLineDetector:
             area = cv2.contourArea(cnt)
             if area < self.MIN_AREA or area > self.MAX_AREA:
                 continue
-            # Jigsaw puzzle-seam rejection (opt-bags center-loss fix): drop small, thin,
-            # wiggly closed loops that are mat seams, not track lines. Only small blobs
+            # Jigsaw puzzle-seam rejection: drop small, thin, wiggly closed loops that are
+            # mat seams, not track lines. Only small blobs
             # are tested (real boundaries are larger and pass straight through), and BOTH
             # fill-extent AND solidity must be low, so elongated line fragments and solid
             # crossing dashes (both high-extent) are never rejected.
@@ -664,10 +659,9 @@ class CenterLineDetector:
         fused_cy = sum(v[1] * a for v, a in zip(valid, areas)) / total
 
         # Crossing-dash slope (Δy/Δx of the dash row): 0 = robot perpendicular to
-        # the dashes. CRITICAL: fit ONLY the dash candidates (small flat blobs),
-        # NEVER the continuing vertical track line — mixing them makes the slope
-        # meaningless (observed in bad_alginment2: −25°↔+10° swings frame to frame).
-        # Use a least-squares line over the dash centroids, and only mark it valid
+        # the dashes. Fit only the dash candidates (small flat blobs), never the continuing
+        # vertical track line — mixing them makes the slope meaningless (swings frame to
+        # frame). Use a least-squares line over the dash centroids, and only mark it valid
         # when there is a clean row (≥ DASH_SLOPE_MIN_N dashes spanning enough x).
         dash_cands, _ = self._dash_candidates(valid)
         self.dash_slope_px   = 0.0
